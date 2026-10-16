@@ -7,6 +7,7 @@
   # Modified by the TorchTurbo contributors.
 
 from abc import ABC
+from dataclasses import replace
 from typing import Optional
 
 import torch
@@ -19,7 +20,7 @@ from .moe_utils import (
     mask_padding_tokens,
     z_loss_func,
 )
-from .utils import topk_softmax_with_capacity
+from .utils import RoutingResult, topk_softmax_with_capacity
 
 
 class Router(ABC, torch.nn.Module):
@@ -247,16 +248,14 @@ class TopKRouter(Router):
         logits: torch.Tensor,
         input_ids: Optional[torch.Tensor] = None,
         padding_mask: torch.Tensor | None = None,
-    ):
+    ) -> RoutingResult:
         """Top-k routing function
 
         Args:
             logits (torch.Tensor): Logits tensor after gating.
 
         Returns:
-            probs (torch.Tensor): The probabilities of token to experts assignment.
-            routing_map (torch.Tensor): The mapping of token to experts assignment,
-                with shape [num_tokens, num_experts].
+            RoutingResult: Final weights, assignment mask, and sorted expert IDs.
         """
         seq_length, bsz = logits.shape[:2]
         logits = logits.view(-1, self.config.num_moe_experts)
@@ -268,7 +267,7 @@ class TopKRouter(Router):
 
         if self.routing_type == "none":
             # A naive top-k routing without load balancing
-            scores, routing_map, _ = topk_softmax_with_capacity(
+            routing = topk_softmax_with_capacity(
                 logits,
                 self.topk,
                 use_pre_softmax=self.config.moe_router_pre_softmax,
@@ -295,13 +294,16 @@ class TopKRouter(Router):
                 self.score_function,
                 padding_mask,
             )
-            scores = self._apply_aux_loss(scores, aux_scores, aux_routing_map)
+            routing = replace(
+                routing,
+                probs=self._apply_aux_loss(routing.probs, aux_scores, aux_routing_map),
+            )
 
         # Prevent extra local tokens accumulation on evaluation or activation recomputation
         if self.enable_expert_bias and torch.is_grad_enabled():
             with torch.no_grad():
                 bias_routing_map = mask_padding_tokens(
-                    routing_map, padding_mask
+                    routing.routing_map, padding_mask
                 )
                 tokens_per_expert = bias_routing_map.sum(dim=0).to(torch.float32)
                 if not hasattr(self, "local_tokens_per_expert"):
@@ -312,14 +314,14 @@ class TopKRouter(Router):
                     )
                 self.local_tokens_per_expert.add_(tokens_per_expert)
 
-        return scores, routing_map
+        return routing
 
     def forward(
         self,
         input: torch.Tensor,
         input_ids: Optional[torch.Tensor] = None,
         padding_mask: torch.Tensor | None = None,
-    ):
+    ) -> tuple[RoutingResult, torch.Tensor]:
         """
         Forward pass of the router.
 
@@ -330,6 +332,6 @@ class TopKRouter(Router):
 
         logits = self.gating(input)
 
-        scores, routing_map = self.routing(logits, input_ids, padding_mask)
+        routing = self.routing(logits, input_ids, padding_mask)
 
-        return scores, routing_map, logits
+        return routing, logits
