@@ -84,7 +84,7 @@ def test_router_aux_uses_raw_logits_not_dispatch_map():
     router.expert_bias.copy_(torch.tensor([-10.0, 0.0, 0.0, 10.0]))
     logits = torch.tensor([[[4.0, 3.0, 2.0, 1.0]], [[3.0, 2.0, 1.0, 0.0]]])
 
-    _, dispatch_map = router.routing(logits)
+    dispatch_map = router.routing(logits).routing_map
 
     raw_scores = torch.sigmoid(logits.reshape(-1, 4))
     raw_scores = raw_scores / raw_scores.sum(dim=-1, keepdim=True)
@@ -111,11 +111,11 @@ def test_router_aux_does_not_change_forward_routing():
     plain_router.weight.data.copy_(weight)
     hidden_states = torch.randn(2, 3, 3)
 
-    aux_probs, aux_map, _ = aux_router(hidden_states)
-    plain_probs, plain_map, _ = plain_router(hidden_states)
+    aux_routing, _ = aux_router(hidden_states)
+    plain_routing, _ = plain_router(hidden_states)
 
-    torch.testing.assert_close(aux_probs, plain_probs)
-    torch.testing.assert_close(aux_map, plain_map)
+    torch.testing.assert_close(aux_routing.probs, plain_routing.probs)
+    torch.testing.assert_close(aux_routing.routing_map, plain_routing.routing_map)
 
 
 def test_aux_loss_autoscaler_adds_scaled_gradient():
@@ -168,8 +168,8 @@ def test_token_aux_loss_is_zero_when_every_token_is_padding():
     torch.nn.init.normal_(router.weight)
     hidden_states = torch.randn(3, 1, 4)
 
-    probs, _, _ = router(hidden_states, padding_mask=torch.ones(1, 3, dtype=torch.bool))
-    probs.sum().backward()
+    routing, _ = router(hidden_states, padding_mask=torch.ones(1, 3, dtype=torch.bool))
+    routing.probs.sum().backward()
 
     assert router._metrics["aux_loss"] == 0
     assert torch.isfinite(router.weight.grad).all()
@@ -340,8 +340,8 @@ def _run_sp_aux_loss_test(rank: int, world_size: int, init_file: str) -> None:
             sp_group=dist.group.WORLD,
         )
         router.weight.data.copy_(initial_weight.T)
-        scores, _, _ = router(local_hidden_states.unsqueeze(1))
-        (scores * 0.0).sum().backward()
+        routing, _ = router(local_hidden_states.unsqueeze(1))
+        (routing.probs * 0.0).sum().backward()
         dist.all_reduce(router.weight.grad, op=dist.ReduceOp.SUM)
         router.weight.grad.div_(world_size)
 
@@ -537,8 +537,8 @@ def test_packed_tail_does_not_change_router_losses_gradients_or_bias_counts():
     router = TopKRouter(config)
     reference_router = TopKRouter(config)
 
-    scores, _ = router.routing(logits, padding_mask=runtime_inputs.padding_mask)
-    reference_scores, _ = reference_router.routing(reference_logits)
+    scores = router.routing(logits, padding_mask=runtime_inputs.padding_mask).probs
+    reference_scores = reference_router.routing(reference_logits).probs
     (scores.sum() * 0).backward()
     (reference_scores.sum() * 0).backward()
 
@@ -687,11 +687,11 @@ def test_router_z_loss_does_not_change_forward_routing():
     plain_router.weight.data.copy_(weight)
     hidden_states = torch.randn(2, 3, 3)
 
-    z_probs, z_map, _ = z_router(hidden_states)
-    plain_probs, plain_map, _ = plain_router(hidden_states)
+    z_routing, _ = z_router(hidden_states)
+    plain_routing, _ = plain_router(hidden_states)
 
-    torch.testing.assert_close(z_probs, plain_probs)
-    torch.testing.assert_close(z_map, plain_map)
+    torch.testing.assert_close(z_routing.probs, plain_routing.probs)
+    torch.testing.assert_close(z_routing.routing_map, plain_routing.routing_map)
 
 
 def test_z_loss_autoscaler_adds_scaled_gradient():

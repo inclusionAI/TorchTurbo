@@ -7,10 +7,31 @@
   # Modified by the TorchTurbo contributors.
 
 import math
+from dataclasses import dataclass
 from typing import Optional
 
 import torch
+
 from torchturbo.runtime import get_device_runtime
+
+
+@dataclass(frozen=True, slots=True)
+class RoutingResult:
+    """Route assignments and weights for one local token batch.
+
+    Attributes:
+        probs: Final dense routing weights, shaped [tokens, experts].
+        routing_map: Boolean assignment mask, shaped [tokens, experts].
+        expert_indices: Selected IDs sorted per token, shaped [tokens, top_k].
+    """
+
+    probs: torch.Tensor
+    routing_map: torch.Tensor
+    expert_indices: torch.Tensor
+
+    def selected_probs(self) -> torch.Tensor:
+        """Gather final weights in the exact order used for permutation."""
+        return self.probs.gather(1, self.expert_indices)
 
 
 def slice_tensor_for_ep_rank(tensor, ep_rank, ep_world_size):
@@ -267,7 +288,7 @@ def topk_softmax_with_capacity(
     use_hash_routing: bool = False,
     hash_table: Optional[torch.Tensor] = None,
     input_ids: Optional[torch.Tensor] = None,
-):
+) -> RoutingResult:
     """Apply capacity and padding to the top-k selection.
     Args:
         logits (torch.Tensor): Logits tensor.
@@ -287,14 +308,8 @@ def topk_softmax_with_capacity(
         expert_bias (torch.Tensor): The bias added to logits for expert routing.
 
     Returns:
-        Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-            - routing_probs (torch.Tensor): A tensor of shape [num_tokens, num_experts] containing
-              the routing probabilities for each token to each expert.
-            - routing_map (torch.Tensor): A mask tensor of shape [num_tokens, num_experts]
-              indicating which experts were selected for each token. True values represent
-              the selected experts.
-            - tokens_per_expert (torch.Tensor): A tensor of shape [num_experts] containing
-              the number of local tokens assigned to each expert before dropping and padding.
+        RoutingResult: Dense weights and mask, plus selected expert IDs in
+        ascending expert-ID order for each token.
     """
     assert (
         logits.dim() == 2
@@ -359,9 +374,11 @@ def topk_softmax_with_capacity(
     # TODO Try using element-wise operations instead of scatter?
     topk_masked_gates = torch.zeros_like(logits).scatter(1, top_indices, probs)
     topk_map = torch.zeros_like(logits).int().scatter(1, top_indices, 1).bool()
-    tokens_per_expert = topk_map.sum(dim=0)
-
-    return topk_masked_gates, topk_map, tokens_per_expert
+    return RoutingResult(
+        probs=topk_masked_gates,
+        routing_map=topk_map,
+        expert_indices=top_indices.sort(dim=-1).values,
+    )
 
 
 def ensure_divisibility(numerator, denominator):

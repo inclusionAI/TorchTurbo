@@ -19,6 +19,7 @@ from .moe_config import MoEConfig
 # from torch_turbo.distributed.parallel_state import get_expert_model_parallel_group
 from ..comm.comm import all_to_all, gather_from_sequence_parallel_region
 from .utils import (
+    RoutingResult,
     permute,
     unpermute,
     sort_chunks_by_idxs,
@@ -48,14 +49,13 @@ class MoETokenDispatcher:
 
     @abstractmethod
     def token_permutation(
-        self, tokens: torch.Tensor, probs: torch.Tensor, routing_map: torch.Tensor
+        self, tokens: torch.Tensor, routing: RoutingResult
     ):
         """Dispatch tokens to experts.
 
         Args:
             tokens (torch.Tensor): Input tokens.
-            probs (torch.Tensor): The routing probability tensor [num_tokens, num_experts].
-            routing_map (torch.Tensor): Token to expert mapping tensor.
+            routing (RoutingResult): Local routing weights, mask, and expert IDs.
 
         Returns:
             Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -172,9 +172,10 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
     def _token_permutation_with_deferred_probs(
         self,
         hidden_states: torch.Tensor,
-        probs: torch.Tensor,
-        routing_map: torch.Tensor,
+        routing: RoutingResult,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        probs = routing.probs
+        routing_map = routing.routing_map
         self.hidden_shape = hidden_states.shape
         self.probs = probs
         self.routing_map = routing_map
@@ -188,13 +189,10 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             "before_permutation_1", tokens_per_expert
         )
         self.hidden_shape_before_permute = hidden_states.shape
-        expert_indices = torch.nonzero(routing_map, as_tuple=True)[1].view(
-            hidden_states.shape[0], -1
-        )
         (
             permutated_local_input_tokens,
             self.reversed_local_input_permutation_mapping,
-        ) = ops.moe_token_permutation(hidden_states, expert_indices)
+        ) = ops.moe_token_permutation(hidden_states, routing.expert_indices)
 
         tokens_per_expert = self._maybe_dtoh_and_synchronize(
             "before_ep_alltoall", tokens_per_expert
@@ -353,8 +351,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
     def token_permutation(
         self,
         hidden_states: torch.Tensor,
-        probs: torch.Tensor,
-        routing_map: torch.Tensor,
+        routing: RoutingResult,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Dispatch tokens to local experts using AlltoAll communication.
@@ -367,8 +364,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
 
         Args:
             hidden_states (torch.Tensor): Input token embeddings.
-            probs (torch.Tensor): The probabilities of token to experts assignment.
-            routing_map (torch.Tensor): The mapping of token to experts assignment.
+            routing (RoutingResult): Local routing weights, mask, and expert IDs.
 
         Returns:
             Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -378,10 +374,12 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         """
         if self.deferred_probs_to_unpermutation:
             return self._token_permutation_with_deferred_probs(
-                hidden_states, probs, routing_map
+                hidden_states, routing
             )
 
         # Preprocess: Get the metadata for communication, permutation and computation operations.
+        probs = routing.probs
+        routing_map = routing.routing_map
         self.hidden_shape = hidden_states.shape
         self.probs = probs
         self.routing_map = routing_map
