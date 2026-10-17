@@ -45,8 +45,6 @@ from transformers.utils.generic import OutputRecorder, check_model_inputs
 
 try:
     from fla.modules import FusedRMSNormGated, ShortConvolution
-    from fla.ops.kda import chunk_kda, fused_recurrent_kda
-    # from fla.ops.kda.gate import fused_kda_gate  # deprecated, gate is now computed inside chunk_kda/fused_recurrent_kda
     from fla.ops.utils.index import prepare_cu_seqlens_from_mask, prepare_lens_from_mask
     from fla.utils import tensor_cache
 except ImportError:
@@ -55,6 +53,26 @@ except ImportError:
         "`pip install 'flash-linear-attention>=0.6.0'`. "
         "See src/torchturbo/models/kimi_k3/README.md for the verified "
         "environment matrix."
+    )
+
+# The KDA Triton kernels are import-optional: if fla.ops.kda itself cannot be
+# imported (triton / triton-ascend missing, or a partial fla install), the
+# KDA layers automatically fall back to the pure-PyTorch chunk_kda_naive and
+# a warning is logged once at import time. NOTE: stacks where the kernel
+# imports fine but deadlocks at runtime (old triton-ascend aicore timeout)
+# cannot be auto-detected — set ``kda_implementation: naive`` in the model
+# config there (see README).
+try:
+    from fla.ops.kda import chunk_kda, fused_recurrent_kda
+    # from fla.ops.kda.gate import fused_kda_gate  # deprecated, gate is now computed inside chunk_kda/fused_recurrent_kda
+except ImportError:
+    chunk_kda = fused_recurrent_kda = None
+    logging.get_logger(__name__).warning(
+        "fla.ops.kda is not importable (triton backend missing or fla too "
+        "old): KDA layers will run the pure-PyTorch chunk_kda_naive "
+        "fallback. Install flash-linear-attention>=0.6.0 with a working "
+        "triton backend for the fused path, or set kda_implementation: "
+        "naive to silence this warning."
     )
 
 # Pure-PyTorch (small-operator) KDA implementation, functionally equivalent
@@ -74,7 +92,6 @@ assert version.parse(transformers.__version__) >= version.parse("4.56.0"), \
     "Please upgrade transformers to >= 4.56.0"
 
 logger = logging.get_logger(__name__)
-
 
 # Register Moonshot-specific activation functions
 class SituAndMul(nn.Module):
@@ -626,6 +643,11 @@ class KimiDeltaAttention(nn.Module):
         use_cache = cache_params is not None
         batch_size, q_len, _ = hidden_states.shape
         mode = 'fused_recurrent' if use_cache and q_len == 1 else self.mode
+        if mode != 'chunk' and fused_recurrent_kda is None:
+            # Triton kernels unavailable (see import-time warning): route
+            # everything through the pure-PyTorch chunk path, which is
+            # functionally equivalent (slower for single-token decode).
+            mode = 'chunk'
         if self.training:
             assert mode == 'chunk', "Only chunk mode is supported in training."
 
@@ -675,11 +697,13 @@ class KimiDeltaAttention(nn.Module):
 
         if mode == 'chunk':
             # Route via config: 'naive' forces the pure-PyTorch fallback
-            # (for stacks where the fla Triton kernel is unavailable);
+            # (for stacks where the fla Triton kernel is known-broken);
             # anything else uses fla's fused chunk_kda (Triton), which is
             # verified on NPU with flash-linear-attention 0.6.0 +
-            # triton-ascend 3.2.2.
-            if getattr(self.config, 'kda_implementation', 'fused') == 'naive':
+            # triton-ascend 3.2.2. If the Triton kernels could not even be
+            # imported, fall back to naive automatically (import-time
+            # warning was logged).
+            if getattr(self.config, 'kda_implementation', 'fused') == 'naive' or chunk_kda is None:
                 o, recurrent_state = chunk_kda_naive(
                 q=q,
                 k=k,

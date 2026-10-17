@@ -319,18 +319,19 @@ class TurboKimiK3ForConditionalGeneration(
 
 
 
-        # Replace fla's triton chunk_kda with the pure-PyTorch naive impl.
-        # fla.ops.kda.chunk_kda uses triton kernels that aicore-timeout on NPU
-        # (torch_npu 2.10, "The aicore execution times out" EZ9999). The naive
-        # impl (torchturbo.ops.kda.chunk_kda_naive) is mathematically equivalent
-        # but pure torch ops — runs on NPU. Patch the modeling module's chunk_kda
-        # so both the official forward (SP=1) and sp_forward (SP>1) use it.
-        # Mirrors MM's kda_implementation=naive path.
-        try:
-            from torchturbo.ops.kda.chunk_kda_naive import chunk_kda_naive
-            klm.chunk_kda = chunk_kda_naive
-        except ImportError:
-            pass
+        # NOTE: an earlier revision of this block unconditionally rebound
+        # klm.chunk_kda to the pure-PyTorch naive impl to work around the
+        # aicore-timeout deadlocks of old NPU stacks (fla 0.5.2 +
+        # triton-ascend 3.2.1). That silently hijacked the modeling-side
+        # kda_implementation routing: config 'fused' (the default) still
+        # executed the naive op, because the else-branch looked up the
+        # module-level name that had been rebound here. The routing now lives
+        # entirely in modeling_kimi_linear.py (per-config branch, plus an
+        # automatic import-time fallback to naive when fla.ops.kda is not
+        # importable) and in sp_forward (conditional import), and the naive
+        # path is always importable — so no global rebinding happens here.
+        # Old stacks that cannot run the Triton kernel should set
+        # kda_implementation: naive in the model config (see README).
 
         # Patch nn.Embedding.forward: use full_tensor() to all-gather sharded weight.
         # Stock PyTorch embedding_dense_backward DTensor strategy lacks the
@@ -424,12 +425,14 @@ class TurboKimiK3ForConditionalGeneration(
             v = _split_last_dim_heads(v, self.head_dim)
             g = _split_last_dim_heads(g, self.head_dim)
 
+            # Reuse the import-time probe from modeling_kimi_linear: if the
+            # Triton kernels were not importable there, klm.chunk_kda is
+            # None and we fall back to the naive impl (a warning was logged
+            # once at import time). No silent per-call try/except here.
+            from . import modeling_kimi_linear as klm
             kda_impl = getattr(self.config, "kda_implementation", "naive")
-            if kda_impl == "fused":
-                try:
-                    from fla.ops.kda import chunk_kda as kda_fn
-                except ImportError:
-                    from torchturbo.ops.kda.chunk_kda_naive import chunk_kda_naive as kda_fn
+            if kda_impl == "fused" and klm.chunk_kda is not None:
+                kda_fn = klm.chunk_kda
             else:
                 from torchturbo.ops.kda.chunk_kda_naive import chunk_kda_naive as kda_fn
 
