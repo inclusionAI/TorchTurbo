@@ -15,7 +15,11 @@ def get_base_moe_config(
         # moe related params
         moe_ffn_hidden_size=hf_config.moe_intermediate_size,
         moe_router_load_balancing_type="none",
-        moe_router_topk=hf_config.num_experts_per_tok,
+        # transformers>=4.55 renamed the serialized field to
+        # ``num_experts_per_token``; older configs still use ``_tok``.
+        moe_router_topk=getattr(
+            hf_config, "num_experts_per_token", getattr(hf_config, "num_experts_per_tok", None)
+        ),
         moe_router_pre_softmax=True,
         moe_token_dispatcher_type="alltoall",
     )
