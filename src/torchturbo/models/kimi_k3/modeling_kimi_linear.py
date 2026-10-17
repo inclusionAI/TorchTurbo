@@ -571,6 +571,42 @@ class KimiDeltaAttention(nn.Module):
             self.head_dim, eps=config.rms_norm_eps, activation='sigmoid')
         self.o_proj = nn.Linear(projection_size, self.hidden_size, bias=False)
 
+    def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
+        """Narrow the zero-padded A_log tensor from release checkpoints.
+
+        Background: every published Kimi-K3 checkpoint (verified on all 69
+        KDA layers, see HF moonshotai/Kimi-K3 discussions #144/#150 and the
+        PatronusAI/kimi-k3-nvfp4 model card) stores ``A_log`` padded from
+        ``num_heads`` (96 trained per-head decay values) up to ``head_dim``
+        (128), with elements ``[num_heads:head_dim]`` exactly zero. Without
+        this hook, ``from_pretrained`` fails with a size-mismatch error
+        because this module correctly sizes ``A_log`` at ``num_heads``
+        (matching the per-head ``A_log.view(H, 1)`` semantics of the
+        FlashKDA/FLA kernels).
+
+        The alternative fix of enlarging the parameter to ``head_dim`` so
+        the padded tensor loads as-is does NOT work: the FLA gate computes
+        ``A_log.view(H, 1)`` with ``H`` = head count, which raises on a
+        128-element tensor at the first forward.
+
+        So instead: keep the trained values, drop the inert padding, and
+        refuse to load if the pad is ever non-zero (that would mean the
+        checkpoint layout changed and the slice below is no longer sound).
+        """
+        a_key = prefix + 'A_log'
+        if a_key in state_dict:
+            a = state_dict[a_key]
+            if a.numel() > self.num_heads:
+                pad = a[self.num_heads:]
+                if pad.any():
+                    raise ValueError(
+                        f'{a_key}: expected a zero-padded tail beyond num_heads, '
+                        f'but found non-zero values (max abs '
+                        f'{pad.abs().max().item():.3e}); refusing to load.')
+                state_dict = dict(state_dict)
+                state_dict[a_key] = a[:self.num_heads]
+        super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
+
     def forward(
         self,
         hidden_states: torch.Tensor,

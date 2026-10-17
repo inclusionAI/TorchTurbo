@@ -84,6 +84,36 @@ class KimiK3WeightConverter(BaseWeightConverter):
                 _map = {'float16': torch.float16, 'bfloat16': torch.bfloat16, 'float32': torch.float32}
                 self.dtype = _map.get(getattr(self.config, 'torch_dtype', 'bfloat16'), torch.bfloat16)
 
+    @override
+    def transform_checkpoint_tensor(self, hf_name, tensor):
+        """Narrow zero-padded A_log from Kimi-K3 release checkpoints.
+
+        Published K3 checkpoints store ``self_attn.A_log`` padded from
+        num_heads (the trained per-head decay values) up to head_dim, with
+        the padding elements exactly zero (see HF moonshotai/Kim-K3
+        discussions #144/#150 and the PatronusAI/kimi-k3-nvfp4 model card).
+        The model sizes A_log at num_heads, so narrow the trained part
+        after verifying the padding is zero. Invoked by the engine's
+        distributed loader before broadcast/FSDP sharding; the HF
+        from_pretrained path is covered by the modeling-side
+        _load_from_state_dict hook.
+        """
+        if (
+            torch.is_tensor(tensor)
+            and tensor.dim() == 1
+            and hf_name.endswith("self_attn.A_log")
+        ):
+            num_heads = (self.config.linear_attn_config or {}).get("num_heads")
+            if num_heads is not None and tensor.shape[0] > num_heads:
+                pad = tensor[num_heads:]
+                if not torch.equal(pad, torch.zeros_like(pad)):
+                    raise ValueError(
+                        f"{hf_name}: non-zero padding beyond num_heads={num_heads}; "
+                        "refusing to narrow (unexpected checkpoint layout)"
+                    )
+                tensor = tensor[:num_heads].clone()
+        return tensor
+
     # K3 official bf16 weights store expert MLP as w1/w2/w3 (MegaBlocks style),
     # but the model defines gate_proj/up_proj/down_proj (HF style). Map the
     # checkpoint names so weight_loader's assemble_weight1/2_for_broadcast pops
