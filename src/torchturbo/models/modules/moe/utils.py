@@ -10,6 +10,7 @@ import math
 from typing import Optional
 
 import torch
+from torchturbo.ops import ops
 from torchturbo.runtime import get_device_runtime
 
 
@@ -167,6 +168,19 @@ def sort_chunks_by_idxs(
     else:
         permuted_probs = None
     return output, permuted_probs
+
+
+def reorder_expert_chunks(
+    input: torch.Tensor,
+    chunk_counts: torch.Tensor,
+    probs: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Transpose rank/expert chunks, preserving token order within each chunk."""
+    if input.device.type == "npu":
+        return ops.moe_chunk_reorder(input, chunk_counts, probs=probs)
+    order = torch.arange(chunk_counts.numel(), device="cpu")
+    order = order.reshape(chunk_counts.shape).T.reshape(-1)
+    return sort_chunks_by_idxs(input, chunk_counts.reshape(-1), order, probs=probs)
 
 
 def unpermute(
