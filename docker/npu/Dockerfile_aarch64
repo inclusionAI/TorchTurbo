@@ -29,6 +29,11 @@ ENV LD_LIBRARY_PATH=/usr/local/python3.11.15/lib/python3.11/site-packages/fla_np
 # Install other packages
 RUN pip install py-spy==0.4.2
 
+# Configure shell startup and SSH access.
+RUN rm -f /etc/profile.d/system-info.sh /etc/motd
+RUN sed -i \
+        's#source /usr/local/Ascend/nnal/atb/set_env.sh$#source /usr/local/Ascend/nnal/atb/set_env.sh --cxx_abi=1#' \
+        /etc/profile /root/.bashrc
 RUN if [ -f /etc/ssh/sshd_config ]; then \
         sed -i '/^[[:space:]#]*PasswordAuthentication[[:space:]]/d' /etc/ssh/sshd_config && \
         echo 'PasswordAuthentication no' >> /etc/ssh/sshd_config; \
