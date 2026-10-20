@@ -39,7 +39,7 @@ RUN bash -c "source /usr/local/Ascend/ascend-toolkit/set_env.sh \
     && FLA_NPU_SOC=ascend910_93 python scripts/build_wheel.py \
     && python -m pip install --force-reinstall --no-cache-dir --no-deps dist/flash_linear_attention_npu_a3-*.whl \
     && rm -rf /tmp/flash-linear-attention-npu"
-RUN pip install /usr/local/package/flash_linear_attention-0.6.0-py3-none-any.whl
+RUN pip install /usr/local/package/flash_linear_attention-0.6.0+main.954438d1-py3-none-any.whl
 # Disable mimalloc to avoid MADV_FREE reclaiming DMA-written pages.
 # Patch PyTorch's AArch64 default so USE_MIMALLOC=OFF takes effect.
 ARG MAX_JOBS=8
