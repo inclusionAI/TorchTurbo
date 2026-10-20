@@ -121,6 +121,9 @@ class FSDPParallelPlan(ParallelPlan):
         Expert Parallelism group size.
     tp_size:
         Tensor Parallelism group size.
+    use_fla_kcp:
+        Whether to route KDA layers through FLA kernel context parallelism
+        (KCP) instead of the default Ulysses sequence parallelism.
     """
 
     plan: dict[str, FSDPPlacementSpec | FSDPPlanSpec | Any] = field(
@@ -129,6 +132,7 @@ class FSDPParallelPlan(ParallelPlan):
     sp_size: int = 1
     ep_size: int = 1
     tp_size: int = 1
+    use_fla_kcp: bool = False
 
     def __post_init__(self) -> None:
         """Normalize plan values to FSDPPlanSpec/FSDPPlacementSpec."""

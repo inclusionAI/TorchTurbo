@@ -23,12 +23,14 @@ def patch_kda_forward(
     sp_group: ProcessGroup | None,
     sp_size: int,
     sp_rank: int,
+    use_fla_kcp: bool = False,
 ) -> None:
-    """Install packed KDA training with sequence gathering and head sharding.
+    """Install packed KDA training with Ulysses or FLA context parallelism.
 
     The wrapped forward receives global packed boundaries as the
     ``cu_seqlens`` keyword; convolutions and KDA share them while their
-    parameters are sliced by head for sequence parallelism.
+    parameters are sliced by head for Ulysses sequence parallelism.
+    FLA context parallelism keeps all heads on each local sequence shard.
     """
     from fla.modules.fused_norm_gate import rms_norm_gated
     from fla.ops.kda import chunk_kda
@@ -203,4 +205,118 @@ def patch_kda_forward(
         o = self.o_proj(o.flatten(-2))
         return o, None, None
 
-    attention_cls.forward = sp_forward
+    def kcp_forward(
+        self: nn.Module,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        past_key_value: Any = None,
+        **kwargs: Any,
+    ) -> tuple[torch.Tensor, None, None]:
+        from fla.ops.cp import build_cp_context
+
+        batch_size, q_len, _ = hidden_states.shape
+        assert past_key_value is None, "KDA training does not accept a KV cache."
+        assert self.mode == "chunk", "Only chunk mode is supported in training."
+
+        if batch_size != 1:
+            raise ValueError(
+                f"FLA KCP requires batch_size=1, got {batch_size}. "
+                "Use a per-device batch size of 1 or disable use_fla_kcp."
+            )
+
+        # Use global boundaries and isolate any padded tail as a sequence.
+        cu_seqlens = kwargs.get("cu_seqlens")
+        packed_params = get_packed_params(cu_seqlens, q_len * sp_size)
+        if packed_params is not None:
+            cu_seqlens = packed_params.cu_seqlens
+        else:
+            cu_seqlens = torch.tensor(
+                [0, q_len * sp_size],
+                dtype=torch.int32,
+                device=hidden_states.device,
+            )
+        cp_context = build_cp_context(
+            cu_seqlens,
+            group=sp_group,
+            conv1d_kernel_size=self.conv_size,
+        )
+
+        q = self.q_proj(hidden_states)   # [1, T/sp, H*K]
+        k = self.k_proj(hidden_states)   # [1, T/sp, H*K]
+        v = self.v_proj(hidden_states)   # [1, T/sp, H*V]
+
+        # Dispatch through the ops layer; cp_context selects FLA's
+        # Triton CP path instead of AscendC. d,1,w -> d,w.
+        q, _ = ops.causal_conv1d(
+            x=q,
+            weight=self.q_conv1d.weight.squeeze(1),
+            bias=self.q_conv1d.bias,
+            activation=self.q_conv1d.activation,
+            initial_state=None,
+            output_final_state=False,
+            cp_context=cp_context,
+        )
+        k, _ = ops.causal_conv1d(
+            x=k,
+            weight=self.k_conv1d.weight.squeeze(1),
+            bias=self.k_conv1d.bias,
+            activation=self.k_conv1d.activation,
+            initial_state=None,
+            output_final_state=False,
+            cp_context=cp_context,
+        )
+        v, _ = ops.causal_conv1d(
+            x=v,
+            weight=self.v_conv1d.weight.squeeze(1),
+            bias=self.v_conv1d.bias,
+            activation=self.v_conv1d.activation,
+            initial_state=None,
+            output_final_state=False,
+            cp_context=cp_context,
+        )
+
+        if self.no_kda_lora:
+            g = self.f_proj(hidden_states)
+        else:
+            g = self.f_b_proj(self.f_a_proj(hidden_states))
+
+        beta = self.b_proj(hidden_states).float().sigmoid()
+
+        q = q.unflatten(-1, (-1, self.head_k_dim))
+        k = k.unflatten(-1, (-1, self.head_k_dim))
+        v = v.unflatten(-1, (-1, self.head_dim))
+        g = g.unflatten(-1, (-1, self.head_dim))
+
+        # Full A_log/dt_bias under KCP (no slicing).
+        o, _ = chunk_kda(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            A_log=self.A_log,
+            dt_bias=self.dt_bias,
+            initial_state=None,
+            output_final_state=False,
+            use_qk_l2norm_in_kernel=True,
+            use_gate_in_kernel=True,
+            safe_gate=self.safe_gate,
+            lower_bound=self.lower_bound,
+            cp_context=cp_context,
+        )
+
+        # o_norm uses g recomputed from hidden_states.
+        if self.no_kda_lora:
+            g = self.g_proj(hidden_states)
+        else:
+            g = self.g_b_proj(self.g_a_proj(hidden_states))
+        g = g.unflatten(-1, (-1, self.head_dim))
+
+        self.o_norm.forward = norm_forward.__get__(self.o_norm)
+        o = self.o_norm(o, g)
+
+        o = o.flatten(-2)
+        o = self.o_proj(o)
+        return o, None, None
+
+    attention_cls.forward = kcp_forward if use_fla_kcp else sp_forward

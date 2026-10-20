@@ -1060,3 +1060,81 @@ def test_cpu_attention_never_selects_cuda_providers(attention_providers):
             dispatcher.attention_with_max_logits(
                 query, query, query, None, 0.5, 0.0, True, impl=name,
             )
+
+
+def test_causal_conv1d_cp_context_forces_fla_triton(monkeypatch):
+    registry = OpRegistry()
+    native = OpSpec(
+        op_name="causal_conv1d",
+        impl_name="fla_causal_conv1d",
+        kind=OpImplKind.NATIVE,
+        priority=0,
+        devices=(),
+    )
+    custom = OpSpec(
+        op_name="causal_conv1d",
+        impl_name="ascendc_causal_conv1d",
+        kind=OpImplKind.CUSTOM,
+        priority=100,
+        devices=(TurboDevice.CPU,),
+    )
+    registry.register(native)
+    registry.register(custom)
+
+    class FlaCausalConv1d(OpImpl):
+        def __call__(
+            self,
+            x,
+            weight,
+            bias=None,
+            *,
+            activation=None,
+            initial_state=None,
+            output_final_state=False,
+            packed_params=None,
+            cp_context=None,
+        ):
+            return ("fla", cp_context)
+
+    class AscendCCausalConv1d(OpImpl):
+        def __call__(
+            self,
+            x,
+            weight,
+            bias=None,
+            *,
+            activation=None,
+            initial_state=None,
+            output_final_state=False,
+            packed_params=None,
+            cp_context=None,
+        ):
+            return "ascendc"
+
+    monkeypatch.setattr(
+        OpDispatcher,
+        "_load_provider_impl_classes",
+        lambda self, device: {
+            native.impl_name: FlaCausalConv1d,
+            custom.impl_name: AscendCCausalConv1d,
+        },
+    )
+    dispatcher = OpDispatcher(registry=registry, device_runtime=CpuRuntime())
+
+    x = torch.ones(1, 2, 3)
+    weight = torch.ones(3, 2)
+    cp_context = object()
+
+    assert dispatcher.causal_conv1d(x, weight) == "ascendc"
+    assert dispatcher.causal_conv1d(
+        x,
+        weight,
+        cp_context=cp_context,
+    ) == ("fla", cp_context)
+    with pytest.raises(ValueError, match="cp_context is only supported"):
+        dispatcher.causal_conv1d(
+            x,
+            weight,
+            cp_context=cp_context,
+            impl=custom.impl_name,
+        )
