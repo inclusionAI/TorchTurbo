@@ -51,3 +51,6 @@ logs/
 # OS generated files
 **/.DS_Store
 Thumbs.db
+
+# Optional standalone MegaMoE binary distribution
+!src/torchturbo/optimizations/mega_moe/packages/*.whl

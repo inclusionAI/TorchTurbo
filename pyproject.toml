@@ -23,3 +23,6 @@ dev = [
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/torchturbo"]
+
+[tool.setuptools.package-data]
+"torchturbo.optimizations.mega_moe" = ["packages/*.whl", "README.md"]
