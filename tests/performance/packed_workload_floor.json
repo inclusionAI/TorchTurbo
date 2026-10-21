@@ -1,0 +1,10 @@
+{
+  "machine": "aarch64",
+  "max_median_seconds": 0.0027076027,
+  "baseline_median_seconds": 0.002456734500000035,
+  "clock": "process_time",
+  "case": "969 cached packs, DP8, rank block4, seed42",
+  "policy": "Initial recorded sampler CPU latency budget plus 10%; ordinary tests never rewrite the baseline. Precision and workload-cost contracts are unchanged.",
+  "tolerance_percent": 10,
+  "baseline_max_median_seconds": 0.002461456999999978
+}
