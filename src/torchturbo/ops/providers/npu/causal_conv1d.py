@@ -28,6 +28,8 @@ class AscendCCausalConv1d(OpImpl):
             from torchturbo.ops.providers.npu._fla_npu_gdn import (  # noqa: F401
                 ascendc_causal_conv1d,
             )
+        except ImportError:
+            return False
         except Exception as exc:  # pragma: no cover - diagnostic
             import traceback
 

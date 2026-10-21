@@ -1,5 +1,6 @@
 import json
 import math
+import os
 import re
 from contextlib import contextmanager
 from functools import wraps
@@ -11,13 +12,15 @@ import torch
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM
 
+from torchturbo.engine.optimizers import OptimizerRecipe
 from torchturbo.models.modules.attention.ulysses import all_gather_sp_with_grad_reduce
 from torchturbo.utils.flash_attn_utils import cu_seqlens_to_segment_ids
 
 from . import packing_utils as pu
 from torchturbo.models.modules.moe.moe_layer import MoELayer
 from torchturbo.models.modules.moe.moe_utils import MoEAuxLossAutoScaler
-from torchturbo.runtime import is_npu_available
+from torchturbo.runtime import TurboDevice, get_device_runtime
+from torchturbo.runtime import is_npu_available  # noqa: F401 - module-level availability probe
 
 from ..base import TurboModel
 from ..registry import register_model
@@ -125,6 +128,16 @@ class TurboDeepseekV4ForCausalLM(TurboModel, DeepseekV4ForCausalLM):
     def get_weight_converter(self, parallel_context, model_path):
         return DeepseekV4WeightConverter(self, parallel_context, model_path)
 
+    def get_norm(self) -> torch.nn.Module:
+        return self.norm
+
+    def get_optimizer_recipe(self, optimizer_name: str) -> OptimizerRecipe:
+        if optimizer_name == "muon":
+            from .optimizer_recipe import get_muon_recipe
+
+            return get_muon_recipe(self)
+        return super().get_optimizer_recipe(optimizer_name)
+
     def get_lm_head(self):
         return self.head
 
@@ -189,7 +202,7 @@ class TurboDeepseekV4ForCausalLM(TurboModel, DeepseekV4ForCausalLM):
                 original_seq_len = 0
                 rope_theta = attn.config.rope_theta
 
-            freqs_cis = attn._precompute_freqs_cis(
+            freqs_cis = dsv4.get_shared_freqs_cis(
                 attn.rope_head_dim,
                 attn.config.max_position_embeddings,
                 original_seq_len,
@@ -197,7 +210,8 @@ class TurboDeepseekV4ForCausalLM(TurboModel, DeepseekV4ForCausalLM):
                 attn.config.rope_factor,
                 attn.config.beta_fast,
                 attn.config.beta_slow,
-            ).to(attn.attn_sink.device)
+                device=attn.attn_sink.device,
+            )
             attn.register_buffer("freqs_cis", freqs_cis, persistent=False)
 
             if attn.compress_ratio == 4:
@@ -761,7 +775,10 @@ class TurboDeepseekV4ForCausalLM(TurboModel, DeepseekV4ForCausalLM):
         dsv4.SparseAttention.forward = sparse_attention_forward
         dsv4.DeepseekV4Attention.forward = attention_forward
         dsv4.DSAIndexerLossAutoScaler = MoEAuxLossAutoScaler
-        if is_npu_available():
+        if (
+            get_device_runtime().turbo_device is TurboDevice.NPU
+            and os.environ.get("TORCHTURBO_ENABLE_NPU_SFA_LI", "1") == "1"
+        ):
             from .npu import patch_deepseek_v4_npu_sfa_li
 
-            patch_deepseek_v4_npu_sfa_li(sp_rank, sp_group, sp_size)
+            patch_deepseek_v4_npu_sfa_li(sp_rank, sp_size)

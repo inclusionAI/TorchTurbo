@@ -8,6 +8,7 @@ Uses PreAttention/InnerAttention/PostAttention structure for compilation support
 
 import math
 from typing import Optional
+from weakref import WeakValueDictionary
 
 import torch
 import torch.nn as nn
@@ -696,6 +697,34 @@ class PostAttentionOps(nn.Module):
         return wo_b(o.reshape(bsz, seqlen, -1))
 
 
+_FREQS_CIS_CACHE: WeakValueDictionary[tuple, torch.Tensor] = WeakValueDictionary()
+
+
+def get_shared_freqs_cis(
+    dim: int,
+    seqlen: int,
+    original_seq_len: int,
+    base: float,
+    factor: float,
+    beta_fast: float,
+    beta_slow: float,
+    device: Optional[torch.device] = None,
+) -> torch.Tensor:
+    """Share read-only RoPE tables with matching parameters and device."""
+    device = torch.empty(0, device=device).device
+    key = (dim, seqlen, original_seq_len, base, factor, beta_fast, beta_slow, device)
+    cached = _FREQS_CIS_CACHE.get(key)
+    if cached is None:
+        # Build on the target device so meta construction and materialization
+        # never share a meta table with a real-device model.
+        with torch.device(device):
+            cached = DeepseekV4Attention._precompute_freqs_cis(
+                dim, seqlen, original_seq_len, base, factor, beta_fast, beta_slow
+            )
+        _FREQS_CIS_CACHE[key] = cached
+    return cached
+
+
 class DeepseekV4Attention(nn.Module):
     """Multi-head Latent Attention (MLA) with pre/inner/post structure.
 
@@ -751,7 +780,7 @@ class DeepseekV4Attention(nn.Module):
         else:
             original_seq_len, rope_theta = 0, config.rope_theta
 
-        freqs_cis = self._precompute_freqs_cis(
+        freqs_cis = get_shared_freqs_cis(
             self.rope_head_dim,
             config.max_position_embeddings,
             original_seq_len,

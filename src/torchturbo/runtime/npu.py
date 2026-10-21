@@ -11,6 +11,7 @@ from .base import BaseProfiler, DeviceRuntime, TurboDevice
 # Ascend environment variable reference:
 # https://www.hiascend.com/document/detail/zh/Pytorch/600/apiref/apilist/ptaoplist_001052.html
 _NPU_ENV_DEFAULTS = {
+    "ASCEND_CUSTOM_OPP_PATH": "/usr/local/lib/cann_ops/vendors/custom_transformer",
     "HCCL_CONNECT_TIMEOUT": "7200",
     "HCCL_EXEC_TIMEOUT": "7200",
     "HCCL_EVENT_TIMEOUT": "14500",
@@ -129,10 +130,10 @@ class NpuRuntime(DeviceRuntime):
     def initialize(self) -> None:
         if self._initialized:
             return
-        import torch_npu  # noqa: F401
-        from torch_npu.contrib import transfer_to_npu as _  # noqa: F401
         for name, value in _NPU_ENV_DEFAULTS.items():
             os.environ.setdefault(name, value)
+        import torch_npu  # noqa: F401
+        from torch_npu.contrib import transfer_to_npu as _  # noqa: F401
 
         self._initialized = True
 
