@@ -624,6 +624,9 @@ class EngineConfig:
     dspark: DSparkTrainingConfig = field(default_factory=DSparkTrainingConfig)
     """DeepSeek-V4 DSpark training overrides."""
 
+    mega_moe: bool = False
+    """Enable the optional fused MegaMoE backend."""
+
     moe: MoEConfig = field(default_factory=MoEConfig)
     """MoE training settings."""
 
@@ -659,6 +662,7 @@ class EngineConfig:
         self.use_deterministic_algorithms = string_to_bool(
             self.use_deterministic_algorithms
         )
+        self.mega_moe = string_to_bool(self.mega_moe)
         if self.backend_config is None:
             self.backend_config = self._default_backend_config()
         if self.ops is None:
@@ -831,6 +835,7 @@ class EngineConfig:
             "mtp",
             "dspark",
             "moe",
+            "mega_moe",
             "enable_mtp",
             "mtp_loss_scaling_factor",
             "mtp_log_loss",
@@ -857,6 +862,7 @@ class EngineConfig:
             mtp=mtp_config,
             dspark=dspark_config,
             moe=moe_config,
+            mega_moe=d.get("mega_moe", False),
             loss_chunk=loss_chunk_config,
             freeze_policy=freeze_policy,
             mfu=mfu_config,
@@ -1104,6 +1110,7 @@ def build_from_args(
         mtp=_build_mtp_config(fields),
         dspark=_build_dspark_training_config(fields),
         moe=_build_moe_config(fields),
+        mega_moe=fields.get("mega_moe", False),
         loss_chunk=_build_loss_chunk_config(fields),
         freeze_policy=_build_freeze_policy(fields),
         mfu=_build_mfu_config(fields),
@@ -1177,6 +1184,7 @@ def _validate_config_file(data: Mapping[str, Any], parents: tuple[str, ...] = ()
     # Allow config blocks that do not have corresponding CLI arguments.
     allowed.update(
         {
+            "mega_moe",
             "backend_config.cpu_offload.enabled",
             "backend_config.cpu_offload.mode",
             "backend_config.cpu_offload.optimizer_memory_fraction",

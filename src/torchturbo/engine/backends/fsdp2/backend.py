@@ -352,6 +352,10 @@ class FSDP2Backend(BaseBackend):
                     else:
                         logger.debug_rank0("FSDP2Backend patched module %s in-place", fqn)
 
+        if self.config.mega_moe:
+            from ....optimizations.mega_moe.integration import install
+
+            install(model, self.config, self.get_ep_info()["ep_group"])
         return model
 
     @staticmethod
