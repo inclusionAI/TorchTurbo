@@ -78,10 +78,6 @@ class FSDP2CheckpointManager(BaseCheckpointManager):
         weight_converter: BaseWeightConverter,
         assign: bool = False,
     ) -> None:
-        if assign and self._cpu_offload:
-            # Materialize local shards on CPU before FSDP initializes its
-            # offloaded parameter storage from the assigned checkpoint.
-            model.to_empty(device="cpu")
         self._hf_loader(model, weights_dir, weight_converter).load_weights(assign=assign)
 
     def save_hf(

@@ -94,7 +94,13 @@ def _torch_gated_activation(
     if limit < 0:
         raise ValueError("limit must be non-negative.")
 
-    if limit > 0 and x.is_contiguous() and x.numel() > 0 and x.size(-1) % 2 == 0:
+    if (
+        limit > 0
+        and not clamp_gate_after_activation
+        and x.is_contiguous()
+        and x.numel() > 0
+        and x.size(-1) % 2 == 0
+    ):
         return _ChunkedGatedActivation.apply(
             x, activation_func, limit, clamp_gate_after_activation
         )

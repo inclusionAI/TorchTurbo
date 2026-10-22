@@ -1512,8 +1512,11 @@ class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel, GenerationMixin):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         cu_seq_lens_q: Optional[torch.Tensor] = None,
+        cu_seqlens: Optional[torch.Tensor] = None,
         **kwargs,
     ):
+        if cu_seqlens is not None:
+            cu_seq_lens_q = cu_seqlens
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         # Prepare inputs
