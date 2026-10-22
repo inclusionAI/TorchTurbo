@@ -126,6 +126,7 @@ The example above attaches 16 NPUs (`/dev/davinci0`-`/dev/davinci15`), matching 
 ```bash
 # Install dependencies
 bash scripts/runs/bailing_v3/install_lf_deps.sh
+bash scripts/runs/deps/fla_npu.sh
 # Run training (with the default configuration)
 bash scripts/runs/bailing_v3/lf_sft.sh
 ```
@@ -135,6 +136,7 @@ bash scripts/runs/bailing_v3/lf_sft.sh
 ```bash
 # Install dependencies
 bash scripts/runs/bailing_v3/install_swift_deps.sh
+bash scripts/runs/deps/fla_npu.sh
 # Run training (with the default configuration)
 bash scripts/runs/bailing_v3/swift_sft.sh
 ```
@@ -144,6 +146,7 @@ bash scripts/runs/bailing_v3/swift_sft.sh
 ```bash
 # Install dependencies if they have not already been installed
 bash scripts/runs/bailing_v3/install_lf_deps.sh
+bash scripts/runs/deps/fla_npu.sh
 # Run training (with the default configuration)
 bash scripts/runs/bailing_v3/lf_dpo.sh
 ```
@@ -153,6 +156,7 @@ bash scripts/runs/bailing_v3/lf_dpo.sh
 ```bash
 # Install dependencies if they have not already been installed
 bash scripts/runs/bailing_v3/install_swift_deps.sh
+bash scripts/runs/deps/fla_npu.sh
 # Run training (with the default configuration)
 bash scripts/runs/bailing_v3/swift_dpo.sh
 ```
@@ -162,6 +166,7 @@ bash scripts/runs/bailing_v3/swift_dpo.sh
 ```bash
 # Install dependencies if they have not already been installed
 bash scripts/runs/bailing_v3/install_lf_deps.sh
+bash scripts/runs/deps/fla_npu.sh
 # Run training (with the default configuration)
 bash scripts/runs/bailing_v3/lf_pt.sh
 ```
@@ -171,6 +176,7 @@ bash scripts/runs/bailing_v3/lf_pt.sh
 ```bash
 # Install dependencies if they have not already been installed
 bash scripts/runs/bailing_v3/install_swift_deps.sh
+bash scripts/runs/deps/fla_npu.sh
 # Run training (with the default configuration)
 bash scripts/runs/bailing_v3/swift_pt.sh
 ```
