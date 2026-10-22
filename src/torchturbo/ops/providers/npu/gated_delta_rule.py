@@ -37,8 +37,6 @@ class AscendCGatedDeltaRule(OpImpl):
             from torchturbo.ops.providers.npu._fla_npu_gdn import (  # noqa: F401
                 ascendc_chunk_gated_delta_rule,
             )
-        except ImportError:
-            return False
         except Exception as exc:  # pragma: no cover - diagnostic
             import traceback
 

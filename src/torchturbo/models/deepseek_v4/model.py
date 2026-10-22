@@ -781,4 +781,4 @@ class TurboDeepseekV4ForCausalLM(TurboModel, DeepseekV4ForCausalLM):
         ):
             from .npu import patch_deepseek_v4_npu_sfa_li
 
-            patch_deepseek_v4_npu_sfa_li(sp_rank, sp_size)
+            patch_deepseek_v4_npu_sfa_li(sp_rank, sp_group, sp_size)

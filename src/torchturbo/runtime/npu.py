@@ -130,10 +130,10 @@ class NpuRuntime(DeviceRuntime):
     def initialize(self) -> None:
         if self._initialized:
             return
-        for name, value in _NPU_ENV_DEFAULTS.items():
-            os.environ.setdefault(name, value)
         import torch_npu  # noqa: F401
         from torch_npu.contrib import transfer_to_npu as _  # noqa: F401
+        for name, value in _NPU_ENV_DEFAULTS.items():
+            os.environ.setdefault(name, value)
 
         self._initialized = True
 

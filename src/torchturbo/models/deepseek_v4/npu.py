@@ -9,7 +9,9 @@ from torchturbo.ops import ops
 from .packing_utils import _segment_spans
 
 
-def patch_deepseek_v4_npu_sfa_li(sp_rank: int, sp_size: int) -> None:
+def patch_deepseek_v4_npu_sfa_li(
+    sp_rank: int, sp_group: torch.distributed.ProcessGroup | None, sp_size: int
+) -> None:
     """Install fused NPU sparse-attention and lightning-indexer forwards."""
     from . import modeling_deepseek_v4 as dsv4
 
