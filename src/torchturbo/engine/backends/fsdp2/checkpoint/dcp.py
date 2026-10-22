@@ -29,7 +29,10 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor
 
 from torchturbo.engine.optimizers import OptimizersContainer
-from ....checkpoint.distributed import collective_check
+from ....checkpoint.distributed import (
+    collective_check,
+    get_control_plane_group,
+)
 from torchturbo.logging import get_logger
 
 logger = get_logger(__name__)
@@ -145,7 +148,11 @@ class DcpCheckpoint:
             for fqn, value in model.state_dict().items()
         }
         start = time.perf_counter()
-        dcp.save({_MODEL_KEY: state_dict}, checkpoint_id=dcp_dir)
+        dcp.save(
+            {_MODEL_KEY: state_dict},
+            checkpoint_id=dcp_dir,
+            process_group=get_control_plane_group(),
+        )
         logger.info_rank0(
             "[save] model DCP saved to %s in %.2fs (%d entries)",
             dcp_dir, time.perf_counter() - start, len(state_dict),
@@ -224,7 +231,11 @@ class DcpCheckpoint:
             optim_state, self._ep_partitioned_fqns(model)
         )
         start = time.perf_counter()
-        dcp.save({_OPTIMIZER_KEY: stamped}, checkpoint_id=dcp_dir)
+        dcp.save(
+            {_OPTIMIZER_KEY: stamped},
+            checkpoint_id=dcp_dir,
+            process_group=get_control_plane_group(),
+        )
         logger.info_rank0(
             "[save] optimizer state saved to %s in %.2fs",
             dcp_dir, time.perf_counter() - start,
