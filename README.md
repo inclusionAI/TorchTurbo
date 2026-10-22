@@ -218,6 +218,7 @@ scripts/runs/
 ├── deps/                     # Base dependencies
 │   ├── gpu.sh                # GPU dependencies
 │   ├── npu.sh                # NPU dependencies
+│   ├── fla_npu.sh            # Install the bundled A3 fla-npu wheel
 │   ├── lf_deps.sh            # LlamaFactory dependencies
 │   └── swift_deps.sh         # ms-swift dependencies
 └── qwen3_5_moe/
