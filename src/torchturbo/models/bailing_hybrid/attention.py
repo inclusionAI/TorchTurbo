@@ -31,7 +31,6 @@ def patch_kda_forward(
     parameters are sliced by head for sequence parallelism.
     """
     from fla.modules.fused_norm_gate import rms_norm_gated
-    from fla.ops.kda import chunk_kda
 
     from torchturbo.ops import ops
     from torchturbo.ops.packed_params import get_packed_params
@@ -105,6 +104,14 @@ def patch_kda_forward(
             )
 
         # Every convolution must reset at the same boundaries as recurrent KDA.
+        # ``head_num`` asks the fused convolution provider for its native
+        # head-first ``[B, H, T, Dh]`` output, which is the spelling the fused
+        # KDA operator and its backward consume -- so Q/K/V never cross a
+        # layout transpose.  The convolution is depthwise, so regrouping
+        # channels is exact; the triton provider regroups them itself.
+        q_heads = q.shape[-1] // self.head_k_dim
+        k_heads = k.shape[-1] // self.head_k_dim
+        v_heads = v.shape[-1] // self.head_dim
         q, _ = ops.causal_conv1d(
             x=q,
             weight=get_parameter_local_cp(self.q_conv1d.weight, dim=0).squeeze(1),
@@ -115,6 +122,7 @@ def patch_kda_forward(
             initial_state=None,
             output_final_state=False,
             packed_params=packed_params,
+            head_num=q_heads,
         )
         k, _ = ops.causal_conv1d(
             x=k,
@@ -126,6 +134,7 @@ def patch_kda_forward(
             initial_state=None,
             output_final_state=False,
             packed_params=packed_params,
+            head_num=k_heads,
         )
         v, _ = ops.causal_conv1d(
             x=v,
@@ -137,6 +146,7 @@ def patch_kda_forward(
             initial_state=None,
             output_final_state=False,
             packed_params=packed_params,
+            head_num=v_heads,
         )
 
         # Compute g, beta from padded hidden_states (always [B, T/sp, H] format)
@@ -146,9 +156,8 @@ def patch_kda_forward(
             g = self.f_b_proj(self.f_a_proj(hidden_states))
         beta = self.b_proj(hidden_states).float().sigmoid()
 
-        q = q.unflatten(-1, (-1, self.head_k_dim))
-        k = k.unflatten(-1, (-1, self.head_k_dim))
-        v = v.unflatten(-1, (-1, self.head_dim))
+        # q/k/v already come back head-first [B, H, T, D] from the fused
+        # convolution, so only the gate needs its last-dim head split.
         g = g.unflatten(-1, (-1, self.head_dim))
 
         if sp_size > 1:
@@ -169,7 +178,16 @@ def patch_kda_forward(
             A_log_local = self.A_log
             dt_bias_local = self.dt_bias
 
-        o, _ = chunk_kda(
+        # ops dispatcher routes to the native fla triton chunk_kda by
+        # default; the AscendC fused fwd+bwd provider is opt-in
+        # (TORCHTURBO_KDA_ASCENDC=1 or an explicit impl/override).
+        #
+        # ``head_major_qkv`` keeps Q/K/V head-first into the operator (the
+        # native provider converts internally).  ``disable_recompute=True``
+        # is required by the fused AscendC backward, which has no recompute
+        # path on A2/A3 -- set it on the triton provider too so both
+        # backends run in the same memory regime and stay comparable.
+        o, _ = ops.chunk_kda(
             q=q,
             k=k,
             v=v,
@@ -184,6 +202,8 @@ def patch_kda_forward(
             safe_gate=self.safe_gate,
             lower_bound=self.lower_bound,
             cu_seqlens=cu_seqlens,
+            disable_recompute=True,
+            head_major_qkv=True,
         )
 
         if sp_size > 1:

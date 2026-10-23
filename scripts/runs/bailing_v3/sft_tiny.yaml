@@ -1,0 +1,25 @@
+engine_config:
+  parallel_plan:
+    sp_size: 8
+    ep_size: 8
+  optimizer:
+    name: muon
+    muon:
+      # Engine-managed Muon takes its LR and weight decay from here;
+      # LlamaFactory --learning_rate / --weight_decay are ignored for it.
+      # Values mirror the internal tiny SFT launch (0.000055 / 0.1).
+      lr: 0.000055
+      weight_decay: 0.1
+      # The fallback AdamW rate follows config.lr when adamw_lr is unset.
+      adamw_betas: [0.9, 0.95]
+  moe:
+    z_loss_coeff: 0.0000029
+  activation_checkpointing:
+    use_reentrant: true
+  loss_chunk:
+    enabled: true
+  mfu:
+    enabled: true
+  mtp:
+    enabled: true
+    loss_scaling_factor: 0.1

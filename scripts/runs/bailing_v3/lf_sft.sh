@@ -20,6 +20,23 @@ FINETUNING_TYPE=${FINETUNING_TYPE:-full}
 DATASET=${DATASET:-science}
 # turbo engine flags (sp/ep, freeze, cpu offload) live in the sibling yaml.
 TT_CONFIG=${TT_CONFIG:-"$(dirname "$0")/sft.yaml"}
+# optimizer shared by Muon and its fallback AdamW groups; also 2D-matrix LR
+# adjustment matters, so keep LR small for full fine-tuning.
+EPOCHS=${EPOCHS:-1}
+LEARNING_RATE=${LEARNING_RATE:-1.25e-5}
+MIN_LR_RATIO=${MIN_LR_RATIO:-0.0}
+WEIGHT_DECAY=${WEIGHT_DECAY:-0.0}
+ADAM_BETA1=${ADAM_BETA1:-0.9}
+ADAM_BETA2=${ADAM_BETA2:-0.95}
+WARMUP_RATIO=${WARMUP_RATIO:-0.0}
+# checkpointing cadence; 200000000 disables intermediate saves.
+SAVE_STEPS=${SAVE_STEPS:-200000000}
+SAVE_TOTAL_LIMIT=${SAVE_TOTAL_LIMIT:-1}
+SEED=${SEED:-42}
+# neat-packing flag; set to empty string to disable.
+NEAT_PACKING=${NEAT_PACKING:-"--neat_packing"}
+# tensorboard event directory (shared across nodes).
+LOGGING_DIR=${LOGGING_DIR:-}
 
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 
@@ -51,7 +68,7 @@ LOG_FILE=${LOG_FILE_PREFIX:-$OUTPUT_DIR/rank$NODE_RANK}-$CUR_TIME.log
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 RUN_LF="${REPO_ROOT}/scripts/runs/run_lf.py"
-DATASET_DIR="${REPO_ROOT}/dataset"
+DATASET_DIR=${DATASET_DIR:-"${REPO_ROOT}/dataset"}
 export PYTHONPATH=$REPO_ROOT/src:$PYTHONPATH
 
 DISTRIBUTED_ARGS="
@@ -66,9 +83,15 @@ mkdir -p $OUTPUT_DIR
 echo $CUR_TIME >> $LOG_FILE
 echo $OUTPUT_DIR >> $LOG_FILE
 
+TT_LOGGING_ARGS=""
+if [ -n "$LOGGING_DIR" ]; then
+    TT_LOGGING_ARGS="--logging_dir ${LOGGING_DIR}"
+fi
+
 torchrun $DISTRIBUTED_ARGS $RUN_LF \
     --tt_config ${TT_CONFIG} \
     --report_to tensorboard \
+    ${TT_LOGGING_ARGS} \
     --disable_shuffling \
     --stage sft \
     --model_name_or_path $MODEL \
@@ -82,7 +105,7 @@ torchrun $DISTRIBUTED_ARGS $RUN_LF \
     --finetuning_type ${FINETUNING_TYPE} \
     --output_dir $OUTPUT_DIR \
     --overwrite_output_dir \
-    --num_train_epochs 1 \
+    --num_train_epochs ${EPOCHS} \
     --per_device_train_batch_size 1 \
     --gradient_accumulation_steps 1 \
     --eval_strategy no \
@@ -91,14 +114,18 @@ torchrun $DISTRIBUTED_ARGS $RUN_LF \
     --logging_steps 1 \
     --overwrite_cache \
     --save_strategy "steps" \
-    --save_steps 200000000 \
-    --warmup_ratio 0.0 \
-    --learning_rate 1.25e-5 \
-    --save_total_limit 1 \
+    --save_steps ${SAVE_STEPS} \
+    --warmup_ratio ${WARMUP_RATIO} \
+    --learning_rate ${LEARNING_RATE} \
+    --min_lr_ratio ${MIN_LR_RATIO} \
+    --weight_decay ${WEIGHT_DECAY} \
+    --adam_beta1 ${ADAM_BETA1} \
+    --adam_beta2 ${ADAM_BETA2} \
+    --save_total_limit ${SAVE_TOTAL_LIMIT} \
     --plot_loss \
-    --seed 42 \
+    --seed ${SEED} \
     --ddp_timeout 1800000000 \
     --bf16 \
-    --neat_packing \
+    ${NEAT_PACKING} \
     --trust_remote_code \
     2>&1 | tee $LOG_FILE

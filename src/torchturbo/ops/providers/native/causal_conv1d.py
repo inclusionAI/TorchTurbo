@@ -37,6 +37,7 @@ class FlaCausalConv1d(OpImpl):
         initial_state=None,
         output_final_state: bool = False,
         packed_params=None,
+        head_num=None,
         **kwargs,
     ):
         # fla's causal_conv1d is an autograd function returning (y, final_state).
@@ -50,7 +51,7 @@ class FlaCausalConv1d(OpImpl):
             if cu_seqlens is not None:
                 raise ValueError("pass either cu_seqlens or packed_params, not both")
             cu_seqlens = packed_params.cu_seqlens
-        return causal_conv1d(
+        y, final_state = causal_conv1d(
             x=x,
             weight=weight,
             bias=bias,
@@ -59,3 +60,19 @@ class FlaCausalConv1d(OpImpl):
             output_final_state=output_final_state,
             cu_seqlens=cu_seqlens,
         )
+        if head_num is not None and y is not None:
+            # Mirror the AscendC provider's head-first spelling so callers can
+            # feed the fused KDA operator without knowing which backend ran.
+            # The convolution is depthwise, so regrouping the channels is exact.
+            head_num = int(head_num)
+            batch, seq_len, dim = y.shape
+            if head_num <= 0 or dim % head_num:
+                raise ValueError(
+                    f"head_num={head_num} must be a positive divisor of D={dim}."
+                )
+            y = (
+                y.view(batch, seq_len, head_num, dim // head_num)
+                .transpose(1, 2)
+                .contiguous()
+            )
+        return y, final_state

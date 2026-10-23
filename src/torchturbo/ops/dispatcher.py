@@ -419,6 +419,7 @@ class OpDispatcher:
         output_final_state: bool = False,
         cu_seqlens: torch.Tensor | None = None,
         packed_params=None,
+        head_num=None,
         impl: str | None = None,
     ):
         if cu_seqlens is not None:
@@ -434,6 +435,7 @@ class OpDispatcher:
             initial_state=initial_state,
             output_final_state=output_final_state,
             packed_params=packed_params,
+            head_num=head_num,
             impl=impl,
         )
 
