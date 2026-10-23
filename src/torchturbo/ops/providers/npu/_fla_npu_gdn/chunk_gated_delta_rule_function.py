@@ -21,12 +21,9 @@ The public entry is ``ChunkGatedDeltaRuleFunction.apply`` with this signature::
     )
 
 The adapter implements the full forward and backward chains, including GVA
-head reduction. The current v26.6.0 ``bwd_dhu`` kernel does not consume
-``h0``/``dht`` or produce ``dh0``. This wrapper therefore supports
-``initial_state`` as a constant forward input, but rejects initial-state
-gradients and final-state-gradient propagation instead of silently returning
-incorrect gradients. Other unsupported combinations are rejected before the
-first compute kernel is launched.
+head reduction. It supports ``initial_state`` as a constant forward input,
+but does not implement initial-state or final-state gradients. Unsupported
+combinations are rejected before the first compute kernel is launched.
 """
 
 from __future__ import annotations
@@ -561,11 +558,9 @@ def _forward_chain(
         initial_state=initial_state,
         output_final_state=output_final_state,
         chunk_size=chunk_size,
-        save_new_value=True,
         cu_seqlens=cu_seqlens_list,
         chunk_indices=chunk_list,
-        use_exp2=False,
-        transpose_state_layout=False,
+        state_v_first=False,
     )
     output_head = ascendc_chunk_fwd_o(
         q,
@@ -636,9 +631,8 @@ def _backward_chain(
         raise ValueError("do must have the same dtype/device as v")
     if dht is not None:
         raise NotImplementedError(
-            "final_state gradient is unsupported by the current v26.6.0 "
-            "AscendC chunk_gated_delta_rule_bwd_dhu kernel: the kernel "
-            "ignores dht. Set output_final_state=False, or do not include "
+            "final_state gradients are unsupported by this adapter. "
+            "Set output_final_state=False, or do not include "
             "final_state in the differentiated loss."
         )
 
@@ -666,11 +660,9 @@ def _backward_chain(
             initial_state=initial_state,
             output_final_state=False,
             chunk_size=chunk_size,
-            save_new_value=True,
             cu_seqlens=cu_seqlens_list,
             chunk_indices=chunk_list,
-            use_exp2=False,
-            transpose_state_layout=False,
+            state_v_first=False,
         )
     else:
         assert saved_u is not None and saved_h is not None and saved_v_new is not None
@@ -697,9 +689,7 @@ def _backward_chain(
         chunk_size,
         g=g_head,
         gK=None,
-        # v26.6.0 ignores both state tensors in the kernel. Passing the
-        # documented 4D h0 also hits an erroneous 5D check in the legacy
-        # torch wrapper, so omit both on supported gradient paths.
+        # This adapter does not propagate initial-state or final-state gradients.
         h0=None,
         dht=None,
         cu_seqlens=cu_seqlens_list,
@@ -766,8 +756,7 @@ def _backward_chain(
         head_first=False,
     )
     dbeta = dbeta.transpose(1, 2).contiguous()
-    # v26.6.0 does not implement dh0. Forward rejects a differentiable
-    # initial_state, so None is the only correct result on supported paths.
+    # Forward rejects a differentiable initial_state, so no gradient is returned.
     dh0 = None
     return dq, dk, dv, dg, dbeta, dh0
 
@@ -842,11 +831,8 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             )
         if initial_state is not None and ctx.needs_input_grad[6]:
             raise NotImplementedError(
-                "initial_state.requires_grad=True is unsupported by the "
-                "current v26.6.0 AscendC "
-                "chunk_gated_delta_rule_bwd_dhu kernel: the kernel does not "
-                "produce dh0. Pass a detached initial_state until state "
-                "backward is implemented."
+                "initial_state.requires_grad=True is unsupported by this "
+                "adapter. Pass a detached initial_state."
             )
 
         q = q.contiguous()
