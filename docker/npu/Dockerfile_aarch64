@@ -22,10 +22,12 @@ RUN pip install triton==3.5.0
 RUN pip install triton-ascend==3.2.2 --extra-index-url=https://triton-ascend.osinfra.cn/pypi/simple
 COPY docker/npu/pkg/* /usr/local/package/
 RUN pip install /usr/local/package/torch_npu-2.10.0.post2-cp311-cp311-manylinux_2_28_aarch64.whl
+# flash-linear-attention-npu 26.6.0: built from flashserve/flash-linear-attention-npu
+# branch v26.6.0, commit 7765e45 ("fix: isolate FLA and CANN opapi dynamic symbols" #392).
 RUN pip install /usr/local/package/flash_linear_attention_npu-26.6.0-910_93.aarch64-py3-none-any.whl --force-reinstall --no-deps
-RUN pip install /usr/local/package/flash_linear_attention-0.6.0-py3-none-any.whl
-ENV ASCEND_CUSTOM_OPP_PATH=/usr/local/python3.11.15/lib/python3.11/site-packages/fla_npu/opp:/usr/local/python3.11.15/lib/python3.11/site-packages/fla_npu/opp/vendors/fla_npu_transformer:${ASCEND_CUSTOM_OPP_PATH}
-ENV LD_LIBRARY_PATH=/usr/local/python3.11.15/lib/python3.11/site-packages/fla_npu/opp/vendors/fla_npu_transformer/op_api/lib:${LD_LIBRARY_PATH}
+# flash-linear-attention: built from the fla-org/flash-linear-attention
+# main branch at commit 954438d1, not from any official release.
+RUN pip install /usr/local/package/flash_linear_attention-0.6.0+main.954438d1-py3-none-any.whl
 # Install other packages
 RUN pip install py-spy==0.4.2
 
