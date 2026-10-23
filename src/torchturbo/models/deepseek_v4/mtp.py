@@ -656,7 +656,14 @@ class DeepseekV4MTPForwarder:
         global_input_ids = all_gather_sp_with_grad_reduce(
             input_ids, dim=1, sp_group=self.sp_group, sp_size=self.sp_size
         )
+        if cu_seq_lens is None:
+            segment_ids = torch.ones_like(global_input_ids)
+        else:
+            segment_ids = cu_seqlens_to_segment_ids(
+                cu_seq_lens, global_input_ids.size(-1)
+            ).to(input_ids.device)
         mtp_start = self.sp_rank * local_length
+        local_segment_ids = segment_ids[..., mtp_start:mtp_start + local_length]
         mtp_logits = []
         for layer_idx, mtp_layer in enumerate(model.mtp, start=1):
             start = mtp_start + layer_idx
@@ -666,6 +673,21 @@ class DeepseekV4MTPForwarder:
                 (0, local_length - mtp_input_ids.size(-1)),
                 value=model.padding_idx,
             )
+            shifted_segment_ids = segment_ids[..., start:start + local_length]
+            shifted_segment_ids = F.pad(
+                shifted_segment_ids,
+                (0, local_length - shifted_segment_ids.size(-1)),
+                value=0,
+            )
+            # MTP inputs must stay within their original sample. Zero segment
+            # IDs exclude both existing padding and the newly padded tail.
+            padding_mask = (shifted_segment_ids == 0) | (
+                shifted_segment_ids != local_segment_ids
+            )
+            runtime_inputs = MoERuntimeInputs(padding_mask=padding_mask)
+            for module in mtp_layer.modules():
+                if isinstance(module, BaseMoELayer):
+                    module.set_runtime_inputs(runtime_inputs)
             embedding_hidden_states = model.embed(mtp_input_ids)
             hidden_states, mtp_logits_i = mtp_layer(
                 hidden_states,
@@ -768,9 +790,8 @@ class DeepseekV4MTPForwarder:
         draft_input_ids = draft_input_ids.view(batch_size, -1)
 
         padding_mask = ~block_mask.repeat_interleave(block_size, dim=1)
-        # Keep exactly one fallback block active on an anchor-empty rank;
-        # eval_mask keeps fallback blocks out of the DSpark loss.
-        padding_mask[0, :block_size] &= block_mask.any()
+        # Placeholder blocks still run for collective participation, but are
+        # excluded from router losses and expert-bias statistics.
         draft_runtime_inputs = MoERuntimeInputs(padding_mask=padding_mask)
         for module in model.mtp.modules():
             if isinstance(module, BaseMoELayer):

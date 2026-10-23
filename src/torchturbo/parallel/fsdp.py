@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import copy
+from collections.abc import Mapping
+from dataclasses import dataclass, field, fields
 from enum import Enum
 from typing import TYPE_CHECKING, Any
 
@@ -141,6 +143,41 @@ class FSDPParallelPlan(ParallelPlan):
                 self.plan[k] = FSDPPlanSpec(placement=v)
             elif not isinstance(v, FSDPPlanSpec):
                 self.plan[k] = FSDPPlanSpec(placement=FSDPPlacementSpec(placement=v))
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize the plan schema, keeping replacement kwargs and IO objects typed."""
+        plan = copy.deepcopy(self)
+        data = {f.name: getattr(plan, f.name) for f in fields(plan)}
+        data["plan"] = {}
+        for fqn, spec in plan.plan.items():
+            spec_d = {f.name: getattr(spec, f.name) for f in fields(spec)}
+            for name in ("placement", "vision_balance"):
+                value = spec_d[name]
+                if value is not None:
+                    spec_d[name] = {f.name: getattr(value, f.name) for f in fields(value)}
+            data["plan"][fqn] = spec_d
+        return data
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> FSDPParallelPlan:
+        """Rebuild a full plan or partial overrides from a dictionary."""
+        spec_fields = [f.name for f in fields(FSDPPlanSpec)]
+        plan_entries = {}
+        for fqn, spec_d in (data.get("plan") or {}).items():
+            # Missing fields must remain None so partial plans inherit model defaults.
+            spec_kwargs = {**dict.fromkeys(spec_fields), **spec_d}
+            placement_d = spec_kwargs["placement"]
+            if isinstance(placement_d, Mapping):
+                spec_kwargs["placement"] = FSDPPlacementSpec(**placement_d)
+            vision_d = spec_kwargs["vision_balance"]
+            if vision_d is not None:
+                mode = vision_d.get("mode")
+                spec_kwargs["vision_balance"] = VisionBalanceSpec(**{
+                    **vision_d,
+                    "mode": VisionBalanceMode(mode) if mode is not None else None,
+                })
+            plan_entries[fqn] = FSDPPlanSpec(**spec_kwargs)
+        return cls(**{**data, "plan": plan_entries})
 
     def match(self, fqn: str) -> Any | None:
         """Find the specification for a given FQN. Returns None if no match."""

@@ -84,6 +84,24 @@ def test_parallel_plan_still_normalizes_tuple_placement_specs():
     assert spec.placement.mesh_dim == "edp"
 
 
+def test_parallel_plan_round_trip_preserves_partial_overrides():
+    plan = FSDPParallelPlan.from_dict({
+        "sp_size": 2,
+        "ep_size": 4,
+        "tp_size": 2,
+        "plan": {"model.visual": {"vision_balance": {"mode": "patch_sq"}}},
+    })
+    restored = FSDPParallelPlan.from_dict(plan.to_dict())
+
+    assert restored == plan
+    assert (restored.sp_size, restored.ep_size, restored.tp_size) == (2, 4, 2)
+    spec = restored.plan["model.visual"]
+    assert spec.vision_balance.mode is VisionBalanceMode.PATCH_SQ
+    assert spec.standalone_world_shard is None
+    assert spec.activation_checkpoint is None
+    assert spec.module_kwargs is None
+
+
 def test_match_fqn_star_stays_within_one_segment():
     assert match_fqn(
         "model.layers.*.q_*.weight",

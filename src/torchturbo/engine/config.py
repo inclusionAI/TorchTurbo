@@ -22,16 +22,13 @@ import os
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Literal, get_args, get_type_hints
+from typing import Any, Literal, get_args, get_type_hints
 
 from omegaconf import OmegaConf
 
 from ..logging import get_logger
 from ..ops.base import OpPolicy
 from .args import TorchTurboArgs, get_arg_specs, string_to_bool
-
-if TYPE_CHECKING:
-    from ..parallel import FSDPParallelPlan
 
 logger = get_logger(__name__)
 
@@ -476,6 +473,12 @@ class MoEConfig:
 
     aux_loss_coeff: float = 0.0
     z_loss_coeff: float = 0.0
+    token_dispatcher: str = "alltoall"
+    """Expert token dispatcher type."""
+
+    def __post_init__(self) -> None:
+        if self.token_dispatcher != "alltoall":
+            raise ValueError("moe.token_dispatcher must be 'alltoall'.")
 
 
 @dataclass
@@ -715,8 +718,7 @@ class EngineConfig:
         elif parallel_d is not None:
             if not isinstance(parallel_d, Mapping):
                 raise ValueError("parallel_plan must be a mapping or FSDPParallelPlan.")
-            _validate_config_file({"parallel_plan": parallel_d})
-            parallel_plan = _parse_parallel_plan({**parallel_sizes, **parallel_d})
+            parallel_plan = FSDPParallelPlan.from_dict({**parallel_sizes, **parallel_d})
         else:
             parallel_plan = FSDPParallelPlan(**parallel_sizes)
 
@@ -838,10 +840,14 @@ class EngineConfig:
             "enable_chunk_loss",
             "loss_chunk_size",
             "freeze_policy",
+            "diffusion",
             "mfu",
             "gbs",
+            "plugin_paths",
+            "extra",
         }
-        extra = {k: v for k, v in d.items() if k not in known_keys}
+        extra = dict(d.get("extra") or {})
+        extra.update({k: v for k, v in d.items() if k not in known_keys})
 
         return cls(
             backend=backend,
@@ -859,8 +865,10 @@ class EngineConfig:
             moe=moe_config,
             loss_chunk=loss_chunk_config,
             freeze_policy=freeze_policy,
+            diffusion=_build_diffusion_config(d),
             mfu=mfu_config,
             gbs=d.get("gbs"),
+            plugin_paths=list(d.get("plugin_paths") or []),
             extra=extra,
         )
 
@@ -955,12 +963,15 @@ class EngineConfig:
         return FreezePolicy.from_list(value["parameter_groups"])
 
     def to_dict(self) -> dict[str, Any]:
-        """Serialize back to a dict (for logging, etc.)."""
+        """Serialize configuration fields for logging or reconstruction."""
+        from torchturbo.parallel import FSDPParallelPlan
 
         data = {}
         for field_info in dataclasses.fields(self):
             value = getattr(self, field_info.name)
-            if dataclasses.is_dataclass(value):
+            if isinstance(value, FSDPParallelPlan):
+                value = value.to_dict()
+            elif dataclasses.is_dataclass(value):
                 value = dataclasses.asdict(value)
             data[field_info.name] = value
         return data
@@ -995,6 +1006,8 @@ def build_from_args(
         Parsed ``--tt_*`` args (the single source of truth for turbo flags).
         ``None`` is treated as all-defaults.
     """
+    from torchturbo.parallel import FSDPParallelPlan
+
     tt = torchturbo_args or TorchTurboArgs()
     arg_specs = get_arg_specs()
 
@@ -1077,7 +1090,7 @@ def build_from_args(
         OmegaConf.merge(fields, config_from_file, config_from_cli), resolve=True
     )
 
-    parallel_plan = _parse_parallel_plan(fields.get("parallel_plan") or {})
+    parallel_plan = FSDPParallelPlan.from_dict(fields.get("parallel_plan") or {})
 
     ac_d = dict(fields.get("activation_checkpointing") or {})
     if "enabled" in ac_d:
@@ -1121,33 +1134,6 @@ def build_from_args(
         config.parallel_plan.ep_size,
     )
     return config
-
-
-def _parse_parallel_plan(parallel_d: Mapping[str, Any]) -> FSDPParallelPlan:
-    """Parse a validated plan mapping shared by file and dict configuration."""
-    from torchturbo.parallel import (
-        FSDPParallelPlan,
-        FSDPPlanSpec,
-        VisionBalanceMode,
-        VisionBalanceSpec,
-    )
-
-    spec_fields = [f.name for f in dataclasses.fields(FSDPPlanSpec)]
-    plan_entries = {}
-    for fqn, spec_d in (parallel_d.get("plan") or {}).items():
-        spec_kwargs = {f: spec_d.get(f) for f in spec_fields}
-        vision_d = spec_kwargs["vision_balance"]
-        if vision_d is not None:
-            mode = vision_d.get("mode")
-            spec_kwargs["vision_balance"] = VisionBalanceSpec(
-                mode=VisionBalanceMode(mode) if mode is not None else None,
-            )
-        plan_entries[fqn] = FSDPPlanSpec(**spec_kwargs)
-    return FSDPParallelPlan(
-        plan=plan_entries,
-        sp_size=parallel_d.get("sp_size", 1),
-        ep_size=parallel_d.get("ep_size", 1),
-    )
 
 
 def _dataclass_config_paths(
@@ -1301,6 +1287,7 @@ def _build_moe_config(fields: Mapping[str, Any]) -> MoEConfig:
     return MoEConfig(
         aux_loss_coeff=float(moe_d.get("aux_loss_coeff", 0.0)),
         z_loss_coeff=float(moe_d.get("z_loss_coeff", 0.0)),
+        token_dispatcher=moe_d.get("token_dispatcher", "alltoall"),
     )
 
 

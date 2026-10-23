@@ -7,9 +7,8 @@
   # Modified by the TorchTurbo contributors.
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Optional, Union
-import os
 
 import torch
 import torch.distributed as dist
@@ -19,9 +18,6 @@ from .moe_config import MoEConfig
 from .router import TopKRouter
 from .token_dispatcher import MoETokenDispatcher, MoEAlltoAllTokenDispatcher
 from .module import ModuleSpec, build_module
-from torchturbo.logging import get_logger
-
-logger = get_logger(__name__)
 
 
 @dataclass
@@ -45,7 +41,7 @@ class BaseMoELayer(torch.nn.Module, ABC):
         config: MoEConfig,
         ep_group: dist.ProcessGroup,
         layer_number: Optional[int] = None,
-    ):
+    ) -> None:
         super().__init__()
 
         ep_size = dist.get_world_size(ep_group)
@@ -76,6 +72,8 @@ class BaseMoELayer(torch.nn.Module, ABC):
         self.router: TopKRouter = None
         self.experts = None
         self.shared_experts = None
+        self.shared_expert = None
+        self.shared_expert_gate = None
         self.token_dispatcher: Optional[MoETokenDispatcher] = None
         self.layer_number = layer_number
         self._runtime_inputs = MoERuntimeInputs()
@@ -84,7 +82,9 @@ class BaseMoELayer(torch.nn.Module, ABC):
         self._runtime_inputs = inputs
 
     @abstractmethod
-    def forward(self, hidden_states, input_ids=None):
+    def forward(
+        self, hidden_states: torch.Tensor, input_ids: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Forward method for the MoE layer."""
         pass
 
@@ -99,12 +99,10 @@ class MoELayer(BaseMoELayer):
         config: MoEConfig,
         ep_group: dist.ProcessGroup,
         submodules: Optional[MoESubmodules] = None,
-        use_fused_permute_unpermute: Optional[bool] = False,
-        use_te: Optional[bool] = False,
+        use_te: bool = False,
         layer_number: Optional[int] = None,
-        sp_group=None,
-    ):
-        self.use_fused_permute_unpermute = use_fused_permute_unpermute
+        sp_group: dist.ProcessGroup | None = None,
+    ) -> None:
         self.use_te = use_te
         self.submodules = submodules
         super(MoELayer, self).__init__(
@@ -146,82 +144,34 @@ class MoELayer(BaseMoELayer):
                 self.submodules.shared_experts, config=self.config
             )
 
-    def forward(self, hidden_states: torch.Tensor, input_ids=None):
-        # debug
-        rank = torch.distributed.get_rank()
+    def forward(
+        self, hidden_states: torch.Tensor, input_ids: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Route tokens, compute local experts, and combine their outputs."""
+        routing, logits = self.router(
+            hidden_states, input_ids, self._runtime_inputs.padding_mask
+        )
+        logits = logits.view(-1, logits.shape[-1])
 
-        # process MoE
-        def custom_forward(hidden_states, input_ids=None):
-            hidden_states_dtype = hidden_states.dtype
-            routing, logits = self.router(
-                hidden_states, input_ids, self._runtime_inputs.padding_mask
+        dispatcher = self.token_dispatcher
+        packed, packed_probs = dispatcher.dispatch_preprocess(hidden_states, routing)
+        received, received_probs = dispatcher.token_dispatch(packed, packed_probs)
+        expert_input, tokens_per_expert, expert_probs = dispatcher.dispatch_postprocess(
+            received, received_probs,
+        )
+        expert_output, bias = self.experts(expert_input, tokens_per_expert, expert_probs)
+        assert bias is None, "Bias is not supported in MoEAlltoAllTokenDispatcher"
+        combined = dispatcher.combine_preprocess(expert_output)
+        returned = dispatcher.token_combine(combined)
+        output = dispatcher.combine_postprocess(returned)
+        output = output.to(hidden_states.dtype)
+
+        if self.shared_expert is not None:
+            shared_expert_output = self.shared_expert(hidden_states)
+            shared_expert_output = (
+                F.sigmoid(self.shared_expert_gate(hidden_states)) * shared_expert_output
             )
-            if self.config.moe_router_score_function == "softmax":
-                routing = replace(
-                    routing,
-                    probs=routing.probs / routing.probs.sum(dim=-1, keepdim=True),
-                )
-            logits = logits.view(-1, logits.shape[-1])
-            (dispatched_input, tokens_per_expert, permuted_probs) = (
-                self.token_dispatcher.token_permutation(
-                    hidden_states, routing
-                )
-            )
-            expert_output, mlp_bias = self.experts(
-                dispatched_input, tokens_per_expert, permuted_probs
-            )
-
-            if self.token_dispatcher.deferred_probs_to_unpermutation:
-                probs_for_unpermutation = routing.selected_probs()
-                output, mlp_bias = self.token_dispatcher.token_unpermutation(
-                    expert_output, mlp_bias, probs=probs_for_unpermutation
-                )
-            else:
-                expert_output = expert_output * permuted_probs.unsqueeze(-1)
-                output, mlp_bias = self.token_dispatcher.token_unpermutation(
-                    expert_output, mlp_bias
-                )
-            output = output.to(hidden_states_dtype)
-
-            if hasattr(self, "shared_expert") and self.shared_expert is not None:
-                shared_expert_output = self.shared_expert(hidden_states)
-                shared_expert_output = (
-                    F.sigmoid(self.shared_expert_gate(hidden_states))
-                    * shared_expert_output
-                )
-                output = output + shared_expert_output
-
-            if hasattr(self, "shared_experts") and self.shared_experts is not None:
-                shared_expert_output = self.shared_experts(hidden_states)
-                output = output + shared_expert_output
-
-            if rank == 0 and int(os.environ.get('TORCH_TURBO_DEBUG', '0')):
-                logger.debug_rank0(
-                    "hidden_states.shape %s hidden_states %s",
-                    hidden_states.shape, hidden_states,
-                )
-                logger.debug_rank0(
-                    "dispatched_input.shape %s dispatched_input %s",
-                    dispatched_input.shape, dispatched_input,
-                )
-                logger.debug_rank0(
-                    "tokens_per_expert.shape %s tokens_per_expert %s",
-                    tokens_per_expert.shape, tokens_per_expert,
-                )
-                logger.debug_rank0(
-                    "permuted_probs.shape %s permuted_probs %s",
-                    permuted_probs.shape, permuted_probs,
-                )
-                logger.debug_rank0(
-                    "before unpermutation: expert_output.shape %s expert_output %s",
-                    expert_output.shape, expert_output,
-                )
-                logger.debug_rank0(
-                    "after unpermutation: expert_output.shape %s expert_output %s",
-                    output.shape, output,
-                )
-
-            return output, mlp_bias, logits
-
-        output, mlp_bias, logits = custom_forward(hidden_states, input_ids)
+            output = output + shared_expert_output
+        if self.shared_experts is not None:
+            output = output + self.shared_experts(hidden_states)
         return output, logits

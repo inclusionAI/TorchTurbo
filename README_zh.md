@@ -293,7 +293,6 @@ docs/runs/
 | `TORCH_TURBO_PREFETCH_DIRECTION=forward_backward` | prefetch 作用的 pass：`forward` / `forward_backward`（默认） |
 | `TORCH_TURBO_FORWARD_PREFETCH_DEPTH=1` | forward 每个 source 预取多少层（默认 1） |
 | `TORCH_TURBO_BACKWARD_PREFETCH_DEPTH=1` | backward 每个 source 预取多少层（默认 1，仅 forward_backward 生效） |
-| `TORCH_TURBO_DEBUG=1` | 开启 MoE 层额外的 rank-0 调试输出 |
 
 
 ## 命令行参数说明

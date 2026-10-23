@@ -82,6 +82,92 @@ def test_engine_config_to_dict_excludes_runtime_state():
     assert "device_runtime" not in data
 
 
+@pytest.mark.parametrize("through_json", [False, True])
+def test_engine_config_round_trip_preserves_all_settings(through_json):
+    from torchturbo.engine.args import TorchTurboArgs
+    from torchturbo.engine.config import DiffusionConfig, EngineConfig, build_from_args
+    from torchturbo.parallel import FSDPPlanSpec, VisionBalanceMode, VisionBalanceSpec
+
+    original = build_from_args(TorchTurboArgs(sp_size=2, ep_size=4))
+    original.parallel_plan.plan = {
+        "model.layers.*": FSDPPlanSpec(activation_checkpoint=True),
+        "model.visual": FSDPPlanSpec(
+            standalone_world_shard=True,
+            vision_balance=VisionBalanceSpec(mode=VisionBalanceMode.PATCH_SQ),
+        ),
+    }
+    original.moe.aux_loss_coeff = 0.01
+    original.diffusion = DiffusionConfig(
+        cap_lambda=2.0, bd_mask_low=0.2, bd_mask_high=0.9, bd_block_size=16,
+    )
+    original.plugin_paths = ["custom_plugin.py"]
+    original.extra = {"run_name": "round-trip", "metadata": {"seed": 7}}
+    restored = original
+    for _ in range(2):
+        serialized = restored.to_dict()
+        if through_json:
+            serialized = json.loads(json.dumps(serialized))
+        restored = EngineConfig.from_dict(serialized)
+        assert restored == original
+
+
+def test_engine_config_dict_round_trip_restores_runtime_plan_fields():
+    from torch.distributed.tensor import Shard
+
+    from torchturbo.engine.config import EngineConfig
+    from torchturbo.models.bailing_moe_v3_vl.vision_balance import BailingVisionBalanceIO
+    from torchturbo.models.modules.moe.experts import GroupedMLP
+    from torchturbo.models.modules.moe.module import ModuleSpec
+    from torchturbo.models.modules.moe.moe_layer import MoELayer, MoESubmodules
+    from torchturbo.parallel import (
+        FSDPParallelPlan, FSDPPlacementSpec, FSDPPlanSpec,
+        VisionBalanceMode, VisionBalanceSpec,
+    )
+
+    original = EngineConfig(parallel_plan=FSDPParallelPlan(
+        sp_size=2, ep_size=4, tp_size=2,
+        plan={"model.visual": FSDPPlanSpec(
+            placement=FSDPPlacementSpec(placement=Shard(0), mesh_dim="ep"),
+            replace_module=MoELayer,
+            module_kwargs={"moe_submodules": MoESubmodules(
+                experts=ModuleSpec(module=GroupedMLP),
+            )},
+            vision_balance=VisionBalanceSpec(
+                mode=VisionBalanceMode.PATCH, io=BailingVisionBalanceIO(),
+            ),
+        )},
+    ))
+    serialized = original.to_dict()
+    restored = EngineConfig.from_dict(serialized)
+    spec = restored.parallel_plan.plan["model.visual"]
+
+    assert restored.parallel_plan.tp_size == 2
+    assert isinstance(spec.placement, FSDPPlacementSpec)
+    assert spec.placement.placement == Shard(0)
+    assert spec.placement.mesh_dim == "ep"
+    assert spec.vision_balance.mode is VisionBalanceMode.PATCH
+    assert isinstance(spec.vision_balance.io, BailingVisionBalanceIO)
+    assert spec.vision_balance.io is serialized["parallel_plan"]["plan"]["model.visual"]["vision_balance"]["io"]
+    assert spec.replace_module is MoELayer
+    submodules = spec.module_kwargs["moe_submodules"]
+    assert isinstance(submodules, MoESubmodules)
+    assert isinstance(submodules.experts, ModuleSpec)
+    assert submodules.experts.module is GroupedMLP
+
+
+@pytest.mark.parametrize("plan", [
+    {"typo": 1},
+    {"plan": {"model.layers.*": {"typo": True}}},
+    {"plan": {"model.visual": {"vision_balance": {"typo": "patch"}}}},
+    {"plan": {"model.visual": {"placement": {"placement": None, "typo": "ep"}}}},
+])
+def test_dict_parallel_plan_rejects_unknown_fields(plan):
+    from torchturbo.engine.config import EngineConfig
+
+    with pytest.raises((TypeError, ValueError), match="typo"):
+        EngineConfig.from_dict({"parallel_plan": plan})
+
+
 @pytest.mark.parametrize("nested_sizes", [False, True])
 def test_dict_parallel_plan_keeps_legacy_sizes_unless_overridden(nested_sizes):
     from torchturbo.engine.config import EngineConfig

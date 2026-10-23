@@ -113,6 +113,11 @@ engine_config:
         # Size limit in MiB. Required for size and unused by other strategies.
         bucket_cap_mb: null
 
+  moe:
+    aux_loss_coeff: 0.0
+    z_loss_coeff: 0.0
+    token_dispatcher: alltoall
+
   mtp:
     enabled: false
     loss_scaling_factor: 0.1

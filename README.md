@@ -338,7 +338,6 @@ docs/runs/
 | `TORCH_TURBO_PREFETCH_DIRECTION=forward_backward` | Set the passes in which prefetching is applied: `forward` or `forward_backward` (default) |
 | `TORCH_TURBO_FORWARD_PREFETCH_DEPTH=1` | Set the number of layers prefetched for each source during the forward pass (default: 1) |
 | `TORCH_TURBO_BACKWARD_PREFETCH_DEPTH=1` | Set the number of layers prefetched for each source during the backward pass (default: 1; applies only to `forward_backward`) |
-| `TORCH_TURBO_DEBUG=1` | Enable additional rank-0 debug output in the MoE layer |
 
 ## Command-Line Arguments
 

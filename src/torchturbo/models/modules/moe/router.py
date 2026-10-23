@@ -279,13 +279,16 @@ class TopKRouter(Router):
                 use_hash_routing=self.use_hash_routing,
                 hash_table=getattr(self, "tid2eid", None),
                 input_ids=input_ids,
+                normalize_topk_prob=self.config.moe_router_normalize_topk_prob,
             )
         else:
             raise ValueError(f"Unsupported MoE routing type: {self.routing_type}")
 
+        # Hash assignments are fixed, so learned-routing AUX does not apply.
         if (
             self.training
             and torch.is_grad_enabled()
+            and not self.use_hash_routing
             and self.config.moe_aux_loss_coeff > 0.0
         ):
             aux_routing_map, aux_scores = compute_routing_scores_for_aux_loss(

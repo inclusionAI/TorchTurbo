@@ -946,6 +946,14 @@ parallel_plan:
     )
 
 
+def test_file_parallel_plan_rejects_runtime_only_tp_size(tmp_path):
+    path = _write(
+        tmp_path, "cfg.yaml", _engine_config("parallel_plan:\n  tp_size: 2\n"),
+    )
+    with pytest.raises(ValueError, match="Unknown key: parallel_plan.tp_size"):
+        _build_from_argv(["--tt_config", path])
+
+
 def test_file_plan_without_sp_ep_keeps_tt_values(tmp_path):
     path = _write(
         tmp_path,

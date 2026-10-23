@@ -614,7 +614,7 @@ class GroupedMLPLoRA(nn.Module, BaseTunerLayer):
         1. Base fc1 via grouped GEMM
         2. LoRA fc1 via two grouped GEMM calls (A then B)
         3. Add LoRA fc1 result to base fc1 result
-        4. Apply activation function
+        4. Apply activation function and routing probabilities
         5. Base fc2 via grouped GEMM
         6. LoRA fc2 via two grouped GEMM calls (A then B)
         7. Add LoRA fc2 result to base fc2 result
@@ -661,6 +661,7 @@ class GroupedMLPLoRA(nn.Module, BaseTunerLayer):
             )
             permuted_probs = torch.ones_like(permuted_probs)
 
+        activation_probs = permuted_probs.unsqueeze(-1)
         x = permuted_local_hidden_states
 
         if x.nelement() != 0:
@@ -696,7 +697,7 @@ class GroupedMLPLoRA(nn.Module, BaseTunerLayer):
 
             # ===== Activation (SwiGLU / GeGLU) =====
             intermediate_parallel = base.activation_func_with_probs(
-                fc1_output, permuted_probs.unsqueeze(-1)
+                fc1_output, activation_probs
             )
 
             # ===== FC2: base GEMM + LoRA GEMM =====
@@ -726,7 +727,8 @@ class GroupedMLPLoRA(nn.Module, BaseTunerLayer):
             # Preserve the output shape and keep local LoRA parameters in the
             # autograd graph so FSDP still receives zero gradients.
             assert torch.count_nonzero(tokens_per_expert) == 0
-            zero = permuted_local_hidden_states.sum() * 0
+            # Empty expert ranks must also participate in the probability A2A backward.
+            zero = permuted_local_hidden_states.sum() * 0 + permuted_probs.sum() * 0
             for adapter_name in active:
                 zero = zero + self.lora_A[adapter_name].weight.sum() * 0
                 zero = zero + self.lora_B[adapter_name].weight.sum() * 0

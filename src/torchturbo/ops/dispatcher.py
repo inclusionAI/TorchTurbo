@@ -483,6 +483,21 @@ class OpDispatcher:
             "lightning_indexer_metadata", *args, impl=impl, **kwargs
         )
 
+    def moe_fused_permutation(
+        self, *args: Any, impl: str | None = None, **kwargs: Any,
+    ) -> Any:
+        return self._dispatch("moe_fused_permutation", *args, impl=impl, **kwargs)
+
+    def moe_fused_unpermutation(
+        self, *args: Any, impl: str | None = None, **kwargs: Any,
+    ) -> Any:
+        return self._dispatch("moe_fused_unpermutation", *args, impl=impl, **kwargs)
+
+    def moe_fused_sort_chunks(
+        self, *args: Any, impl: str | None = None, **kwargs: Any,
+    ) -> Any:
+        return self._dispatch("moe_fused_sort_chunks", *args, impl=impl, **kwargs)
+
     def __getattr__(self, name: str):
         if name.startswith("_"):
             raise AttributeError(name)

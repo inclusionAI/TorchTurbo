@@ -15,6 +15,7 @@ from torchturbo.engine.core import TorchTurboEngine
 from torchturbo.engine.metrics import MetricTracker
 from torchturbo.models.modules.moe.experts import GroupedMLP
 from torchturbo.models.modules.moe.module import ModuleSpec
+from torchturbo.models.modules.moe.moe_config import MoEConfig
 from torchturbo.models.modules.moe.moe_layer import MoESubmodules
 from torchturbo.models.modules.moe.moe_utils import MoEAuxLossAutoScaler
 from torchturbo.models.qwen3_5_moe.configuration_qwen3_5_moe import Qwen3_5MoeConfig
@@ -28,6 +29,14 @@ from .test_trainer_packed import _packed_batch
 
 @pytest.fixture
 def cpu_moe(monkeypatch, tmp_path):
+    def cpu_moe_config(*, moe_permute_fusion, **kwargs):
+        assert moe_permute_fusion is True
+        return MoEConfig(moe_permute_fusion=False, **kwargs)
+
+    monkeypatch.setattr(
+        "torchturbo.models.qwen3_5_moe.parallel_plan.MoEConfig",
+        cpu_moe_config,
+    )
     runtime = CpuRuntime()
     monkeypatch.setattr(importlib.import_module("torchturbo.ops.ops"), "_OPS", None)
     monkeypatch.setattr(
@@ -124,7 +133,7 @@ def test_dpo_uses_engine_auxiliary_gradients_and_metrics(
     captured = {}
 
     def capture_logits(module, args, output):
-        captured["logits"] = output[2].reshape(-1, router.num_experts)
+        captured["logits"] = output[1].reshape(-1, router.num_experts)
 
     router.register_forward_hook(capture_logits)
     batch = _packed_batch()
