@@ -13,6 +13,8 @@ class BaseProfiler(ABC):
         output_dir: str,
         worker_name: str,
         profiling_enabled: bool,
+        record_shapes: bool,
+        with_stack: bool,
         memory_snapshot_steps: int | None,
     ) -> None:
         ...
@@ -133,6 +135,8 @@ class DeviceRuntime(ABC):
         output_dir: str,
         worker_name: str,
         profiling_enabled: bool,
+        record_shapes: bool,
+        with_stack: bool,
         memory_snapshot_steps: int | None,
     ) -> BaseProfiler:
         ...

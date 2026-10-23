@@ -1,5 +1,6 @@
 from contextlib import nullcontext
 import os
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -78,6 +79,8 @@ class FakeRuntime(DeviceRuntime):
         output_dir: str,
         worker_name: str,
         profiling_enabled: bool,
+        record_shapes: bool,
+        with_stack: bool,
         memory_snapshot_steps: int | None,
     ):
         self.profiler_calls.append((output_dir, worker_name))
@@ -126,6 +129,8 @@ def test_cpu_runtime_contract():
             output_dir="/tmp",
             worker_name="worker",
             profiling_enabled=True,
+            record_shapes=False,
+            with_stack=False,
             memory_snapshot_steps=None,
         )
 
@@ -268,3 +273,70 @@ def test_device_runtime_get_returns_selected_runtime(monkeypatch):
 
     assert current is selected
     assert current.turbo_device is TurboDevice.CPU
+
+
+def _fake_torch_npu_module():
+    """Minimal torch_npu stand-in covering what _NpuProfiler reads."""
+    experimental_config_calls = []
+    profile_calls = []
+
+    class FakeExperimentalConfig:
+        def __init__(self, **kwargs):
+            experimental_config_calls.append(kwargs)
+
+    class FakeProfile:
+        def __init__(self, **kwargs):
+            profile_calls.append(kwargs)
+
+        def start(self):
+            return None
+
+        def step(self):
+            return None
+
+        def stop(self):
+            return None
+
+    profiler = SimpleNamespace(
+        _ExperimentalConfig=FakeExperimentalConfig,
+        ExportType=SimpleNamespace(Text="text"),
+        ProfilerLevel=SimpleNamespace(Level0="Level0", Level1="Level1"),
+        AiCMetrics=SimpleNamespace(AiCoreNone="none"),
+        ProfilerActivity=SimpleNamespace(CPU="cpu", NPU="npu"),
+        schedule=lambda **kwargs: None,
+        tensorboard_trace_handler=lambda *args, **kwargs: None,
+        profile=FakeProfile,
+    )
+    module = SimpleNamespace(profiler=profiler)
+    return module, experimental_config_calls, profile_calls
+
+
+@pytest.mark.parametrize(
+    ("record_shapes", "with_stack", "expected_level"),
+    [(True, False, "Level1"), (False, True, "Level0")],
+)
+def test_npu_profiler_level_follows_record_shapes(
+    monkeypatch, record_shapes, with_stack, expected_level
+):
+    fake_module, experimental_config_calls, profile_calls = (
+        _fake_torch_npu_module()
+    )
+    monkeypatch.setitem(sys.modules, "torch_npu", fake_module)
+
+    from torchturbo.runtime.npu import _NpuProfiler
+
+    profiler = _NpuProfiler(
+        "/tmp/profiling",
+        "rank0",
+        profiling_enabled=True,
+        record_shapes=record_shapes,
+        with_stack=with_stack,
+        memory_snapshot_steps=None,
+    )
+    # Constructing records torch_npu calls; start() is never called so this
+    # test works on devices without torch_npu installed.
+    # Level only tracks record_shapes; with_stack must not raise it.
+    assert profiler._profiler is not None
+    assert experimental_config_calls[0]["profiler_level"] == expected_level
+    assert profile_calls[0]["record_shapes"] is record_shapes
+    assert profile_calls[0]["with_stack"] is with_stack

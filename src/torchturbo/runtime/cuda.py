@@ -14,6 +14,8 @@ class _CudaProfiler(BaseProfiler):
         output_dir: str,
         worker_name: str,
         profiling_enabled: bool,
+        record_shapes: bool,
+        with_stack: bool,
         memory_snapshot_steps: int | None,
     ) -> None:
         self._profiler = None
@@ -29,9 +31,9 @@ class _CudaProfiler(BaseProfiler):
                 on_trace_ready=torch.profiler.tensorboard_trace_handler(
                     output_dir, worker_name=worker_name
                 ),
-                record_shapes=False,
+                record_shapes=record_shapes,
                 profile_memory=False,
-                with_stack=False,
+                with_stack=with_stack,
                 with_modules=False,
                 with_flops=False,
             )
@@ -137,11 +139,15 @@ class CudaRuntime(DeviceRuntime):
         output_dir: str,
         worker_name: str,
         profiling_enabled: bool,
+        record_shapes: bool,
+        with_stack: bool,
         memory_snapshot_steps: int | None,
     ) -> BaseProfiler:
         return _CudaProfiler(
             output_dir,
             worker_name,
             profiling_enabled,
+            record_shapes,
+            with_stack,
             memory_snapshot_steps,
         )

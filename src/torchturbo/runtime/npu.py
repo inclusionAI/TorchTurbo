@@ -37,15 +37,23 @@ class _NpuProfiler(BaseProfiler):
         output_dir: str,
         worker_name: str,
         profiling_enabled: bool,
+        record_shapes: bool,
+        with_stack: bool,
         memory_snapshot_steps: int | None,
     ) -> None:
         self._profiler = None
         if profiling_enabled:
             import torch_npu
 
+            # Level0 omits input shapes from kernel_details.csv; Level1 emits them.
+            profiler_level = (
+                torch_npu.profiler.ProfilerLevel.Level1
+                if record_shapes
+                else torch_npu.profiler.ProfilerLevel.Level0
+            )
             experimental_config = torch_npu.profiler._ExperimentalConfig(
                 export_type=[torch_npu.profiler.ExportType.Text],
-                profiler_level=torch_npu.profiler.ProfilerLevel.Level0,
+                profiler_level=profiler_level,
                 mstx=False,
                 aic_metrics=torch_npu.profiler.AiCMetrics.AiCoreNone,
                 l2_cache=False,
@@ -66,9 +74,9 @@ class _NpuProfiler(BaseProfiler):
                 on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(
                     output_dir, worker_name=worker_name
                 ),
-                record_shapes=False,
+                record_shapes=record_shapes,
                 profile_memory=False,
-                with_stack=False,
+                with_stack=with_stack,
                 with_modules=False,
                 with_flops=False,
                 experimental_config=experimental_config,
@@ -200,11 +208,15 @@ class NpuRuntime(DeviceRuntime):
         output_dir: str,
         worker_name: str,
         profiling_enabled: bool,
+        record_shapes: bool,
+        with_stack: bool,
         memory_snapshot_steps: int | None,
     ) -> BaseProfiler:
         return _NpuProfiler(
             output_dir,
             worker_name,
             profiling_enabled,
+            record_shapes,
+            with_stack,
             memory_snapshot_steps,
         )

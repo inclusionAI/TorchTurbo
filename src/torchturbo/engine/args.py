@@ -19,6 +19,7 @@ The parsed args can later be retrieved::
 from __future__ import annotations
 
 import argparse
+import json
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -45,6 +46,26 @@ def parse_log_level(value: str) -> LogLevel:
         raise argparse.ArgumentTypeError(
             f"Unsupported log level {value!r}; supported levels: {supported}"
         ) from exc
+
+
+def parse_profiling_config(value: str) -> dict[str, bool]:
+    """Parse a --tt_profiling_config JSON dict of profiling detail knobs.
+
+    Accepted keys are ``with_shape`` and ``with_stack``; both must be bool.
+    """
+    try:
+        parsed = json.loads(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"Invalid JSON: {value!r}") from exc
+    unknown = set(parsed) - {"with_shape", "with_stack"}
+    if unknown:
+        raise argparse.ArgumentTypeError(
+            f"Unknown profiling keys: {sorted(unknown)}"
+        )
+    bad = [key for key, knob in parsed.items() if not isinstance(knob, bool)]
+    if bad:
+        raise argparse.ArgumentTypeError(f"Values must be bool: {bad}")
+    return parsed
 
 
 # ---------------------------------------------------------------------------
@@ -155,6 +176,10 @@ class TorchTurboArgs:
     hf_export:
         Whether to export HF safetensors with the final training checkpoint
         or every training checkpoint. Defaults to every checkpoint.
+    profiling_config:
+        Profiling detail knobs (``with_shape``/``with_stack``) as a JSON
+        dict from ``--tt_profiling_config``. Only effective when
+        ``profiling`` is enabled. ``None`` means both knobs are off.
     log_level:
         TorchTurbo log level. Defaults to ``LogLevel.INFO``.
     """
@@ -190,6 +215,7 @@ class TorchTurboArgs:
     freeze_language_model: bool = False
     hf_export: str | None = None
     profiling: bool = False
+    profiling_config: dict[str, bool] | None = None
     memory_snapshot_steps: int | None = None
     log_level: LogLevel = LogLevel.INFO
 
@@ -642,6 +668,17 @@ _TURBO_ARG_SPECS: tuple[TurboArgSpec, ...] = (
         help="Enable NPU/CUDA profiling for the second step. "
         "Outputs to {output_dir}/profiling/. "
         "Accepts --tt_profiling, ... true, or ... false.",
+    ),
+    TurboArgSpec(
+        name="profiling_config",
+        args_name="profiling_config",
+        cli_name="--tt_profiling_config",
+        type=parse_profiling_config,
+        metavar="DICT",
+        help="Profiling detail knobs as a JSON dict. Only effective with "
+        "--tt_profiling. with_shape records tensor shapes (enables "
+        "record_shapes and NPU profiler level Level1); with_stack records "
+        'the Python call stack. E.g. {"with_shape": true}.',
     ),
     TurboArgSpec(
         name="memory_snapshot_steps",

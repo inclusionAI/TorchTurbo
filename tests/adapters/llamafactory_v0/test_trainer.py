@@ -384,6 +384,74 @@ def test_train_checks_the_output_dir_before_training(
 
 
 @pytest.mark.parametrize(
+    ("profiling", "profiling_config", "expected_start", "expected_stop"),
+    [
+        # Profiling on: the config dict is forwarded as the trailing argument.
+        (
+            True,
+            {"with_shape": True},
+            (True, None, {"with_shape": True}),
+            True,
+        ),
+        # Config without --tt_profiling stays inert.
+        (False, {"with_shape": True}, None, False),
+    ],
+)
+def test_train_forwards_profiling_config(
+    monkeypatch,
+    tmp_path,
+    profiling,
+    profiling_config,
+    expected_start,
+    expected_stop,
+):
+    from torchturbo.engine.args import TorchTurboArgs
+
+    monkeypatch.setattr(
+        "torchturbo.engine.args._current_torchturbo_args",
+        TorchTurboArgs(profiling=profiling, profiling_config=profiling_config),
+    )
+    source = tmp_path / "source"
+    source.mkdir()
+    output_dir = str(tmp_path / "out")
+    calls = {"start": [], "stop": []}
+
+    class Engine:
+        model_name_or_path = str(source)
+
+        def start_profiling(self, output_dir, profiling_enabled, steps, config):
+            calls["start"].append((output_dir, profiling_enabled, steps, config))
+
+        def stop_profiling(self):
+            calls["stop"].append(None)
+
+    class BaseTrainer:
+        def train(self, *args, **kwargs):
+            return None
+
+    trainer_cls = make_torchturbo_trainer(
+        BaseTrainer, engine=Engine(), stage="sft"
+    )
+    trainer = object.__new__(trainer_cls)
+    trainer.args = SimpleNamespace(output_dir=output_dir)
+
+    # add_callback comes from the HF base trainer; provide a no-op.
+    trainer.add_callback = lambda callback: None
+
+    trainer.train()
+
+    if expected_start is None:
+        assert calls["start"] == []
+        assert calls["stop"] == []
+    else:
+        expected_enabled, expected_steps, expected_config = expected_start
+        assert calls["start"] == [
+            (output_dir, expected_enabled, expected_steps, expected_config)
+        ]
+        assert calls["stop"] == [None]
+
+
+@pytest.mark.parametrize(
     ("internal_call", "save_only_model", "global_step", "expected_kwargs"),
     [
         # Checkpoints from the HF machinery store native model state.

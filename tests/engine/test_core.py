@@ -991,10 +991,15 @@ class TestEngineSetup:
             output_dir: str,
             worker_name: str,
             profiling_enabled: bool,
+            record_shapes: bool,
+            with_stack: bool,
             memory_snapshot_steps: int | None,
         ):
             profiler_kwargs["output_dir"] = output_dir
             profiler_kwargs["worker_name"] = worker_name
+            profiler_kwargs["profiling_enabled"] = profiling_enabled
+            profiler_kwargs["record_shapes"] = record_shapes
+            profiler_kwargs["with_stack"] = with_stack
             return profiler
 
         monkeypatch.setattr(runtime, "profiler", fake_profiler)
@@ -1013,7 +1018,54 @@ class TestEngineSetup:
         assert profiler.calls == ["start", "step", "stop"]
         assert profiler_kwargs["output_dir"] == str(tmp_path / "profiling")
         assert profiler_kwargs["worker_name"].startswith("rank")
+        assert profiler_kwargs["profiling_enabled"] is True
+        assert profiler_kwargs["record_shapes"] is False
+        assert profiler_kwargs["with_stack"] is False
         assert (tmp_path / "profiling").is_dir()
+
+    def test_profiling_config_knobs_reach_runtime_profiler(
+        self, monkeypatch, tmp_path
+    ):
+        runtime = CpuRuntime()
+        recorder = RecordingProfiler()
+        profiler_kwargs = {}
+
+        def fake_profiler(
+            *,
+            output_dir: str,
+            worker_name: str,
+            profiling_enabled: bool,
+            record_shapes: bool,
+            with_stack: bool,
+            memory_snapshot_steps: int | None,
+        ):
+            profiler_kwargs["profiling_enabled"] = profiling_enabled
+            profiler_kwargs["record_shapes"] = record_shapes
+            profiler_kwargs["with_stack"] = with_stack
+            return recorder
+
+        monkeypatch.setattr(runtime, "profiler", fake_profiler)
+        monkeypatch.setattr(engine_core, "get_device_runtime", lambda: runtime)
+        monkeypatch.setattr(
+            engine_core,
+            "get_backend",
+            lambda backend_name: DummyBackend if backend_name == "fsdp2" else None,
+        )
+
+        engine = TorchTurboEngine(EngineConfig())
+
+        engine.start_profiling(str(tmp_path), True, None, {"with_shape": True})
+        assert profiler_kwargs["record_shapes"] is True
+        assert profiler_kwargs["with_stack"] is False
+
+        engine.start_profiling(str(tmp_path), True, None, {"with_stack": True})
+        assert profiler_kwargs["record_shapes"] is False
+        assert profiler_kwargs["with_stack"] is True
+
+        # Knobs are ignored when profiling is disabled (snapshot-only mode).
+        engine.start_profiling(str(tmp_path), False, 3, {"with_shape": True})
+        assert profiler_kwargs["record_shapes"] is False
+        assert profiler_kwargs["with_stack"] is False
 
     def test_profiling_start_failure_clears_previous_profiler(
         self, monkeypatch, tmp_path
@@ -1034,6 +1086,8 @@ class TestEngineSetup:
             output_dir: str,
             worker_name: str,
             profiling_enabled: bool,
+            record_shapes: bool,
+            with_stack: bool,
             memory_snapshot_steps: int | None,
         ):
             return next(profilers)
