@@ -617,3 +617,73 @@ def test_native_load_keeps_new_training_settings_and_rejects_scaling_changes(
     changed_scaling = build(lora_alpha=16)
     with pytest.raises(ValueError, match=r"'lora_alpha': \(32, 16\)"):
         manager.load_model(changed_scaling, str(tmp_path), source_path="/source")
+
+
+@pytest.mark.parametrize("export_fails", [False, True])
+def test_export_plugins_run_only_after_successful_hf_save(
+    manager, tmp_path, monkeypatch, export_fails
+):
+    from torchturbo.engine.plugins import CheckpointExportPlugin, PluginManager
+
+    events = []
+
+    class ExportPlugin(CheckpointExportPlugin):
+        def on_hf_export(self, export_dir: str) -> None:
+            assert os.path.isfile(os.path.join(export_dir, "complete"))
+            events.append("upload")
+
+    plugins = PluginManager()
+    plugins.plugins.append(ExportPlugin())
+    plugins.try_consume(manager.export_plugins)
+
+    def save_hf(model, export_dir, **kwargs):
+        events.append("save")
+        if export_fails:
+            raise RuntimeError("export failed")
+        with open(os.path.join(export_dir, "complete"), "w") as marker:
+            marker.write("saved")
+
+    monkeypatch.setattr(manager._manager, "save_hf", save_hf)
+    if export_fails:
+        with pytest.raises(RuntimeError, match="export failed"):
+            manager.save_model(
+                ConvertibleModel(), str(tmp_path), source_path="/source",
+                format=CheckpointFormat.HF,
+            )
+        assert events == ["save"]
+    else:
+        manager.save_model(
+            ConvertibleModel(), str(tmp_path), source_path="/source",
+            format=CheckpointFormat.HF,
+        )
+        assert events == ["save", "upload"]
+
+
+def test_export_plugin_failure_does_not_fail_save(
+    manager, tmp_path, monkeypatch, recorder
+):
+    from torchturbo.engine.plugins import CheckpointExportPlugin
+
+    class FailingPlugin(CheckpointExportPlugin):
+        def on_hf_export(self, export_dir: str) -> None:
+            raise RuntimeError("upload failed")
+
+    manager.export_plugins.consume(FailingPlugin())
+    monkeypatch.setattr(manager._manager, "save_hf", lambda *a, **kw: None)
+    manager.save_model(
+        ConvertibleModel(), str(tmp_path), source_path="/source",
+        format=CheckpointFormat.HF,
+    )
+    assert any("FailingPlugin failed" in message for message in recorder.warnings)
+
+
+def test_native_only_save_does_not_notify_export_plugin(manager, tmp_path, monkeypatch):
+    from torchturbo.engine.plugins import CheckpointExportPlugin
+
+    class ExportPlugin(CheckpointExportPlugin):
+        def on_hf_export(self, export_dir: str) -> None:
+            pytest.fail("Native-only saves must not trigger export plugins.")
+
+    manager.export_plugins.consume(ExportPlugin())
+    monkeypatch.setattr(manager._manager, "save_native", lambda *a, **kw: None)
+    manager.save_model(ConvertibleModel(), str(tmp_path), source_path="/source")

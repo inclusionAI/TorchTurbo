@@ -12,6 +12,7 @@ import torch.nn as nn
 from torchturbo.logging import get_logger
 
 from ..optimizers import OptimizersContainer
+from ..plugins import CheckpointExportPlugin, Plugin, PluginConsumer
 from ..utils import is_peft_adapter_param
 from . import layout
 from .distributed import collective_check, rank_zero_call
@@ -29,6 +30,36 @@ if TYPE_CHECKING:
 logger = get_logger(__name__)
 
 
+class CheckpointExportPluginConsumer(PluginConsumer):
+    """Register export plugins and notify them on global rank zero."""
+
+    def __init__(self) -> None:
+        self._export_plugins: list[CheckpointExportPlugin] = []
+
+    def matches(self, plugin: Plugin) -> bool:
+        return isinstance(plugin, CheckpointExportPlugin)
+
+    def consume(self, plugin: Plugin) -> None:
+        if not isinstance(plugin, CheckpointExportPlugin):
+            raise TypeError("Expected a CheckpointExportPlugin.")
+        self._export_plugins.append(plugin)
+
+    def _notify_hf_export(self, export_dir: str) -> None:
+        for plugin in self._export_plugins:
+            try:
+                plugin.on_hf_export(export_dir)
+            except Exception:
+                logger.warning_rank0(
+                    "HF export plugin %s failed for %s; continuing training.",
+                    type(plugin).__name__, export_dir, exc_info=True,
+                )
+
+    def notify_hf_export(self, export_dir: str) -> None:
+        """Notify plugins after an HF export, waiting on all ranks."""
+        if self._export_plugins:
+            rank_zero_call(lambda: self._notify_hf_export(export_dir))
+
+
 class CheckpointCoordinator:
     """Coordinate checkpoint policy above a backend checkpoint manager."""
 
@@ -39,6 +70,9 @@ class CheckpointCoordinator:
         *,
         parallel_context: dict[str, Any],
     ) -> None:
+        self.export_plugins: CheckpointExportPluginConsumer = (
+            CheckpointExportPluginConsumer()
+        )
         self._config = config
         self._manager = manager
         self._parallel_context = parallel_context
@@ -105,6 +139,9 @@ class CheckpointCoordinator:
                     os.path.join(output_dir, layout.HF_MODEL_DIR),
                     source_path=source_path,
                     weight_converter=self._weight_converter(model, source_path),
+                )
+                self.export_plugins.notify_hf_export(
+                    os.path.join(output_dir, layout.HF_MODEL_DIR)
                 )
         return formats
 

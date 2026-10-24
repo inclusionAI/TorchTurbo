@@ -351,6 +351,7 @@ class TorchTurboEngine:
                 self.config, self.backend.create_checkpoint_manager(),
                 parallel_context=parallel_context,
             )
+            self.plugin_manager.try_consume(self._checkpoint.export_plugins)
 
         logger.info_rank0(
             "%s model via %s backend",
