@@ -172,24 +172,6 @@ def permute(
     return permuted_input, permuted_probs, sorted_indices
 
 
-def sort_chunks_by_idxs(
-    input: torch.Tensor,
-    split_sizes: torch.Tensor,
-    sorted_idxs: torch.Tensor,
-    probs: Optional[torch.Tensor] = None,
-    fused: bool = False,
-):
-    """Split and sort the input tensor based on the split_sizes and sorted indices."""
-    input = torch.split(input, split_sizes.tolist(), dim=0)
-    output = torch.cat([input[i] for i in sorted_idxs.tolist()], dim=0)
-    if probs is not None:
-        probs = torch.split(probs, split_sizes.tolist(), dim=0)
-        permuted_probs = torch.cat([probs[i] for i in sorted_idxs.tolist()], dim=0)
-    else:
-        permuted_probs = None
-    return output, permuted_probs
-
-
 def unpermute(
     permuted_tokens: torch.Tensor,
     sorted_indices: torch.Tensor,
