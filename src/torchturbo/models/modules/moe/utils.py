@@ -10,7 +10,6 @@ import math
 from typing import Optional
 
 import torch
-from torchturbo.ops import ops
 from torchturbo.runtime import get_device_runtime
 
 
@@ -150,37 +149,6 @@ def permute(
         permuted_probs = None
 
     return permuted_input, permuted_probs, sorted_indices
-
-
-def sort_chunks_by_idxs(
-    input: torch.Tensor,
-    split_sizes: torch.Tensor,
-    sorted_idxs: torch.Tensor,
-    probs: Optional[torch.Tensor] = None,
-    fused: bool = False,
-):
-    """Split and sort the input tensor based on the split_sizes and sorted indices."""
-    input = torch.split(input, split_sizes.tolist(), dim=0)
-    output = torch.cat([input[i] for i in sorted_idxs.tolist()], dim=0)
-    if probs is not None:
-        probs = torch.split(probs, split_sizes.tolist(), dim=0)
-        permuted_probs = torch.cat([probs[i] for i in sorted_idxs.tolist()], dim=0)
-    else:
-        permuted_probs = None
-    return output, permuted_probs
-
-
-def reorder_expert_chunks(
-    input: torch.Tensor,
-    chunk_counts: torch.Tensor,
-    probs: Optional[torch.Tensor] = None,
-) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """Transpose rank/expert chunks, preserving token order within each chunk."""
-    if input.device.type == "npu":
-        return ops.moe_chunk_reorder(input, chunk_counts, probs=probs)
-    order = torch.arange(chunk_counts.numel(), device="cpu")
-    order = order.reshape(chunk_counts.shape).T.reshape(-1)
-    return sort_chunks_by_idxs(input, chunk_counts.reshape(-1), order, probs=probs)
 
 
 def unpermute(

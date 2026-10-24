@@ -21,7 +21,6 @@ from ..comm.comm import all_to_all, gather_from_sequence_parallel_region
 from .utils import (
     permute,
     unpermute,
-    reorder_expert_chunks,
     maybe_move_tensor_to_cpu,
 )
 
@@ -197,10 +196,9 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             "before_permutation_2", tokens_per_expert
         )
         if self.num_local_experts > 1:
-            global_input_tokens, _ = reorder_expert_chunks(
+            global_input_tokens, _ = ops.moe_chunk_reorder(
                 global_input_tokens,
                 self.num_global_tokens_per_local_expert,
-                probs=None,
             )
 
         tokens_per_expert = self._maybe_dtoh_and_synchronize(
@@ -220,7 +218,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             raise RuntimeError("Deferred probs path requires probs for unpermutation.")
 
         if self.num_local_experts > 1:
-            hidden_states, _ = reorder_expert_chunks(
+            hidden_states, _ = ops.moe_chunk_reorder(
                 hidden_states,
                 self.num_global_tokens_per_local_expert.T,
             )
@@ -410,7 +408,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             "before_permutation_2", tokens_per_expert
         )
         if self.num_local_experts > 1:
-            global_input_tokens, global_probs = reorder_expert_chunks(
+            global_input_tokens, global_probs = ops.moe_chunk_reorder(
                 global_input_tokens,
                 self.num_global_tokens_per_local_expert,
                 probs=global_probs,
@@ -454,7 +452,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
 
         # Unpermutation 2: Unsort tokens by local expert.
         if self.num_local_experts > 1:
-            hidden_states, _ = reorder_expert_chunks(
+            hidden_states, _ = ops.moe_chunk_reorder(
                 hidden_states,
                 self.num_global_tokens_per_local_expert.T,
             )
