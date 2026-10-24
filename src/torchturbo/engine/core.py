@@ -916,6 +916,16 @@ class TorchTurboEngine:
             drop_last=drop_last,
         )
 
+        # Only explicit GBS identifies complete optimizer-step boundaries.
+        # Ordinary datasets and legacy sampler layouts keep their existing path.
+        if gbs is not None and dp_info["dp_size"] > 1:
+            from .packed_workload import (
+                PackedWorkloadSampler, packed_costs, supports_packed_costs,
+            )
+
+            if supports_packed_costs(dataset):
+                sampler = PackedWorkloadSampler(sampler, packed_costs(dataset), batch_size)
+
         logger.info_rank0(
             "Created SP-aware DataLoader: dp_size=%d, dp_rank=%d, sp_size=%d",
             dp_info["dp_size"],
