@@ -423,8 +423,11 @@ class _VisionBalanceState:
             world * max_media * num_columns, dtype=torch.long, device=device
         )
         dist.all_gather_into_tensor(gathered, rows.reshape(-1), group=dist.group.WORLD)
-        padded = gathered.view(world, max_media, num_columns).tolist()
-        return [padded[src][:count] for src, count in enumerate(counts)]
+        padded = gathered.view(world, max_media, num_columns).cpu()
+        return [
+            padded[src, :count].tolist() if count else []
+            for src, count in enumerate(counts)
+        ]
 
     def _exchange_pixels(
         self,
