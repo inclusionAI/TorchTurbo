@@ -73,11 +73,20 @@ def test_kda_preserves_packed_boundaries_and_local_parameters(
         assert activation == "sigmoid"
         return x
 
-    def gather_sequence(x, seq_dim, head_dim, sp_group, sp_size):
+    exchanged_streams = []
+    waited_streams = []
+    waited_events = []
+    recorded_events = []
+    created_streams = []
+    created_events = []
+
+    def gather_sequence(x, seq_dim, head_dim, sp_group, sp_size, a2a_stream=None):
+        exchanged_streams.append(a2a_stream)
         full_sequence = torch.cat([x] * sp_size, dim=seq_dim)
         return full_sequence.chunk(sp_size, dim=head_dim)[sp_rank]
 
-    def gather_heads(x, seq_dim, head_dim, sp_group, sp_size):
+    def gather_heads(x, seq_dim, head_dim, sp_group, sp_size, a2a_stream=None):
+        exchanged_streams.append(a2a_stream)
         full_heads = torch.cat([x] * sp_size, dim=head_dim)
         return full_heads.chunk(sp_size, dim=head_dim)[sp_rank]
 
@@ -95,6 +104,28 @@ def test_kda_preserves_packed_boundaries_and_local_parameters(
 
     monkeypatch.setattr(ulysses_module, "gather_seq_scatter_heads", gather_sequence)
     monkeypatch.setattr(ulysses_module, "gather_heads_scatter_seq", gather_heads)
+
+    def new_stream(priority=0):
+        stream = SimpleNamespace()
+        created_streams.append(stream)
+        return stream
+
+    def new_event():
+        event = SimpleNamespace()
+        event.record = lambda stream: recorded_events.append((event, stream))
+        created_events.append(event)
+        return event
+
+    fake_stream = SimpleNamespace(
+        wait_stream=waited_streams.append,
+        wait_event=waited_events.append,
+    )
+    fake_runtime = SimpleNamespace(
+        current_stream=lambda: fake_stream,
+        new_stream=new_stream,
+        new_event=new_event,
+    )
+    monkeypatch.setattr(attention, "get_device_runtime", lambda: fake_runtime)
 
     class TargetKDA(nn.Module):
         def forward(self, x):
@@ -131,6 +162,25 @@ def test_kda_preserves_packed_boundaries_and_local_parameters(
     )
     assert weights is cache is None
     assert OtherKDA()(x) is x
+    if sp_size > 1:
+        (a2a_stream,) = created_streams
+        q_event, k_event, v_event = created_events
+        # All exchanges share one a2a stream; each convolution waits only
+        # on its gather's event, while the chunk and the gated norm wait on
+        # the stream covering the trailing gathers and the output scatter.
+        assert exchanged_streams == [a2a_stream] * 6
+        assert [event for event, _ in recorded_events] == [
+            q_event, k_event, v_event,
+        ]
+        assert [stream for _, stream in recorded_events] == [a2a_stream] * 3
+        assert waited_events == [q_event, k_event, v_event]
+        assert waited_streams == [a2a_stream, a2a_stream]
+    else:
+        assert created_streams == []
+        assert created_events == []
+        assert exchanged_streams == []
+        assert waited_streams == []
+        assert waited_events == []
 
     assert len(conv_calls) == 3
     assert len(kda_calls) == 1
