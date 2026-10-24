@@ -731,7 +731,7 @@ class TorchTurboEngine:
         if self.config.parallel_plan is not None:
             engine_plan = self.config.parallel_plan
 
-            for attr in ["sp_size", "ep_size"]:
+            for attr in ["sp_size", "ep_size", "use_fla_kcp"]:
                 if hasattr(engine_plan, attr):
                     val = getattr(engine_plan, attr)
                     setattr(plan, attr, val)

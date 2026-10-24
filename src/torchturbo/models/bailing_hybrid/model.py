@@ -1,4 +1,5 @@
 from typing_extensions import override
+from torch.distributed import ProcessGroup
 
 from transformers import AutoModelForCausalLM
 
@@ -68,14 +69,22 @@ class TurboBailingMoeV3ForCausalLM(TurboModel, BailingMoeV3ForCausalLM):
         # MLA layers dispatch through the registered turbo_ulysses interface;
         # KDA layers rewrite their forward instead.
         self.register_sp_attention_interface(sp_info)
-        self.patch_kda_forward(sp_group, sp_size, sp_rank)
+        self.patch_kda_forward(sp_group, sp_size, sp_rank, sp_info["use_fla_kcp"])
 
     @classmethod
-    def patch_kda_forward(cls, sp_group, sp_size, sp_rank):
+    def patch_kda_forward(
+        cls,
+        sp_group: ProcessGroup | None,
+        sp_size: int,
+        sp_rank: int,
+        use_fla_kcp: bool = False,
+    ) -> None:
         from .attention import patch_kda_forward as install_kda_forward
         from .modeling_bailing_moe_v3 import BailingMoeV3KimiDeltaAttention
 
-        install_kda_forward(BailingMoeV3KimiDeltaAttention, sp_group, sp_size, sp_rank)
+        install_kda_forward(
+            BailingMoeV3KimiDeltaAttention, sp_group, sp_size, sp_rank, use_fla_kcp
+        )
 
     @staticmethod
     def _pre_init_patches(config):

@@ -166,6 +166,7 @@ class TorchTurboArgs:
     use_deterministic_algorithms: bool = False
     sp_size: int | None = None
     ep_size: int | None = None
+    use_fla_kcp: bool = False
     gbs: int | None = None
     gradient_checkpointing: bool = True
     ac_use_reentrant: bool = False
@@ -325,6 +326,18 @@ _TURBO_ARG_SPECS: tuple[TurboArgSpec, ...] = (
         type=int,
         metavar="SIZE",
         help="Expert parallelism group size. Replaces TORCH_TURBO_EP_SIZE.",
+    ),
+    TurboArgSpec(
+        name="use_fla_kcp",
+        args_name="use_fla_kcp",
+        cli_name="--tt_use_fla_kcp",
+        env_name="TORCH_TURBO_USE_FLA_KCP",
+        config_path="parallel_plan.use_fla_kcp",
+        type=string_to_bool,
+        metavar="BOOL",
+        help="Route KDA layers through FLA kernel context parallelism (KCP) "
+        "instead of the default Ulysses sequence parallelism. "
+        "Replaces TORCH_TURBO_USE_FLA_KCP.",
     ),
     TurboArgSpec(
         name="gbs",
@@ -815,6 +828,7 @@ def parse_torchturbo_args(argv: list[str]) -> tuple[TorchTurboArgs, list[str]]:
             args.optimizer_name,
             args.sp_size,
             args.ep_size,
+            args.use_fla_kcp,
             args.cpu_offload_enabled,
             args.enable_mtp,
             args.mtp_loss_scaling_factor,
