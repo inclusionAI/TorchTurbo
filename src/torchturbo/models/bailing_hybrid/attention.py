@@ -31,7 +31,6 @@ def patch_kda_forward(
     parameters are sliced by head for sequence parallelism.
     """
     from fla.modules.fused_norm_gate import rms_norm_gated
-    from fla.ops.kda import chunk_kda
 
     from torchturbo.ops import ops
     from torchturbo.ops.packed_params import get_packed_params
@@ -169,7 +168,7 @@ def patch_kda_forward(
             A_log_local = self.A_log
             dt_bias_local = self.dt_bias
 
-        o, _ = chunk_kda(
+        o, _ = ops.kda(
             q=q,
             k=k,
             v=v,
@@ -183,7 +182,7 @@ def patch_kda_forward(
             use_gate_in_kernel=True,
             safe_gate=self.safe_gate,
             lower_bound=self.lower_bound,
-            cu_seqlens=cu_seqlens,
+            packed_params=packed_params,
         )
 
         if sp_size > 1:
