@@ -377,7 +377,12 @@ class DistParamLoader:
         owner = self.param_to_rank[name]
         if self.rank == owner:
             assert self.local_sd[name].dtype == broadcast_dtype, "must be"
-            tensor = self.local_sd[name].to(self.device)
+            # model-specific fixups (e.g. narrowing zero-padded release
+            # tensors) must run on the full checkpoint tensor, before any
+            # FSDP sharded narrow/copy sees it.
+            tensor = self.param_converter.transform_checkpoint_tensor(
+                name, self.local_sd[name]
+            ).to(self.device)
         else:
             tensor = torch.empty(shape, device=self.device, dtype=broadcast_dtype)
         return tensor, self.world_mesh, group, owner
