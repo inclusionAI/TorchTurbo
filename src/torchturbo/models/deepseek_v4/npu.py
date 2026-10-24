@@ -9,15 +9,25 @@ from torchturbo.ops import ops
 from .packing_utils import _segment_spans
 
 
-def patch_deepseek_v4_npu_sfa_li(sp_rank: int, sp_group, sp_size: int):
+def patch_deepseek_v4_npu_sfa_li(
+    sp_rank: int, sp_group: torch.distributed.ProcessGroup | None, sp_size: int
+) -> None:
     """Install fused NPU sparse-attention and lightning-indexer forwards."""
     from . import modeling_deepseek_v4 as dsv4
 
-    dsv4.SparseAttention.forward = partialmethod(_npu_sfa, sp_rank=sp_rank)
+    native_sfa_forward = dsv4.SparseAttention.forward
+
+    def sparse_attention_forward(self, *args, **kwargs):
+        # CANN supports a 128-token window; keep the model's PyTorch path
+        # for configurations outside that kernel contract.
+        if self.window_size != 128:
+            return native_sfa_forward(self, *args, **kwargs)
+        return _npu_sfa(self, *args, sp_rank=sp_rank, **kwargs)
+
+    dsv4.SparseAttention.forward = sparse_attention_forward
     dsv4.LiCompute.forward = partialmethod(
         _npu_li,
         sp_rank=sp_rank,
-        sp_group=sp_group,
         sp_size=sp_size,
     )
 
@@ -259,12 +269,12 @@ def _npu_sfa(
             )
         )
         if cmp_sparse_indices is not None:
-            fallback = torch.where(cmp_sparse_indices >= 0, cmp_sparse_indices, 0).amax(dim=-1, keepdim=True)
-            cmp_sparse_indices = torch.where(cmp_sparse_indices >= 0, cmp_sparse_indices, fallback)
+            # The gradient kernel requires unused CSI slots to remain -1.
             if cmp_sparse_indices.size(-1) < 512:
-                cmp_sparse_indices = torch.cat(
-                    [cmp_sparse_indices, fallback.expand(-1, -1, 512 - cmp_sparse_indices.size(-1))],
-                    dim=-1,
+                cmp_sparse_indices = torch.nn.functional.pad(
+                    cmp_sparse_indices,
+                    (0, 512 - cmp_sparse_indices.size(-1)),
+                    value=-1,
                 )
             elif cmp_sparse_indices.size(-1) > 512:
                 cmp_sparse_indices = cmp_sparse_indices[..., :512]
@@ -300,34 +310,25 @@ def _npu_li(
     q_global_positions: torch.LongTensor,
     segment_ids: torch.Tensor,
     sp_rank: int = 0,
-    sp_group=None,
     sp_size: int = 1,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor | None, torch.Tensor | None]:
     """Fused lightning-indexer forward."""
-    from torchturbo.models.modules.attention.ulysses import (
-        all_gather_sp_with_grad_reduce,
-    )
-
     bsz, local_len, num_heads, head_dim = q_indexer.shape
-    q_full = q_indexer
-    weights_full = weights
-    if sp_size > 1:
-        q_full = all_gather_sp_with_grad_reduce(q_indexer, dim=1, sp_group=sp_group, sp_size=sp_size)
-        weights_full = all_gather_sp_with_grad_reduce(weights, dim=1, sp_group=sp_group, sp_size=sp_size)
-
-    query_indices, cu_seqlens_q = _get_li_query_tnd_data(segment_ids)
+    local_start = sp_rank * local_len
+    local_segment_ids = segment_ids[:, local_start : local_start + local_len]
+    query_indices, cu_seqlens_q = _get_li_query_tnd_data(local_segment_ids)
     if query_indices.numel() == 0:
         return None, None
     n_seqs = cu_seqlens_q.numel() - 1
     query_tnd = (
-        q_full.reshape(-1, num_heads, head_dim)
+        q_indexer.reshape(-1, num_heads, head_dim)
         .index_select(0, query_indices)
         .detach()
         .to(torch.bfloat16)
         .contiguous()
     )
     weights_tnd = (
-        weights_full.reshape(-1, num_heads)
+        weights.reshape(-1, num_heads)
         .index_select(0, query_indices)
         .detach()
         .float()
@@ -335,13 +336,22 @@ def _npu_li(
     )
     k_tnd, cu_seqlens_k, tnd_to_block, cmp_residual_k = _get_compressed_kv_tnd_data(
         k_indexer,
+        local_segment_ids,
         segment_ids,
-        segment_ids,
-        0,
+        local_start,
         self.ratio,
     )
-    k_tnd = k_tnd.detach().to(torch.bfloat16).unsqueeze(1).contiguous()
     sparse_count = min(self.index_topk, k_indexer.size(1))
+    compress_topk_idxs = segment_ids.new_full(
+        (bsz, local_len, sparse_count), -1, dtype=torch.long
+    )
+    if k_tnd.size(0) == 0:
+        return compress_topk_idxs, None
+    k_tnd = k_tnd.detach().to(torch.bfloat16).unsqueeze(1).contiguous()
+    max_seqlen_q = int((cu_seqlens_q[1:] - cu_seqlens_q[:-1]).max().item())
+    if sp_size > 1:
+        # The CANN SP prefix view uses the total local query length.
+        max_seqlen_q = query_tnd.size(0)
     # TND batch size equals the number of segments.
     metadata = ops.lightning_indexer_metadata(
         num_heads_q=num_heads,
@@ -352,7 +362,7 @@ def _npu_li(
         cu_seqlens_k=cu_seqlens_k,
         cmp_residual_k=cmp_residual_k,
         batch_size=n_seqs,
-        max_seqlen_q=int((cu_seqlens_q[1:] - cu_seqlens_q[:-1]).max().item()),
+        max_seqlen_q=max_seqlen_q,
         max_seqlen_k=int((cu_seqlens_k[1:] - cu_seqlens_k[:-1]).max().item()),
         layout_q="TND",
         layout_k="TND",
@@ -387,13 +397,5 @@ def _npu_li(
     mapped_block_indices = tnd_to_block[safe_rows]
     valid = valid & (mapped_block_indices >= 0)
     block_indices = torch.where(valid, mapped_block_indices + offset, -1)
-    compress_topk_idxs = block_indices.new_full((bsz, q_full.size(1), sparse_count), -1)
     compress_topk_idxs.reshape(-1, sparse_count)[query_indices] = block_indices
-    index_score = None
-    if sp_size > 1:
-        local_slice = slice(sp_rank * local_len, (sp_rank + 1) * local_len)
-        return (
-            compress_topk_idxs[:, local_slice].contiguous(),
-            index_score,
-        )
-    return compress_topk_idxs.contiguous(), index_score
+    return compress_topk_idxs, None
