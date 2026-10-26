@@ -15,7 +15,7 @@ from torchturbo.engine.backends.fsdp2.optimizers.memory import (
     _TensorSpec,
 )
 from torchturbo.engine.backends.fsdp2.qk_clip import install_qk_clip
-from torchturbo.engine.checkpoint.coordinator import CheckpointCoordinator
+from torchturbo.engine.checkpoint.coordinator import CheckpointCoordinator, CheckpointExportPluginConsumer
 from torchturbo.engine.config import EngineConfig, MuonOptimizerConfig, QKClipConfig
 from torchturbo.engine.core import TorchTurboEngine
 from torchturbo.engine.optimizers import (
@@ -78,6 +78,7 @@ def _engine(runtime, model, offload=None):
     engine._checkpoint = CheckpointCoordinator(
         EngineConfig(), engine.backend.create_checkpoint_manager(),
         parallel_context=parallel_context,
+        export_plugin_consumer=CheckpointExportPluginConsumer(),
     )
     engine.optimizer = engine.backend.prepare_optimizer(
         OptimizerClassPlan(

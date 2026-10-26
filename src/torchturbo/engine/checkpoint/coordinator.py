@@ -44,20 +44,22 @@ class CheckpointExportPluginConsumer(PluginConsumer):
             raise TypeError("Expected a CheckpointExportPlugin.")
         self._export_plugins.append(plugin)
 
-    def _notify_hf_export(self, export_dir: str) -> None:
-        for plugin in self._export_plugins:
-            try:
-                plugin.on_hf_export(export_dir)
-            except Exception:
-                logger.warning_rank0(
-                    "HF export plugin %s failed for %s; continuing training.",
-                    type(plugin).__name__, export_dir, exc_info=True,
-                )
-
     def notify_hf_export(self, export_dir: str) -> None:
         """Notify plugins after an HF export, waiting on all ranks."""
-        if self._export_plugins:
-            rank_zero_call(lambda: self._notify_hf_export(export_dir))
+        if not self._export_plugins:
+            return
+
+        def notify() -> None:
+            for plugin in self._export_plugins:
+                try:
+                    plugin.on_hf_export(export_dir)
+                except Exception:
+                    logger.warning_rank0(
+                        "HF export plugin %s failed for %s; continuing training.",
+                        type(plugin).__name__, export_dir, exc_info=True,
+                    )
+
+        rank_zero_call(notify)
 
 
 class CheckpointCoordinator:
@@ -69,10 +71,9 @@ class CheckpointCoordinator:
         manager: BaseCheckpointManager,
         *,
         parallel_context: dict[str, Any],
+        export_plugin_consumer: CheckpointExportPluginConsumer,
     ) -> None:
-        self.export_plugins: CheckpointExportPluginConsumer = (
-            CheckpointExportPluginConsumer()
-        )
+        self._export_plugin_consumer = export_plugin_consumer
         self._config = config
         self._manager = manager
         self._parallel_context = parallel_context
@@ -140,7 +141,7 @@ class CheckpointCoordinator:
                     source_path=source_path,
                     weight_converter=self._weight_converter(model, source_path),
                 )
-                self.export_plugins.notify_hf_export(
+                self._export_plugin_consumer.notify_hf_export(
                     os.path.join(output_dir, layout.HF_MODEL_DIR)
                 )
         return formats

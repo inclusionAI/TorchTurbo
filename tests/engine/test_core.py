@@ -29,7 +29,7 @@ from torchturbo.engine import (
 )
 from torchturbo.engine.backend_registry import _BACKENDS
 from torchturbo.engine.backends.fsdp2.config import FSDPConfig
-from torchturbo.engine.checkpoint.coordinator import CheckpointCoordinator
+from torchturbo.engine.checkpoint.coordinator import CheckpointCoordinator, CheckpointExportPluginConsumer
 from torchturbo.engine.optimizers import (
     MuonParameterSpec,
     MuonRecipe,
@@ -1224,6 +1224,7 @@ def test_save_model_writes_dcp_state_and_exports_hf_by_policy(
         engine.config,
         engine.backend.create_checkpoint_manager(),
         parallel_context=engine.backend.get_parallel_context(),
+        export_plugin_consumer=CheckpointExportPluginConsumer(),
     )
     engine.model_name_or_path = "/source"
     output_dir = str(tmp_path / "checkpoint-1")
@@ -1244,6 +1245,7 @@ def test_save_model_rejects_a_string_format_before_writing(tmp_path):
         engine.config,
         engine.backend.create_checkpoint_manager(),
         parallel_context=engine.backend.get_parallel_context(),
+        export_plugin_consumer=CheckpointExportPluginConsumer(),
     )
     engine.model_name_or_path = "/source"
 
