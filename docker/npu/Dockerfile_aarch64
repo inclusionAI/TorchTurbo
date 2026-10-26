@@ -36,7 +36,7 @@ RUN git clone --branch v2.10.0 --depth 1 --recurse-submodules --shallow-submodul
         https://github.com/pytorch/pytorch.git /tmp/pytorch \
     && cd /tmp/pytorch \
     && sed -i 's/if(WIN32 OR (CPU_AARCH64 AND NOT APPLE))/if(WIN32)/' CMakeLists.txt \
-    && pip install -r requirements-build.txt cmake==3.27.9 wheel optree==0.16.0 \
+    && pip install -r requirements-build.txt wheel \
     && USE_CUDA=0 USE_ROCM=0 USE_MPS=0 USE_XPU=0 \
         USE_MIMALLOC=OFF BUILD_TEST=0 BLAS=OpenBLAS \
         PYTORCH_BUILD_VERSION=2.10.0+cpu.nomimalloc PYTORCH_BUILD_NUMBER=1 \
