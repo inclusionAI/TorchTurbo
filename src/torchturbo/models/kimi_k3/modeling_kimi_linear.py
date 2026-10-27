@@ -55,36 +55,21 @@ except ImportError:
         "environment matrix."
     )
 
-# The KDA Triton kernels are import-optional: if fla.ops.kda itself cannot be
-# imported (triton / triton-ascend missing, or a partial fla install), the
-# KDA layers automatically fall back to the pure-PyTorch chunk_kda_naive and
-# a warning is logged once at import time. NOTE: stacks where the kernel
-# imports fine but deadlocks at runtime (old triton-ascend aicore timeout)
-# cannot be auto-detected — set ``kda_implementation: naive`` in the model
-# config there (see README).
+# fused_recurrent_kda (single-token decode path) is import-optional: when
+# fla.ops.kda cannot be imported, decode falls back to the chunk path below.
 try:
-    from fla.ops.kda import chunk_kda, fused_recurrent_kda
-    # from fla.ops.kda.gate import fused_kda_gate  # deprecated, gate is now computed inside chunk_kda/fused_recurrent_kda
+    from fla.ops.kda import fused_recurrent_kda
 except ImportError:
-    chunk_kda = fused_recurrent_kda = None
-    logging.get_logger(__name__).warning(
-        "fla.ops.kda is not importable (triton backend missing or fla too "
-        "old): KDA layers will run the pure-PyTorch chunk_kda_naive "
-        "fallback. Install flash-linear-attention>=0.6.0 with a working "
-        "triton backend for the fused path, or set kda_implementation: "
-        "naive to silence this warning."
-    )
+    fused_recurrent_kda = None
 
-# Pure-PyTorch (small-operator) KDA implementation, functionally equivalent
-# to fla.ops.kda.chunk_kda. The training chunk path routes via config
-# ``kda_implementation``:
-#   - "fused" (default): fla's Triton chunk_kda, verified on Ascend NPU with
-#     flash-linear-attention >= 0.6.0 + triton-ascend >= 3.2.2 (older stacks
-#     such as fla 0.5.2 + triton-ascend 3.2.1 deadlock with aicore timeout);
-#   - "naive": this operator — no Triton dependency, fallback for stacks
-#     without a working triton-ascend (verified on NPU, loss matches the
-#     fused path).
-from torchturbo.ops.kda.chunk_kda_naive import chunk_kda_naive
+# The training chunk path goes through the ops-registry entry
+# (``torchturbo.ops.kda.chunk_kda``): auto dispatch prefers fla's Triton
+# kernel and falls back to the pure-PyTorch naive implementation when fla
+# cannot be imported; config ``kda_implementation: naive`` forces the
+# naive impl. Stacks where the kernel imports but deadlocks at runtime
+# (old triton-ascend aicore timeout) must set ``kda_implementation: naive``
+# in the model config (see README).
+from torchturbo.ops.kda import chunk_kda
 
 from .configuration_kimi_k3 import KimiLinearConfig
 
@@ -696,34 +681,12 @@ class KimiDeltaAttention(nn.Module):
         v = rearrange(v, '... (h d) -> ... h d', d=self.head_dim)
 
         if mode == 'chunk':
-            # Route via config: 'naive' forces the pure-PyTorch fallback
-            # (for stacks where the fla Triton kernel is known-broken);
-            # anything else uses fla's fused chunk_kda (Triton), which is
-            # verified on NPU with flash-linear-attention 0.6.0 +
-            # triton-ascend 3.2.2. If the Triton kernels could not even be
-            # imported, fall back to naive automatically (import-time
-            # warning was logged).
-            if getattr(self.config, 'kda_implementation', 'fused') == 'naive' or chunk_kda is None:
-                o, recurrent_state = chunk_kda_naive(
-                q=q,
-                k=k,
-                v=v,
-                g=g,
-                beta=beta,
-                A_log=self.A_log,
-                dt_bias=self.dt_bias,
-                initial_state=recurrent_state,
-                output_final_state=True,
-                use_qk_l2norm_in_kernel=True,
-                use_gate_in_kernel=True,
-                use_beta_sigmoid_in_kernel=True,
-                safe_gate=self.gate_lower_bound is not None,
-                lower_bound=self.gate_lower_bound,
-                transpose_state_layout=True,
-                cu_seqlens=cu_seqlens,
-            )
-            else:
-                o, recurrent_state = chunk_kda(
+            # Routed through the ops registry (torchturbo.ops.kda.chunk_kda):
+            # auto prefers fla's Triton kernel and falls back to the
+            # pure-PyTorch naive impl when fla is not importable;
+            # kda_implementation='naive' forces the naive impl (for stacks
+            # where the kernel imports but deadlocks at runtime).
+            o, recurrent_state = chunk_kda(
                 q=q,
                 k=k,
                 v=v,
@@ -739,6 +702,11 @@ class KimiDeltaAttention(nn.Module):
                 safe_gate=self.gate_lower_bound is not None,
                 lower_bound=self.gate_lower_bound,
                 cu_seqlens=cu_seqlens,
+                impl=(
+                    "naive_chunk_kda"
+                    if getattr(self.config, 'kda_implementation', 'fused') == 'naive'
+                    else None
+                ),
             )
         else:
             o, recurrent_state = fused_recurrent_kda(

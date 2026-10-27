@@ -323,15 +323,13 @@ class TurboKimiK3ForConditionalGeneration(
         # klm.chunk_kda to the pure-PyTorch naive impl to work around the
         # aicore-timeout deadlocks of old NPU stacks (fla 0.5.2 +
         # triton-ascend 3.2.1). That silently hijacked the modeling-side
-        # kda_implementation routing: config 'fused' (the default) still
-        # executed the naive op, because the else-branch looked up the
-        # module-level name that had been rebound here. The routing now lives
-        # entirely in modeling_kimi_linear.py (per-config branch, plus an
-        # automatic import-time fallback to naive when fla.ops.kda is not
-        # importable) and in sp_forward (conditional import), and the naive
-        # path is always importable — so no global rebinding happens here.
-        # Old stacks that cannot run the Triton kernel should set
-        # kda_implementation: naive in the model config (see README).
+        # kda_implementation routing. The routing now lives in the ops
+        # registry (torchturbo.ops.kda.chunk_kda entry): auto dispatch
+        # prefers fla and falls back to the always-importable naive impl,
+        # with kda_implementation: naive mapping to the per-op override —
+        # so no global rebinding happens here. Old stacks that cannot run
+        # the Triton kernel should set kda_implementation: naive in the
+        # model config (see README).
 
         # Patch nn.Embedding.forward: use full_tensor() to all-gather sharded weight.
         # Stock PyTorch embedding_dense_backward DTensor strategy lacks the
@@ -425,24 +423,22 @@ class TurboKimiK3ForConditionalGeneration(
             v = _split_last_dim_heads(v, self.head_dim)
             g = _split_last_dim_heads(g, self.head_dim)
 
-            # Reuse the import-time probe from modeling_kimi_linear: if the
-            # Triton kernels were not importable there, klm.chunk_kda is
-            # None and we fall back to the naive impl (a warning was logged
-            # once at import time). No silent per-call try/except here.
-            from . import modeling_kimi_linear as klm
-            kda_impl = getattr(self.config, "kda_implementation", "naive")
-            if kda_impl == "fused" and klm.chunk_kda is not None:
-                kda_fn = klm.chunk_kda
-            else:
-                from torchturbo.ops.kda.chunk_kda_naive import chunk_kda_naive as kda_fn
+            # Same routing as the official forward: the ops-registry entry
+            # (auto fla -> naive fallback; kda_implementation='naive' forces
+            # the pure-PyTorch impl).
+            from torchturbo.ops.kda import chunk_kda as chunk_kda_op
 
-            o, _ = kda_fn(
+            kda_impl = getattr(self.config, "kda_implementation", "naive")
+            impl = None if kda_impl == "fused" else "naive_chunk_kda"
+
+            o, _ = chunk_kda_op(
                 q=q, k=k, v=v, g=g, beta=beta,
                 A_log=A_log_local, dt_bias=dt_bias_local,
                 initial_state=None, output_final_state=True,
                 use_qk_l2norm_in_kernel=True, use_gate_in_kernel=True,
                 safe_gate=getattr(self, "safe_gate", False),
                 lower_bound=self.gate_lower_bound,
+                impl=impl,
             )
 
             o = gather_heads_scatter_seq(o, seq_dim=1, head_dim=2, sp_group=sp_group, sp_size=sp_size)
