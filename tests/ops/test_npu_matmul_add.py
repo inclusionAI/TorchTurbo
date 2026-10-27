@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import sys
+from types import ModuleType
+
 import torch
 
 from torchturbo.ops.providers.npu.matmul_add import (

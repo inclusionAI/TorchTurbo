@@ -76,6 +76,32 @@ def get_parallel_plan() -> FSDPParallelPlan:
 
 The wrapper class returns this plan from `get_default_parallel_plan()`. The engine then merges `EngineConfig.parallel_plan` into it, including runtime `sp_size` and `ep_size` values supplied through environment variables, a configuration file, or CLI arguments.
 
+Vision balancing is configured on a compatible module's plan entry. For Bailing
+V3 VL, enable it on `model.visual` in the file passed to `--tt_config`:
+
+```yaml
+engine_config:
+  parallel_plan:
+    plan:
+      model.visual:
+        vision_balance:
+          mode: patch_sq
+```
+
+`patch` weights whole media by patch count; `patch_sq` uses squared patch count.
+The model's Python plan supplies `VisionBalanceSpec(io=BailingVisionBalanceIO())`;
+its default `mode=None` leaves balancing disabled. A mode-only file override
+preserves that I/O instance. Python callers use `VisionBalanceMode.PATCH` or
+`VisionBalanceMode.PATCH_SQ`; file values are converted to the enum when parsed.
+
+Models implement `BaseVisionBalanceIO` to read and replace call inputs, extract
+and restore all output streams, and build valid dummy media. `VisionBatch`
+declares packed patch rows, media grids, and per-medium lengths for each output
+stream. `register_vision_balance` uses the instance to preserve the model's
+argument and return formats while exchanging media and restoring their order.
+The boundary must be called in the same order on every WORLD rank. Bailing V3 VL
+provides this implementation; other towers require their own I/O contract.
+
 ### Backend
 
 Currently available backend:

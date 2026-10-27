@@ -1,10 +1,9 @@
+from typing import Any
+
 import torch
+from transformers import AutoModelForImageTextToText
 
 from torchturbo.engine.metrics.flops import BaseModelFlops
-from transformers import AutoModelForImageTextToText
-from typing import Any
-from typing_extensions import override
-
 from torchturbo.models.qwen3_5_moe.configuration_qwen3_5_moe import Qwen3_5MoeConfig
 from torchturbo.models.qwen3_5_moe.modeling_qwen3_5_moe import (
     Qwen3_5MoeForConditionalGeneration,
@@ -13,6 +12,7 @@ from torchturbo.runtime import get_device_runtime
 
 from ...engine.config import ParameterGroup
 from ..base import TurboVLMModel
+from ..modules.attention.gdn import build_gdn_sp_forward
 from ..modules.attention.ulysses import SequenceParallelInputSlicingSpec
 from ..qwen3_5.inputs import prepare_packed_position_ids
 from ..registry import register_model
@@ -84,9 +84,10 @@ class TurboQwen3_5MoeForConditionalGeneration(
         return get_parallel_plan(**kwargs)
 
     def _post_init_patches(self):
-        import torch
         import functools
         import itertools
+
+        import torch
 
         # Wrap get_rope_index:
         # 1. auto-fill mm_token_type_ids when not provided (the open-source LF
@@ -261,25 +262,25 @@ class TurboQwen3_5MoeForConditionalGeneration(
         inputs = super().on_prepare_inputs(inputs, source_inputs=source_inputs)
         return prepare_packed_position_ids(self.model, inputs)
 
-    def on_parallelized(self, parallel_context):
+    def on_parallelized(self, parallel_context: dict[str, Any]) -> None:
+        from torchturbo.models.qwen3_5_moe.modeling_qwen3_5_moe import (
+            Qwen3_5MoeGatedDeltaNet,
+            Qwen3_5MoeMultiTokenPredictor,
+        )
+
         sp_info = parallel_context["sp"]
         sp_group = sp_info["sp_group"]
         sp_size = sp_info["sp_size"]
         sp_rank = sp_info["sp_rank"]
-        if sp_size > 1:
-            from torchturbo.models.qwen3_5_moe.modeling_qwen3_5_moe import (
-                Qwen3_5MoeGatedDeltaNet,
-                Qwen3_5MoeMultiTokenPredictor,
-            )
+        Qwen3_5MoeGatedDeltaNet.forward = build_gdn_sp_forward(
+            sp_group, sp_size, sp_rank
+        )
 
+        if sp_size > 1:
             # Vision keeps flash_attention_2 on its own subconfig and stays
             # on the native flash path; only text attention switches to the
             # registered SP interface.
             self.register_sp_attention_interface(sp_info)
-
-            self.patch_gated_delta_net_for_sp(
-                Qwen3_5MoeGatedDeltaNet, sp_group, sp_size, sp_rank
-            )
 
             if self.mtp is not None:
                 self.patch_mtp_for_sp(
@@ -343,250 +344,6 @@ class TurboQwen3_5MoeForConditionalGeneration(
             )
 
         mtp_cls.forward = _mtp_sp_forward
-
-    # ------------------------------------------------------------------
-    # GatedDeltaNet: head-parallel SP with sp_repeat
-    # ------------------------------------------------------------------
-
-    @classmethod
-    def patch_gated_delta_net_for_sp(cls, attn_cls, sp_group, sp_size, sp_rank):
-        """Head-parallel SP for GatedDeltaNet linear attention.
-
-        Each SP rank computes num_heads/sp_size heads on the full sequence.
-        Q/K/V are split first then gathered individually.
-
-        When sp_size > num_k_heads (e.g., SP=32 with 16 key heads),
-        Q/K heads are repeated by sp_repeat to match sp_size before
-        the all-to-all. V already has enough heads and does NOT repeat.
-
-        Shape reference (Qwen3.5-35B-A3B):
-          nk_full = linear_num_key_heads = 16
-          nv_full = linear_num_value_heads = 32
-          dk = linear_key_head_dim = 128
-          dv = linear_value_head_dim = 128
-          G_orig = nv_full / nk_full = 2
-
-          sp_repeat = max(1, sp_size // nk_full)
-          sh = nk_full * sp_repeat      (super-head count)
-          G_per_sh = nv_full // sh       (value heads per super-head)
-
-          SP=1:  sp_repeat=1, sh=16, G_per_sh=2, nk=16, nv=32
-          SP=2:  sp_repeat=1, sh=16, G_per_sh=2, nk=8,  nv=16
-          SP=32: sp_repeat=2, sh=32, G_per_sh=1, nk=1,  nv=1
-        """
-        from ..modules.attention.ulysses.ulysses import (
-            gather_seq_scatter_heads,
-            gather_heads_scatter_seq,
-        )
-        from torchturbo.ops import ops
-        import torch.nn.functional as F
-
-        def _slice_param(weight, dim):
-            """Slice a parameter along `dim` for this SP rank.
-
-            e.g., A_log [32] → [16] for SP=2 rank 0/1
-                  conv1d.weight [8192, 1, 4] → [4096, 1, 4] for SP=2 rank 0/1
-            """
-            slices = [slice(None)] * weight.dim()
-            d = weight.size(dim)
-            slices[dim] = slice(
-                sp_rank * d // sp_size, (sp_rank + 1) * d // sp_size
-            )
-            return weight[tuple(slices)]
-
-        def sp_forward(self_attn, hidden_states, **kwargs):
-            # Global packed boundaries ride with the forward kwargs (passed by
-            # the decoder layer as cu_seq_lens); the a2a gathers below rebuild
-            # the full sequence on each rank.
-            cu_seqlens = kwargs.get("cu_seq_lens")
-            B, local_T, _ = hidden_states.shape
-
-            nk_full, nv_full = self_attn.num_k_heads, self_attn.num_v_heads
-            dk, dv = self_attn.head_k_dim, self_attn.head_v_dim
-
-            # Projections on local sequence shard [B, T/sp, *]
-            mixed_qkv = self_attn.in_proj_qkv(hidden_states)
-            z = self_attn.in_proj_z(hidden_states)
-            b = self_attn.in_proj_b(hidden_states)
-            a = self_attn.in_proj_a(hidden_states)
-
-            # Split fused QKV → Q/K repeat → super-head packing → all-to-all
-            #
-            # When sp_size > nk_full (e.g., SP=32), Q/K have fewer heads (16)
-            # than SP groups (32). Solution: repeat Q/K heads by sp_repeat,
-            # so super-head count sh = nk_full * sp_repeat = sp_size.
-            #
-            # V has nv_full heads which is already >= sp_size, no repeat needed.
-            q_raw, k_raw, v_raw = torch.split(
-                mixed_qkv,
-                [self_attn.key_dim, self_attn.key_dim, self_attn.value_dim],
-                dim=-1,
-            )
-
-            sp_repeat = max(1, sp_size // nk_full)
-            sh = nk_full * sp_repeat  # super-head count
-            G_per_sh = nv_full // sh  # value heads per super-head
-
-            # Q/K: reshape to heads, repeat if sp_repeat > 1
-            q_shaped = q_raw.reshape(B, local_T, nk_full, dk)
-            k_shaped = k_raw.reshape(B, local_T, nk_full, dk)
-            if sp_repeat > 1:
-                q_shaped = q_shaped.repeat_interleave(sp_repeat, dim=2)
-                k_shaped = k_shaped.repeat_interleave(sp_repeat, dim=2)
-
-            # V: reshape to super-head grouping (no repeat)
-            v_shaped = v_raw.reshape(B, local_T, sh, G_per_sh * dv)
-
-            # Pack Q/K/V into super-heads
-            interleaved_qkv = torch.cat(
-                [q_shaped, k_shaped, v_shaped], dim=-1
-            )
-
-            # All-to-all #1: gather seq / scatter heads
-            interleaved_qkv = gather_seq_scatter_heads(
-                interleaved_qkv,
-                seq_dim=1,
-                head_dim=2,
-                sp_group=sp_group,
-                sp_size=sp_size,
-            )
-            T = interleaved_qkv.shape[1]
-            nk = nk_full * sp_repeat // sp_size  # key heads per rank
-            nv = nv_full // sp_size  # value heads per rank
-
-            # De-interleave super-head → separate Q, K, V
-            q_raw = interleaved_qkv[..., :dk]
-            k_raw = interleaved_qkv[..., dk : 2 * dk]
-            v_raw = interleaved_qkv[..., 2 * dk :].reshape(B, T, nv, dv)
-
-            # Conv1d on local heads
-            # Re-fuse Q/K/V → conv1d with sliced+repeated weights → re-split
-            local_qkv = torch.cat(
-                [
-                    q_raw.reshape(B, T, nk * dk),
-                    k_raw.reshape(B, T, nk * dk),
-                    v_raw.reshape(B, T, nv * dv),
-                ],
-                dim=-1,
-            )
-
-            w = self_attn.conv1d.weight  # [conv_dim, 1, kernel]
-            wq, wk, wv = torch.split(
-                w,
-                [self_attn.key_dim, self_attn.key_dim, self_attn.value_dim],
-                dim=0,
-            )
-
-            # Q/K weight: head-level repeat, then slice by sp_size.
-            # CRITICAL: repeat_interleave on flat dim=0 is channel-level
-            # (c0,c0,c1,c1,...), but Q/K data is head-level repeated
-            # (H0_all_128ch, H0_all_128ch, ...). Must reshape to [heads, dk, 1, K]
-            # first, repeat on head dim, then flatten back.
-            K = self_attn.conv_kernel_size
-            if sp_repeat > 1:
-                wq = wq.reshape(nk_full, dk, 1, K).repeat_interleave(sp_repeat, dim=0).reshape(-1, 1, K)
-                wk = wk.reshape(nk_full, dk, 1, K).repeat_interleave(sp_repeat, dim=0).reshape(-1, 1, K)
-            # wv: [nv_full * dv, 1, K] = [32*128, 1, 4], no repeat needed
-
-            local_conv_weight = torch.cat(
-                [_slice_param(wq, 0), _slice_param(wk, 0), _slice_param(wv, 0)], dim=0
-            )
-
-            local_conv_bias = None
-            if self_attn.conv1d.bias is not None:
-                bq, bk, bv = torch.split(
-                    self_attn.conv1d.bias,
-                    [self_attn.key_dim, self_attn.key_dim, self_attn.value_dim],
-                    dim=0,
-                )
-                if sp_repeat > 1:
-                    bq = bq.reshape(nk_full, dk).repeat_interleave(sp_repeat, dim=0).reshape(-1)
-                    bk = bk.reshape(nk_full, dk).repeat_interleave(sp_repeat, dim=0).reshape(-1)
-                local_conv_bias = torch.cat(
-                    [_slice_param(bq, 0), _slice_param(bk, 0), _slice_param(bv, 0)],
-                    dim=0,
-                )
-
-            local_qkv, _ = ops.causal_conv1d(
-                x=local_qkv,  # [B, T, D]
-                weight=local_conv_weight.squeeze(1),  # d, 1, w -> d, w
-                bias=local_conv_bias,
-                activation=self_attn.activation,
-                initial_state=None,
-                output_final_state=False,
-                cu_seqlens=cu_seqlens,
-            )
-
-            q, k, v = torch.split(
-                local_qkv, [nk * dk, nk * dk, nv * dv], dim=-1
-            )
-            q = q.reshape(B, T, nk, dk)
-            k = k.reshape(B, T, nk, dk)
-            v = v.reshape(B, T, nv, dv)
-
-            # GQA expand
-            # When sp_repeat > 1, the GQA ratio is partially absorbed by sp_repeat.
-            # Use per-rank nk vs nv (not full) to decide whether to expand.
-            if nk < nv:
-                r = nv // nk
-                q = q.repeat_interleave(r, dim=2)
-                k = k.repeat_interleave(r, dim=2)
-
-            # All-to-all for z, b, a (use value-head dimension nv_full)
-            z = gather_seq_scatter_heads(
-                z.reshape(B, local_T, nv_full, dv),
-                seq_dim=1,
-                head_dim=2,
-                sp_group=sp_group,
-                sp_size=sp_size,
-            )
-            b = gather_seq_scatter_heads(
-                b.unsqueeze(-1),
-                seq_dim=1,
-                head_dim=2,
-                sp_group=sp_group,
-                sp_size=sp_size,
-            ).squeeze(-1)
-            a = gather_seq_scatter_heads(
-                a.unsqueeze(-1),
-                seq_dim=1,
-                head_dim=2,
-                sp_group=sp_group,
-                sp_size=sp_size,
-            ).squeeze(-1)
-
-            # Compute gate (beta) and delta (g)
-            beta = b.sigmoid()
-            A_log_local = _slice_param(self_attn.A_log, 0)
-            dt_bias_local = _slice_param(self_attn.dt_bias, 0)
-            g = -A_log_local.float().exp() * F.softplus(a.float() + dt_bias_local)
-
-            # Chunk Gated Delta Rule (core linear attention)
-            out, _ = ops.gated_delta_rule(
-                q=q,
-                k=k,
-                v=v,
-                g=g,
-                beta=beta,
-                initial_state=None,
-                output_final_state=False,
-                use_qk_l2norm_in_kernel=True,
-                cu_seqlens=cu_seqlens,
-            )
-
-            # All-to-all #2: gather heads / scatter seq back
-            out = gather_heads_scatter_seq(
-                out, seq_dim=1, head_dim=2, sp_group=sp_group, sp_size=sp_size
-            )
-            z = gather_heads_scatter_seq(
-                z, seq_dim=1, head_dim=2, sp_group=sp_group, sp_size=sp_size
-            )
-
-            # RMSNorm Gated + output projection
-            out = self_attn.norm(out.reshape(-1, dv), z.reshape(-1, dv))
-            return self_attn.out_proj(out.reshape(B, local_T, -1))
-
-        attn_cls.forward = sp_forward
 
     def get_weight_converter(self, parallel_context, model_path):
         return Qwen3_5MoeWeightConverter(self, parallel_context, model_path)

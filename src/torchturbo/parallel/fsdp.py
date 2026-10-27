@@ -3,10 +3,40 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from enum import Enum
+from typing import TYPE_CHECKING, Any
 
 from ..engine.utils import match_fqn
 from .parallel import ParallelPlan
+
+if TYPE_CHECKING:
+    from ..models.modules.vision.io import BaseVisionBalanceIO
+
+
+class VisionBalanceMode(str, Enum):
+    """Weight used to distribute whole media across vision encoder ranks."""
+
+    PATCH = "patch"
+    PATCH_SQ = "patch_sq"
+
+
+@dataclass
+class VisionBalanceSpec:
+    """Configure media balancing and the model's input/output protocol.
+
+    Attributes:
+        mode: Media balancing weight, or None to leave balancing disabled in
+            the resolved plan. None inherits the model default in an override.
+        io: Model-provided input/output adapter. None inherits the model
+            adapter in a partial plan override.
+    """
+
+    mode: VisionBalanceMode | None = None
+    io: BaseVisionBalanceIO | None = None
+
+    def __post_init__(self) -> None:
+        if self.mode is not None and not isinstance(self.mode, VisionBalanceMode):
+            raise TypeError("VisionBalanceSpec.mode must be a VisionBalanceMode.")
 
 
 @dataclass
@@ -44,6 +74,10 @@ class FSDPPlanSpec:
         A callable to replace the matched module. Signature: `(original_module, **kwargs) -> nn.Module`
     module_kwargs:
         Keyword arguments to pass to the `replace_module` callable.
+    vision_balance:
+        Media balancing mode and the model's input/output adapter. Hooks are
+        installed only when the resolved spec has a mode. Non-None fields in
+        a partial spec override the corresponding model defaults.
     """
 
     placement: FSDPPlacementSpec | None = None
@@ -52,8 +86,13 @@ class FSDPPlanSpec:
     activation_checkpoint: bool = False
     replace_module: Any | None = None
     module_kwargs: dict[str, Any] = field(default_factory=dict)
+    vision_balance: VisionBalanceSpec | None = None
 
     def __post_init__(self) -> None:
+        if self.vision_balance is not None and not isinstance(
+            self.vision_balance, VisionBalanceSpec
+        ):
+            raise TypeError("FSDPPlanSpec.vision_balance must be a VisionBalanceSpec.")
         if self.no_shard and (
             self.standalone_world_shard or self.placement is not None
         ):

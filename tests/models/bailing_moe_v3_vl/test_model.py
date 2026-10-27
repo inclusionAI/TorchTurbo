@@ -1,6 +1,10 @@
 """Numerical and lifecycle contracts for Bailing V3 VL integration."""
 
+import copy
 import json
+import logging
+from contextlib import nullcontext
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -19,6 +23,8 @@ from torchturbo.models.bailing_moe_v3_vl.modeling_bailing_moe_v3_vl import (
     BailingMoeV3KimiDeltaAttention,
     _prepare_mtp_input_ids,
 )
+from torchturbo.models.bailing_moe_v3_vl.vision_balance import BailingVisionBalanceIO
+from torchturbo.models.modules.vision.io import VisionBatch
 
 
 def make_config(*, hybrid=False, mtp=0):
@@ -82,6 +88,238 @@ def make_model(**kwargs):
         if isinstance(module, BailingMoeV3KimiDeltaAttention):
             nn.init.zeros_(module.dt_bias)
     return model.eval()
+
+
+@pytest.fixture
+def single_rank_group(tmp_path):
+    torch.distributed.init_process_group(
+        "gloo",
+        init_method=(tmp_path / "vision_balance_group").as_uri(),
+        rank=0,
+        world_size=1,
+    )
+    try:
+        yield
+    finally:
+        torch.distributed.destroy_process_group()
+
+
+@pytest.mark.parametrize("argument_style", ["positional", "mixed", "keyword"])
+def test_vision_balance_io_preserves_call_arguments(argument_style):
+    tower = make_model().model.visual
+    io = BailingVisionBalanceIO()
+    pixels = torch.randn(20, 24)
+    grid = torch.tensor([[1, 2, 2], [2, 2, 4]])
+    metadata = {"attention_mask": None}
+    kwargs = {"metadata": metadata}
+    extra_argument = object()
+    if argument_style == "positional":
+        args = (pixels, grid, extra_argument)
+    elif argument_style == "mixed":
+        args = (pixels,)
+        kwargs["grid_thw"] = grid
+    else:
+        args = ()
+        kwargs.update(hidden_states=pixels, grid_thw=grid)
+
+    original_kwargs = kwargs.copy()
+    batch = io.read_inputs(tower, args, kwargs)
+    assert batch.pixels is pixels
+    assert batch.grid_thw is grid
+    assert batch.output_lengths == {"features": [1, 4]}
+
+    replacement = VisionBatch(
+        pixels=torch.cat((pixels[4:], pixels[:4])),
+        grid_thw=grid.flip(0),
+        output_lengths={"features": [4, 1]},
+    )
+    new_args, new_kwargs = io.write_inputs(args, kwargs, replacement)
+    assert len(new_args) == len(args)
+    assert new_kwargs.keys() == kwargs.keys()
+    assert new_kwargs["metadata"] is metadata
+    assert all(kwargs[name] is value for name, value in original_kwargs.items())
+    if argument_style == "positional":
+        assert new_args == (replacement.pixels, replacement.grid_thw, extra_argument)
+        assert args == (pixels, grid, extra_argument)
+    elif argument_style == "mixed":
+        assert new_args[0] is replacement.pixels
+        assert new_kwargs["grid_thw"] is replacement.grid_thw
+        assert args[0] is pixels
+    else:
+        assert new_kwargs["hidden_states"] is replacement.pixels
+        assert new_kwargs["grid_thw"] is replacement.grid_thw
+
+
+def test_vision_balance_io_dummy_runs_one_merged_token():
+    tower = make_model().model.visual.double()
+    io = BailingVisionBalanceIO()
+    batch = io.make_dummy(tower)
+
+    assert batch.pixels.shape == (4, 24)
+    assert batch.pixels.dtype == torch.float64
+    assert batch.pixels.device == next(tower.parameters()).device
+    assert torch.count_nonzero(batch.pixels) == 0
+    assert batch.grid_thw.tolist() == [[1, 2, 2]]
+    assert batch.grid_thw.dtype == torch.long
+    assert batch.grid_thw.device == batch.pixels.device
+    assert batch.output_lengths == {"features": [1]}
+    args, kwargs = io.write_inputs((), {}, batch)
+    with torch.no_grad():
+        features = tower(*args, **kwargs)
+    assert features.shape == (1, 64)
+    assert io.read_outputs(features)["features"] is features
+
+
+@pytest.mark.parametrize("explicit_none", [False, True])
+def test_vision_balance_io_requires_media_inputs(explicit_none):
+    # Media-less batches reach the tower with a framework-provided dummy
+    # image, so read_inputs must not invent media for missing inputs.
+    tower = make_model().model.visual
+    io = BailingVisionBalanceIO()
+    args = (None, None) if explicit_none else ()
+
+    with pytest.raises(ValueError, match="hidden_states and grid_thw together"):
+        io.read_inputs(tower, args, {})
+
+
+@pytest.mark.parametrize("missing", ["hidden_states", "grid_thw"])
+def test_vision_balance_io_rejects_missing_input_pair(missing):
+    tower = make_model().model.visual
+    kwargs = {
+        "hidden_states": torch.randn(4, 24),
+        "grid_thw": torch.tensor([[1, 2, 2]]),
+    }
+    kwargs[missing] = None
+
+    with pytest.raises(ValueError, match="hidden_states and grid_thw together"):
+        BailingVisionBalanceIO().read_inputs(tower, (), kwargs)
+
+
+def test_vision_balance_io_restores_tensor_and_rejects_structured_output():
+    io = BailingVisionBalanceIO()
+    output = torch.randn(1, 64)
+    restored = torch.randn(2, 64)
+    original_batch = VisionBatch(
+        pixels=torch.randn(8, 24),
+        grid_thw=torch.tensor([[1, 2, 4]]),
+        output_lengths={"features": [2]},
+    )
+
+    assert io.read_outputs(output)["features"] is output
+    assert io.write_outputs(output, {"features": restored}, original_batch) is restored
+    with pytest.raises(TypeError, match="tensor tower output"):
+        io.read_outputs((output, [torch.randn(1, 64)]))
+
+
+def test_default_plan_declares_disabled_bailing_vision_balance_io():
+    plan = TurboBailingMoeV3VLForConditionalGeneration.get_default_parallel_plan()
+    spec = plan.plan["model.visual"]
+
+    assert spec.standalone_world_shard
+    assert spec.vision_balance.mode is None
+    assert isinstance(spec.vision_balance.io, BailingVisionBalanceIO)
+
+
+@pytest.mark.parametrize("mode", ["patch", "patch_sq"])
+@pytest.mark.parametrize(
+    "checkpoint_mode, frozen", [(None, False), (False, False), (True, False), (None, True)]
+)
+def test_vision_balance_registration_preserves_forward_and_backward(
+    monkeypatch, single_rank_group, mode, checkpoint_mode, frozen
+):
+    from torchturbo.engine.backends.fsdp2.backend import FSDP2Backend
+    from torchturbo.engine.config import ActivationCheckpointingConfig
+    from torchturbo.engine.model_fqn import build_model_fqn_map
+    from torchturbo.models.modules.vision import register_vision_balance
+    from torchturbo.models.modules.vision.balance import _VisionBalanceState
+    from torchturbo.parallel import (
+        FSDPParallelPlan,
+        FSDPPlanSpec,
+        VisionBalanceMode,
+        VisionBalanceSpec,
+    )
+
+    tower = make_model().model.visual.train().requires_grad_(not frozen)
+    reference = copy.deepcopy(tower)
+    if checkpoint_mode is not None:
+        backend = FSDP2Backend.__new__(FSDP2Backend)
+        backend.logger = logging.getLogger(__name__)
+        backend.config = EngineConfig(
+            activation_checkpointing=ActivationCheckpointingConfig(
+                enabled=True, use_reentrant=checkpoint_mode
+            )
+        )
+        backend.prefetch_manager = SimpleNamespace(
+            suspend_expert_forward_prefetch=lambda model: nullcontext()
+        )
+        plan = FSDPParallelPlan(
+            plan={"blocks.*": FSDPPlanSpec(activation_checkpoint=True)}
+        )
+        resolved = backend._compile_parallel_plan(plan, build_model_fqn_map(tower))
+        backend._apply_activation_checkpointing(tower, resolved)
+
+    events = []
+    block_calls = []
+    original_build_plan = _VisionBalanceState._build_plan
+    original_post_forward = _VisionBalanceState._post_forward
+
+    def build_plan(state, module, batch):
+        events.append("balance.pre")
+        return original_build_plan(state, module, batch)
+
+    def post_forward(state, module, args, output):
+        events.append("balance.post")
+        return original_post_forward(state, module, args, output)
+
+    monkeypatch.setattr(_VisionBalanceState, "_build_plan", build_plan)
+    monkeypatch.setattr(_VisionBalanceState, "_post_forward", post_forward)
+    # These markers occupy the same hook positions as FSDP. The tower and
+    # collectives execute on CPU; this test does not shard its parameters.
+    tower.register_forward_pre_hook(
+        lambda module, args: events.append("fsdp.pre"), prepend=True
+    )
+    tower.register_forward_hook(
+        lambda module, args, output: events.append("fsdp.post")
+    )
+    tower.blocks[0].attn.qkv.register_forward_pre_hook(
+        lambda module, args: block_calls.append(None)
+    )
+    register_vision_balance(
+        tower,
+        spec=VisionBalanceSpec(mode=VisionBalanceMode(mode), io=BailingVisionBalanceIO()),
+        sp_size=1,
+        sp_rank=0,
+    )
+    assert tower.state_dict().keys() == reference.state_dict().keys()
+
+    pixels = torch.randn(20, 24)
+    grid = torch.tensor([[1, 2, 2], [2, 2, 4]])
+    expected = reference(pixels, grid_thw=grid)
+    if not frozen:
+        expected.square().sum().backward()
+
+    for _ in range(2):
+        events.clear()
+        block_calls.clear()
+        tower.zero_grad(set_to_none=True)
+        actual = tower(pixels, grid_thw=grid)
+        torch.testing.assert_close(actual, expected)
+        if not frozen:
+            actual.square().sum().backward()
+            for parameter, reference_parameter in zip(
+                tower.parameters(), reference.parameters()
+            ):
+                torch.testing.assert_close(parameter.grad, reference_parameter.grad)
+        assert events == ["fsdp.pre", "balance.pre", "fsdp.post", "balance.post"]
+        assert len(block_calls) == (2 if checkpoint_mode is not None else 1)
+
+    events.clear()
+    tower.eval()
+    reference.eval()
+    with torch.no_grad():
+        actual = tower(pixels, grid_thw=grid)
+        torch.testing.assert_close(actual, reference(pixels, grid_thw=grid))
+    assert events == ["fsdp.pre", "fsdp.post", "balance.post"]
 
 
 @pytest.mark.parametrize("hybrid", [False, True])

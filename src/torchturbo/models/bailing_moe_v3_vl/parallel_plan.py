@@ -6,13 +6,19 @@ from torch import nn
 from torch.distributed.tensor import Shard
 
 from torchturbo.engine.config import EngineConfig
-from torchturbo.parallel import FSDPParallelPlan, FSDPPlacementSpec, FSDPPlanSpec
+from torchturbo.parallel import (
+    FSDPParallelPlan,
+    FSDPPlacementSpec,
+    FSDPPlanSpec,
+    VisionBalanceSpec,
+)
 
 from ..bailing_hybrid.parallel_plan import _replace_moe_only
 from ..modules.moe.experts import GroupedMLP
 from ..modules.moe.module import ModuleSpec
 from ..modules.moe.moe_layer import MoESubmodules
 from .configuration_bailing_moe_v3_vl import BailingMoeV3VLConfig
+from .vision_balance import BailingVisionBalanceIO
 
 
 def _replace_vl_moe(
@@ -50,7 +56,10 @@ def get_parallel_plan() -> FSDPParallelPlan:
             ),
             "model.layers.*": FSDPPlanSpec(activation_checkpoint=True),
             "model.visual.blocks.*": FSDPPlanSpec(activation_checkpoint=True),
-            "model.visual": FSDPPlanSpec(standalone_world_shard=True),
+            "model.visual": FSDPPlanSpec(
+                standalone_world_shard=True,
+                vision_balance=VisionBalanceSpec(io=BailingVisionBalanceIO()),
+            ),
             "linear_proj": FSDPPlanSpec(standalone_world_shard=True),
             "model.word_embeddings": FSDPPlanSpec(standalone_world_shard=True),
             "lm_head": FSDPPlanSpec(standalone_world_shard=True),

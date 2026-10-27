@@ -2,13 +2,16 @@ import gc
 import json
 import os
 import time
+from functools import partial
 from pathlib import Path
 
 import torch
 import torch.distributed as dist
+from safetensors import safe_open
 from safetensors.torch import load_file
-from torch.distributed._tensor import distribute_tensor, DTensor
+from torch.distributed._tensor import DTensor, distribute_tensor
 
+from torchturbo.engine.checkpoint.distributed import collective_check
 from torchturbo.engine.peft.weights import (
     compute_dora_magnitude,
     get_peft_init_config,
@@ -20,7 +23,9 @@ from torchturbo.engine.utils import (
     strip_peft_prefix,
 )
 from torchturbo.logging import get_logger
-from torchturbo.engine.checkpoint.distributed import collective_check
+from torchturbo.models.modules.cpu_resident import (
+    CPUResidentParameter,
+)
 
 logger = get_logger(__name__)
 
@@ -173,6 +178,8 @@ class DistParamLoader:
         expert_param_groups = []  # list of (model_param_name, [local_hf_names], total_local_bytes)
 
         for name, param in self.model.named_parameters():
+            if isinstance(param, CPUResidentParameter):
+                continue
             clean_name = strip_peft_prefix(name)
             if is_peft_adapter_param(clean_name):
                 continue
@@ -595,6 +602,8 @@ class DistParamLoader:
         budget_bytes = self._sync_memory_budget()
 
         for name, param in self.model.named_parameters():
+            if isinstance(param, CPUResidentParameter):
+                continue
             clean_name = strip_peft_prefix(name)
             target_dtype = param.dtype
 
@@ -689,6 +698,47 @@ class DistParamLoader:
         if state_dict:
             self.model.load_state_dict(state_dict, assign=assign, strict=False)
 
+    def _load_cpu_resident_weights(self) -> None:
+        """Read checkpoint shards into each parameter's CPU storage."""
+        def describe(name: str, parameter: CPUResidentParameter):
+            converter = self.param_converter
+            clean_name = strip_peft_prefix(name)
+            source = converter.get_omitted_tied_source(
+                clean_name, converter.to_hf_name(clean_name)
+            )
+            if source is not None:
+                keys = [source]
+            else:
+                keys, _, _ = converter.get_param_load_entries(
+                    clean_name, parameter.numel(), self.param_to_filename
+                )
+            if not keys:
+                raise ValueError(f"CPU parameter {name} has no checkpoint source tensors")
+            tensor_infos = converter.checkpoint_info.get_tensor_infos()
+            dtype = tensor_infos[keys[0]][1]
+            sizes = []
+            for key in keys:
+                shape, shard_dtype = tensor_infos[key]
+                if len(shape) != parameter.ndim or shape[1:] != tuple(parameter.shape[1:]):
+                    raise ValueError(f"Invalid CPU checkpoint shard shape for {key}: {shape}")
+                if shard_dtype != dtype:
+                    raise ValueError(f"Mixed CPU checkpoint shard dtypes for {key}")
+                sizes.append(shape[0] if shape else 1)
+            parameter.validate_shard_sizes(sizes)
+            files = [self.path / self.param_to_filename[key] for key in keys]
+            return keys, sizes, dtype, files
+
+        for name, parameter in self.model.named_parameters():
+            if not isinstance(parameter, CPUResidentParameter):
+                continue
+            keys, sizes, dtype, files = collective_check(partial(describe, name, parameter))
+
+            def read(index: int, target: torch.Tensor) -> None:
+                with safe_open(files[index], framework="pt", device="cpu") as handle:
+                    target.copy_(handle.get_tensor(keys[index]))
+
+            parameter.load_(sizes, read, dtype=dtype)
+
     # ── Cleanup ────────────────────────────────────────────────────
 
     def _cleanup(self):
@@ -702,8 +752,8 @@ class DistParamLoader:
 
     def load_weights(self, *, assign: bool = False) -> None:
         """Load weights, assigning storage only during initial meta loading."""
-        # collective_check actions must not run collectives, so the timing
-        # barrier follows once every rank has reported its read result.
+        self._load_cpu_resident_weights()
+        # The timing barrier follows after all ranks report local read errors.
         self.local_sd = collective_check(self._load_local_shards)
         self._sync_log_rank0("[load] local shards loaded")
 

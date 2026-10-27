@@ -20,7 +20,7 @@ from ..logging import get_logger
 from .backend_registry import get_available_backends, get_backend
 from .backends.base import BaseBackend
 from .checkpoint import CheckpointFormat
-from .checkpoint.coordinator import CheckpointCoordinator
+from .checkpoint.coordinator import CheckpointCoordinator, CheckpointExportPluginConsumer
 from .config import EngineConfig, FreezePolicy
 from .metrics import MetricTracker
 from .optimizers import MuonPlan, OptimizerClassPlan
@@ -347,9 +347,12 @@ class TorchTurboEngine:
                 model.on_parallelized(parallel_context)
 
         if self._checkpoint is None:
+            export_plugin_consumer = CheckpointExportPluginConsumer()
+            self.plugin_manager.try_consume(export_plugin_consumer)
             self._checkpoint = CheckpointCoordinator(
                 self.config, self.backend.create_checkpoint_manager(),
                 parallel_context=parallel_context,
+                export_plugin_consumer=export_plugin_consumer,
             )
 
         logger.info_rank0(
@@ -718,6 +721,7 @@ class TorchTurboEngine:
     def _resolve_parallel_plan(self, model: nn.Module):
         """Resolve the parallel plan for a model."""
         from ..models.base import TurboModel
+        from ..parallel import VisionBalanceSpec
 
         if not isinstance(model, TurboModel):
             raise TypeError(
@@ -745,6 +749,23 @@ class TorchTurboEngine:
                         for f in dataclasses.fields(engine_spec):
                             value = getattr(engine_spec, f.name)
                             if value is not None:
+                                if (
+                                    isinstance(value, VisionBalanceSpec)
+                                    and base.vision_balance is not None
+                                ):
+                                    base_vision = base.vision_balance
+                                    value = VisionBalanceSpec(
+                                        mode=(
+                                            value.mode
+                                            if value.mode is not None
+                                            else base_vision.mode
+                                        ),
+                                        io=(
+                                            value.io
+                                            if value.io is not None
+                                            else base_vision.io
+                                        ),
+                                    )
                                 overrides[f.name] = value
                         plan.plan[fqn] = dataclasses.replace(base, **overrides)
                     else:

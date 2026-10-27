@@ -13,10 +13,12 @@ if "grouped_gemm" not in sys.modules:  # pragma: no cover - env shim
 
 import pytest
 
-from torchturbo.parallel.fsdp import (
+from torchturbo.parallel import (
     FSDPParallelPlan,
     FSDPPlacementSpec,
     FSDPPlanSpec,
+    VisionBalanceMode,
+    VisionBalanceSpec,
 )
 from torchturbo.engine.utils import match_fqn
 
@@ -27,6 +29,32 @@ def test_standalone_world_shard_spec_is_valid():
     assert spec.standalone_world_shard is True
     assert spec.no_shard is False
     assert spec.placement is None
+
+
+@pytest.mark.parametrize("mode", list(VisionBalanceMode))
+def test_vision_balance_plan_accepts_spec_with_enum(mode):
+    vision_spec = VisionBalanceSpec(mode=mode)
+    assert FSDPPlanSpec(vision_balance=vision_spec).vision_balance is vision_spec
+    assert vision_spec.mode is mode
+
+
+@pytest.mark.parametrize("mode", ["patch", "patch_sq", "pixel", True, False])
+def test_vision_balance_spec_requires_enum_mode(mode):
+    with pytest.raises(TypeError, match="VisionBalanceMode"):
+        VisionBalanceSpec(mode=mode)
+
+
+@pytest.mark.parametrize("value", ["patch", VisionBalanceMode.PATCH, True, {}])
+def test_vision_balance_plan_requires_spec(value):
+    with pytest.raises(TypeError, match="VisionBalanceSpec"):
+        FSDPPlanSpec(vision_balance=value)
+
+
+def test_vision_balance_spec_defaults_to_disabled():
+    spec = VisionBalanceSpec()
+
+    assert spec.mode is None
+    assert spec.io is None
 
 
 def test_no_shard_conflicts_with_standalone_world_shard():

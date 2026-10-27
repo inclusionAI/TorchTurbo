@@ -31,11 +31,20 @@ from torchturbo.engine.config import (
 )
 from torchturbo.engine.core import TorchTurboEngine
 from torchturbo.models.base import TurboModel
+from torchturbo.models.bailing_moe_v3_vl.parallel_plan import (
+    get_parallel_plan as get_bailing_vl_plan,
+)
+from torchturbo.models.bailing_moe_v3_vl.vision_balance import BailingVisionBalanceIO
 from torchturbo.models.qwen3_5_moe.parallel_plan import (
     get_parallel_plan as get_qwen3_5_moe_plan,
 )
 from torchturbo.ops.base import OpPolicy
-from torchturbo.parallel.fsdp import FSDPPlanSpec
+from torchturbo.parallel import (
+    FSDPParallelPlan,
+    FSDPPlanSpec,
+    VisionBalanceMode,
+    VisionBalanceSpec,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -71,11 +80,21 @@ class _FakeQwen35Moe(TurboModel):
         return get_qwen3_5_moe_plan()
 
 
-def _resolve_engine_plan(cfg: EngineConfig):
+class _FakeBailingVL(TurboModel):
+    """Model whose default plan mirrors ``bailing_moe_v3_vl.parallel_plan``."""
+
+    @classmethod
+    def get_default_parallel_plan(cls, **kwargs):
+        return get_bailing_vl_plan()
+
+
+def _resolve_engine_plan(
+    cfg: EngineConfig, model_cls: type[TurboModel] = _FakeQwen35Moe
+):
     """Run the engine's model-default + engine-config plan merge."""
     engine = TorchTurboEngine.__new__(TorchTurboEngine)
     engine.config = cfg
-    return engine._resolve_parallel_plan(_FakeQwen35Moe())
+    return engine._resolve_parallel_plan(model_cls())
 
 
 # ---------------------------------------------------------------------------
@@ -173,6 +192,59 @@ def test_build_from_json_with_engineconfig_wrapper(tmp_path):
     assert cfg.parallel_plan.sp_size == 2
     assert cfg.parallel_plan.ep_size == 4
     assert cfg.activation_checkpointing.enabled is False
+
+
+def test_vision_balance_defaults_to_off(tmp_path):
+    path = _write(tmp_path, "vb.yaml", _engine_config("mixed_precision: fp32\n"))
+
+    cfg = _build_from_argv(["--tt_config", path])
+
+    plan = _resolve_engine_plan(cfg, _FakeBailingVL)
+
+    vision_spec = plan.plan["model.visual"].vision_balance
+    assert vision_spec.mode is None
+    assert isinstance(vision_spec.io, BailingVisionBalanceIO)
+
+
+@pytest.mark.parametrize("mode", ["pixel", True, False])
+def test_invalid_vision_balance_mode_in_file_raises(tmp_path, mode):
+    plan = {"model.visual": {"vision_balance": {"mode": mode}}}
+    path = _write(
+        tmp_path,
+        "vb.yaml",
+        _engine_config(
+            yaml.safe_dump({"parallel_plan": {"plan": plan}})
+        ),
+    )
+
+    with pytest.raises(ValueError, match="VisionBalanceMode"):
+        _build_from_argv(["--tt_config", path])
+
+
+@pytest.mark.parametrize("value", ["patch", True, False, []])
+def test_vision_balance_config_requires_mapping(tmp_path, value):
+    plan = {"model.visual": {"vision_balance": value}}
+    path = _write(
+        tmp_path,
+        "vb.yaml",
+        _engine_config(yaml.safe_dump({"parallel_plan": {"plan": plan}})),
+    )
+
+    with pytest.raises(ValueError, match="vision_balance must be a mapping"):
+        _build_from_argv(["--tt_config", path])
+
+
+@pytest.mark.parametrize("key", ["io", "enabled", "mdoe"])
+def test_vision_balance_config_rejects_unknown_keys(tmp_path, key):
+    plan = {"model.visual": {"vision_balance": {key: "patch"}}}
+    path = _write(
+        tmp_path,
+        "vb.yaml",
+        _engine_config(yaml.safe_dump({"parallel_plan": {"plan": plan}})),
+    )
+
+    with pytest.raises(ValueError, match=rf"Unknown key: .*vision_balance\.{key}"):
+        _build_from_argv(["--tt_config", path])
 
 
 def test_build_muon_runtime_policy_from_yaml(tmp_path):
@@ -856,6 +928,8 @@ parallel_plan:
       activation_checkpoint: true
     "model.visual":
       standalone_world_shard: true
+      vision_balance:
+        mode: patch_sq
 """
         ),
     )
@@ -866,6 +940,10 @@ parallel_plan:
     assert isinstance(cfg.parallel_plan.plan["model.layers.*"], FSDPPlanSpec)
     assert cfg.parallel_plan.plan["model.layers.*"].activation_checkpoint is True
     assert cfg.parallel_plan.plan["model.visual"].standalone_world_shard is True
+    assert (
+        cfg.parallel_plan.plan["model.visual"].vision_balance.mode
+        is VisionBalanceMode.PATCH_SQ
+    )
 
 
 def test_file_plan_without_sp_ep_keeps_tt_values(tmp_path):
@@ -949,6 +1027,93 @@ parallel_plan:
     plan = _resolve_engine_plan(_build_from_argv(["--tt_config", path]))
 
     assert plan.plan["model.visual"].standalone_world_shard is False
+
+
+@pytest.mark.parametrize("source", ["yaml", "python", "dict"])
+@pytest.mark.parametrize("mode", ["patch", "patch_sq"])
+def test_parallel_plan_vision_balance_keeps_bailing_sharding(
+    tmp_path, source, mode
+):
+    spec = {"vision_balance": {"mode": mode}}
+
+    if source == "yaml":
+        path = _write(
+            tmp_path,
+            "cfg.yaml",
+            _engine_config(
+                yaml.safe_dump(
+                    {
+                        "parallel_plan": {"plan": {"model.visual": spec}},
+                    }
+                )
+            ),
+        )
+        cfg = _build_from_argv(["--tt_config", path])
+    elif source == "dict":
+        cfg = EngineConfig.from_dict(
+            {"parallel_plan": {"plan": {"model.visual": spec}}}
+        )
+        assert "parallel_plan" not in cfg.extra
+    else:
+        cfg = EngineConfig(
+            parallel_plan=FSDPParallelPlan(
+                plan={
+                    "model.visual": FSDPPlanSpec(
+                        standalone_world_shard=True,
+                        vision_balance=VisionBalanceSpec(mode=VisionBalanceMode(mode)),
+                    )
+                }
+            ),
+        )
+
+    plan = _resolve_engine_plan(cfg, _FakeBailingVL)
+
+    vision_spec = plan.plan["model.visual"].vision_balance
+    assert vision_spec.mode is VisionBalanceMode(mode)
+    assert isinstance(vision_spec.io, BailingVisionBalanceIO)
+    assert plan.plan["model.visual"].standalone_world_shard is True
+    assert plan.plan["model.visual.blocks.*"].activation_checkpoint is True
+
+
+@pytest.mark.parametrize("override_mode", [None, VisionBalanceMode.PATCH])
+@pytest.mark.parametrize("replace_io", [False, True])
+def test_parallel_plan_merges_vision_spec_without_mutating_default(
+    override_mode, replace_io
+):
+    default_io = BailingVisionBalanceIO()
+    override_io = BailingVisionBalanceIO() if replace_io else None
+    default_vision = VisionBalanceSpec(
+        mode=VisionBalanceMode.PATCH_SQ, io=default_io
+    )
+    default_plan = FSDPParallelPlan(
+        plan={"visual": FSDPPlanSpec(vision_balance=default_vision)}
+    )
+
+    class ModelWithVisionDefault(TurboModel):
+        @classmethod
+        def get_default_parallel_plan(cls, **kwargs):
+            return default_plan
+
+    cfg = EngineConfig(
+        parallel_plan=FSDPParallelPlan(
+            plan={
+                "visual": FSDPPlanSpec(
+                    vision_balance=VisionBalanceSpec(
+                        mode=override_mode, io=override_io
+                    )
+                )
+            }
+        )
+    )
+
+    plan = _resolve_engine_plan(cfg, ModelWithVisionDefault)
+    vision_spec = plan.plan["visual"].vision_balance
+
+    assert vision_spec is not default_vision
+    assert vision_spec.mode is (override_mode or VisionBalanceMode.PATCH_SQ)
+    assert vision_spec.io is (override_io if replace_io else default_io)
+    assert default_vision.mode is VisionBalanceMode.PATCH_SQ
+    assert default_vision.io is default_io
 
 
 def test_config_adds_plan_entry_missing_from_model_default(tmp_path):

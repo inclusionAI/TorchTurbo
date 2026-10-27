@@ -1,34 +1,53 @@
-from copy import deepcopy
-import sys
+from __future__ import annotations
+
 import pytest
+import torch
 
 pytest.importorskip("torch_npu")
-pytest.importorskip("mindspeed")
 
-import torch
-import torch_npu
-from tests_extend.unit_tests.common import DistributedTest
-from mindspeed import megatron_adaptor
-from mindspeed.ops.npu_rotary_position_embedding import npu_rotary_position_embedding
-from transformers.models.qwen3_moe.modeling_qwen3_moe import apply_rotary_pos_emb
+from torchturbo.ops.providers.npu.rotary_position_embedding import (
+    NpuRotaryPositionEmbedding,
+)
 
-class TestNpuFusedRotaryEmbedding(DistributedTest):
-    world_size = 1
 
-    @pytest.mark.parametrize('dtype', [torch.float16, torch.bfloat16])
-    def test_npu_fused_rotary_pos_embedding(self, dtype):
-        x_ori = torch.rand(4, 8192, 4, 128).npu().to(dtype)
+def _reference_rotary(
+    x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, interleave: bool
+) -> torch.Tensor:
+    if interleave:
+        x1 = x[..., ::2]
+        x2 = x[..., 1::2]
+        rotated = torch.stack((-x2, x1), dim=-1).flatten(start_dim=-2)
+    else:
+        x1, x2 = torch.chunk(x, 2, dim=-1)
+        rotated = torch.cat((-x2, x1), dim=-1)
+    return x * cos + rotated * sin
 
-        x_fused = deepcopy(x_ori)
 
-        cos = torch.rand(1, 8192, 1, 128).npu().to(dtype)
-        sin = torch.rand(1, 8192, 1, 128).npu().to(dtype)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("mode", [0, 1])
+def test_rotary_position_embedding_matches_reference(
+    dtype: torch.dtype, mode: int
+) -> None:
+    values = torch.rand(2, 16, 2, 16, dtype=torch.float32) * 2 - 1
+    cos_values = torch.rand(1, 16, 1, 16, dtype=torch.float32)
+    sin_values = torch.rand(1, 16, 1, 16, dtype=torch.float32)
 
-        cos_fused = deepcopy(cos)
-        sin_fused = deepcopy(sin)
+    x = values.to(device="npu", dtype=dtype)
+    cos = cos_values.to(device="npu", dtype=dtype)
+    sin = sin_values.to(device="npu", dtype=dtype)
+    expected = _reference_rotary(values, cos_values, sin_values, mode == 1)
+    actual = NpuRotaryPositionEmbedding()(x, cos, sin, mode)
 
-        output_ori, _ = apply_rotary_pos_emb(x_ori, x_ori, cos, sin)
-        output_fused = npu_rotary_position_embedding(x_fused, cos_fused, sin_fused, 0)
+    tolerance = 2e-3 if dtype == torch.float16 else 6e-3
+    assert torch.allclose(
+        actual.float().cpu(), expected, atol=tolerance, rtol=tolerance
+    )
 
-        tol = 0.004 if dtype == torch.bfloat16 else 0.001
-        assert torch.allclose(output_ori, output_fused, rtol=tol, atol=tol)
+
+def test_rotary_position_embedding_rejects_invalid_mode() -> None:
+    x = torch.randn(1, 2, 2, 16, device="npu", dtype=torch.bfloat16)
+    cos = torch.randn(1, 2, 1, 16, device="npu", dtype=torch.bfloat16)
+    sin = torch.randn_like(cos)
+
+    with pytest.raises(ValueError, match="RoPE mode must be 0 or 1"):
+        NpuRotaryPositionEmbedding()(x, cos, sin, 2)

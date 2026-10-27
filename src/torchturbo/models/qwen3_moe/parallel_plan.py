@@ -32,6 +32,10 @@ class QWen3MoeLayerWrapper(MoELayer):
         if hasattr(original_module, "shared_experts"):
             self.shared_experts = original.shared_experts
 
+    def forward(self, hidden_states, input_ids=None):
+        output, _ = super().forward(hidden_states, input_ids)
+        return output
+
 
 def get_parallel_plan() -> FSDPParallelPlan:
     from torch.distributed._tensor import Shard

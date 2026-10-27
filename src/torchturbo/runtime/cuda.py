@@ -24,7 +24,7 @@ class _CudaProfiler(BaseProfiler):
                     torch.profiler.ProfilerActivity.CUDA,
                 ],
                 schedule=torch.profiler.schedule(
-                    wait=0, warmup=0, active=1, repeat=1, skip_first=1
+                    wait=0, warmup=10, active=1, repeat=1, skip_first=1
                 ),
                 on_trace_ready=torch.profiler.tensorboard_trace_handler(
                     output_dir, worker_name=worker_name

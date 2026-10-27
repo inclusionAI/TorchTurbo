@@ -1,4 +1,4 @@
-"""Coordinate checkpoint preflight failures before tensor collectives."""
+"""Coordinate checkpoint failures across ranks."""
 
 from __future__ import annotations
 
@@ -27,9 +27,10 @@ def rank_zero_call(action: Callable[[], T]) -> T:
 
 
 def collective_check(action: Callable[[], T]) -> T:
-    """Run local preflight work and propagate failures before ranks proceed.
+    """Run work and propagate failures across WORLD before ranks proceed.
 
-    The action must not contain distributed collectives.
+    The action must be local or coordinate its own failures within every group
+    it uses. This function cannot recover peers blocked inside the action.
     """
     if not dist.is_initialized():
         return action()

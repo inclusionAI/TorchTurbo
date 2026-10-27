@@ -82,6 +82,49 @@ def test_engine_config_to_dict_excludes_runtime_state():
     assert "device_runtime" not in data
 
 
+@pytest.mark.parametrize("nested_sizes", [False, True])
+def test_dict_parallel_plan_keeps_legacy_sizes_unless_overridden(nested_sizes):
+    from torchturbo.engine.config import EngineConfig
+    from torchturbo.parallel import VisionBalanceMode
+
+    plan = {"plan": {"model.visual": {"vision_balance": {"mode": "patch_sq"}}}}
+    if nested_sizes:
+        plan.update(sp_size=2, ep_size=4)
+    cfg = EngineConfig.from_dict(
+        {"sp_size": 8, "parallel": {"ep_size": 16}, "parallel_plan": plan}
+    )
+
+    assert cfg.parallel_plan.sp_size == (2 if nested_sizes else 8)
+    assert cfg.parallel_plan.ep_size == (4 if nested_sizes else 16)
+    vision_spec = cfg.parallel_plan.plan["model.visual"].vision_balance
+    assert vision_spec.mode is VisionBalanceMode.PATCH_SQ
+    assert "parallel_plan" not in cfg.extra
+
+
+def test_dict_config_retains_typed_parallel_plan_and_io_instance():
+    from torchturbo.engine.config import EngineConfig
+    from torchturbo.models.bailing_moe_v3_vl.vision_balance import BailingVisionBalanceIO
+    from torchturbo.parallel import FSDPParallelPlan, FSDPPlanSpec, VisionBalanceSpec
+
+    io = BailingVisionBalanceIO()
+    plan = FSDPParallelPlan(
+        plan={"model.visual": FSDPPlanSpec(vision_balance=VisionBalanceSpec(io=io))}
+    )
+    cfg = EngineConfig.from_dict({"parallel_plan": plan})
+
+    assert cfg.parallel_plan is plan
+    assert cfg.parallel_plan.plan["model.visual"].vision_balance.io is io
+
+
+@pytest.mark.parametrize("mode", ["invalid", False])
+def test_dict_config_rejects_invalid_vision_mode(mode):
+    from torchturbo.engine.config import EngineConfig
+
+    plan = {"model.visual": {"vision_balance": {"mode": mode}}}
+    with pytest.raises(ValueError, match="VisionBalanceMode"):
+        EngineConfig.from_dict({"parallel_plan": {"plan": plan}})
+
+
 def test_engine_config_from_dict_parses_moe_config():
     from torchturbo.engine.config import EngineConfig
 

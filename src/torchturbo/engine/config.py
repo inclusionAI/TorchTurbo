@@ -22,13 +22,16 @@ import os
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Literal, get_args, get_type_hints
+from typing import TYPE_CHECKING, Any, Literal, get_args, get_type_hints
 
 from omegaconf import OmegaConf
 
 from ..logging import get_logger
 from ..ops.base import OpPolicy
 from .args import TorchTurboArgs, get_arg_specs, string_to_bool
+
+if TYPE_CHECKING:
+    from ..parallel import FSDPParallelPlan
 
 logger = get_logger(__name__)
 
@@ -699,18 +702,23 @@ class EngineConfig:
         if "op_policy" in d:
             raise ValueError("op_policy is no longer supported; use ops.policy.")
 
-        # Parallel Plan (parse sp, ep, tp sizes)
-        parallel_d = d.get("parallel", {})
-
-        sp_size = parallel_d.get("sp_size", d.get("sp_size", 1))
-        ep_size = parallel_d.get("ep_size", d.get("ep_size", 1))
-
         from torchturbo.parallel import FSDPParallelPlan
 
-        parallel_plan = FSDPParallelPlan(
-            sp_size=sp_size,
-            ep_size=ep_size,
-        )
+        legacy_parallel = d.get("parallel", {})
+        parallel_sizes = {
+            "sp_size": legacy_parallel.get("sp_size", d.get("sp_size", 1)),
+            "ep_size": legacy_parallel.get("ep_size", d.get("ep_size", 1)),
+        }
+        parallel_d = d.get("parallel_plan")
+        if isinstance(parallel_d, FSDPParallelPlan):
+            parallel_plan = parallel_d
+        elif parallel_d is not None:
+            if not isinstance(parallel_d, Mapping):
+                raise ValueError("parallel_plan must be a mapping or FSDPParallelPlan.")
+            _validate_config_file({"parallel_plan": parallel_d})
+            parallel_plan = _parse_parallel_plan({**parallel_sizes, **parallel_d})
+        else:
+            parallel_plan = FSDPParallelPlan(**parallel_sizes)
 
         # Backend-specific config
         backend_config = d.get("backend_config", None)
@@ -797,6 +805,7 @@ class EngineConfig:
             "mixed_precision",
             "use_deterministic_algorithms",
             "parallel",
+            "parallel_plan",
             "fsdp",
             "backend_config",
             "activation_checkpointing",
@@ -1068,19 +1077,7 @@ def build_from_args(
         OmegaConf.merge(fields, config_from_file, config_from_cli), resolve=True
     )
 
-    # Parallel plan (parse FQN -> FSDPPlanSpec mappings from the file).
-    from torchturbo.parallel import FSDPParallelPlan, FSDPPlanSpec
-
-    parallel_d = fields.get("parallel_plan") or {}
-    spec_fields = [f.name for f in dataclasses.fields(FSDPPlanSpec)]
-    parallel_plan = FSDPParallelPlan(
-        plan={
-            fqn: FSDPPlanSpec(**{f: spec_d.get(f) for f in spec_fields})
-            for fqn, spec_d in (parallel_d.get("plan") or {}).items()
-        },
-        sp_size=parallel_d.get("sp_size", 1),
-        ep_size=parallel_d.get("ep_size", 1),
-    )
+    parallel_plan = _parse_parallel_plan(fields.get("parallel_plan") or {})
 
     ac_d = dict(fields.get("activation_checkpointing") or {})
     if "enabled" in ac_d:
@@ -1124,6 +1121,33 @@ def build_from_args(
         config.parallel_plan.ep_size,
     )
     return config
+
+
+def _parse_parallel_plan(parallel_d: Mapping[str, Any]) -> FSDPParallelPlan:
+    """Parse a validated plan mapping shared by file and dict configuration."""
+    from torchturbo.parallel import (
+        FSDPParallelPlan,
+        FSDPPlanSpec,
+        VisionBalanceMode,
+        VisionBalanceSpec,
+    )
+
+    spec_fields = [f.name for f in dataclasses.fields(FSDPPlanSpec)]
+    plan_entries = {}
+    for fqn, spec_d in (parallel_d.get("plan") or {}).items():
+        spec_kwargs = {f: spec_d.get(f) for f in spec_fields}
+        vision_d = spec_kwargs["vision_balance"]
+        if vision_d is not None:
+            mode = vision_d.get("mode")
+            spec_kwargs["vision_balance"] = VisionBalanceSpec(
+                mode=VisionBalanceMode(mode) if mode is not None else None,
+            )
+        plan_entries[fqn] = FSDPPlanSpec(**spec_kwargs)
+    return FSDPParallelPlan(
+        plan=plan_entries,
+        sp_size=parallel_d.get("sp_size", 1),
+        ep_size=parallel_d.get("ep_size", 1),
+    )
 
 
 def _dataclass_config_paths(
@@ -1178,6 +1202,15 @@ def _validate_config_file(data: Mapping[str, Any], parents: tuple[str, ...] = ()
                         "Unknown key: "
                         + ".".join((*parts, str(fqn), sorted(unknown)[0]))
                     )
+                vision_config = spec.get("vision_balance")
+                if vision_config is not None:
+                    vision_path = ".".join((*parts, str(fqn), "vision_balance"))
+                    if not isinstance(vision_config, Mapping):
+                        raise ValueError(f"{vision_path} must be a mapping.")
+                    if unknown := set(vision_config) - {"mode"}:
+                        raise ValueError(
+                            f"Unknown key: {vision_path}.{sorted(unknown)[0]}"
+                        )
             continue
         if not any(path == item or item.startswith(path + ".") for item in allowed):
             raise ValueError(f"Unknown key: {path}")

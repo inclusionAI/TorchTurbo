@@ -163,7 +163,7 @@ def _run_ep_checkpoint_test(
 
         from torchturbo.engine.backends.fsdp2.checkpoint.manager import FSDP2CheckpointManager
         from torchturbo.engine.backends.fsdp2.optimizers.memory import OptimizerMemoryController
-        from torchturbo.engine.checkpoint.coordinator import CheckpointCoordinator
+        from torchturbo.engine.checkpoint.coordinator import CheckpointCoordinator, CheckpointExportPluginConsumer
         from torchturbo.engine.config import EngineConfig
         from torchturbo.runtime.cpu import CpuRuntime
 
@@ -179,7 +179,8 @@ def _run_ep_checkpoint_test(
             require_optimizer_not_suspended=controller.require_not_suspended,
         )
         coordinator = CheckpointCoordinator(
-            EngineConfig(), manager, parallel_context=parallel_context
+            EngineConfig(), manager, parallel_context=parallel_context,
+            export_plugin_consumer=CheckpointExportPluginConsumer(),
         )
         coordinator.save_optimizer_and_scheduler(
             trained, optimizer, None, checkpoint_dir
@@ -246,6 +247,7 @@ def _run_shard_read_failure_test(
         # Spawned workers import their own copy of the module.
         weight_loader.load_file = load_file
         loader = weight_loader.DistParamLoader.__new__(weight_loader.DistParamLoader)
+        loader.model = nn.Module()
         loader.rank = rank
         loader.path = Path(weights_dir)
         loader.local_params = {"weight"}

@@ -159,3 +159,19 @@ def test_try_consume_runs_consumer_only_on_matching_plugins(module, manager, tmp
     manager.try_consume(_C())
     manager.try_consume(_NonMatching())
     assert seen == [["a"]]
+
+def test_checkpoint_export_plugin_loads_without_platform_sdk(module, tmp_path):
+    plugin_file = _write_plugin(
+        tmp_path,
+        "from torchturbo.engine.plugins import CheckpointExportPlugin, register_plugin\n"
+        "@register_plugin('export')\n"
+        "class Export(CheckpointExportPlugin):\n"
+        "    def on_hf_export(self, export_dir):\n"
+        "        self.export_dir = export_dir\n",
+    )
+    manager = module.PluginManager([plugin_file])
+    assert len(manager.plugins) == 1
+    plugin = manager.plugins[0]
+    assert isinstance(plugin, module.CheckpointExportPlugin)
+    plugin.on_hf_export(str(tmp_path))
+    assert plugin.export_dir == str(tmp_path)

@@ -49,12 +49,10 @@ from fla_npu.ops.ascendc import (
     npu_recompute_w_u_fwd as ascendc_recompute_w_u_fwd,
     solve_tri as ascendc_solve_tri,
 )
-from fla_npu.ops.triton import (
-    chunk_local_cumsum,
-    chunk_scaled_dot_kkt_fwd,
-    l2norm_bwd,
-    l2norm_fwd,
-)
+from fla_npu.ops.triton import chunk_local_cumsum
+
+from .kkt import chunk_scaled_dot_kkt_fwd
+from .l2norm import l2norm_bwd, l2norm_fwd
 
 
 TensorIndexDict = Dict[str, Optional[torch.Tensor]]

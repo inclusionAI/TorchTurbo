@@ -65,16 +65,14 @@ def build_packed_params(
     chunk_tensors: dict[str, torch.Tensor] = {}
     chunk_lists = ValidatedChunkLists()
     for chunk_size in dict.fromkeys(chunk_sizes):
-        pairs: list[list[int]] = []
         flattened: list[int] = []
         for sequence_index, (left, right) in enumerate(pairwise(offsets)):
             count = (right - left + chunk_size - 1) // chunk_size
             for chunk_index in range(count):
-                pairs.append([sequence_index, chunk_index])
                 flattened.extend((sequence_index, chunk_index))
         key = str(chunk_size)
         chunk_tensors[key] = torch.tensor(
-            pairs,
+            flattened,
             dtype=torch.int64,
             device=device,
         ).reshape(-1, 2)

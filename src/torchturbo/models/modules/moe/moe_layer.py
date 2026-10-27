@@ -7,7 +7,7 @@
   # Modified by the TorchTurbo contributors.
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Optional, Union
 import os
 
@@ -153,15 +153,18 @@ class MoELayer(BaseMoELayer):
         # process MoE
         def custom_forward(hidden_states, input_ids=None):
             hidden_states_dtype = hidden_states.dtype
-            probs, routing_map, logits = self.router(
+            routing, logits = self.router(
                 hidden_states, input_ids, self._runtime_inputs.padding_mask
             )
             if self.config.moe_router_score_function == "softmax":
-                probs = probs / probs.sum(dim=-1, keepdim=True)
+                routing = replace(
+                    routing,
+                    probs=routing.probs / routing.probs.sum(dim=-1, keepdim=True),
+                )
             logits = logits.view(-1, logits.shape[-1])
             (dispatched_input, tokens_per_expert, permuted_probs) = (
                 self.token_dispatcher.token_permutation(
-                    hidden_states, probs, routing_map
+                    hidden_states, routing
                 )
             )
             expert_output, mlp_bias = self.experts(
@@ -169,10 +172,7 @@ class MoELayer(BaseMoELayer):
             )
 
             if self.token_dispatcher.deferred_probs_to_unpermutation:
-                num_tokens, _ = probs.shape
-                probs_for_unpermutation = probs.masked_select(routing_map).view(
-                    num_tokens, -1
-                )
+                probs_for_unpermutation = routing.selected_probs()
                 output, mlp_bias = self.token_dispatcher.token_unpermutation(
                     expert_output, mlp_bias, probs=probs_for_unpermutation
                 )

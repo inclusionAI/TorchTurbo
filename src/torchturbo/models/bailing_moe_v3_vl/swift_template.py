@@ -5,12 +5,17 @@ from itertools import groupby
 from typing import Any, Literal
 
 from PIL import Image
-from swift.template import Template
+from swift.template import ContextType, Template
 from swift.template.template_inputs import StdTemplateInputs
 from swift.template.template_meta import TemplateMeta
 from swift.utils import to_device
 
 from ..bailing_hybrid.swift_template import (
+    ASSISTANT_OPEN,
+    HUMAN_OPEN,
+    OBSERVATION_OPEN,
+    ROLE_END,
+    SYS_OPEN,
     THINK_END,
     LingV3AgentTemplate,
     _make_ling_v3_template_meta,
@@ -25,6 +30,17 @@ from .processing import (
 )
 
 _TEMPLATE_NAME = "bailing_moe_v3_vl"
+_ORDERED_TEMPLATE_NAME = "bailing_moe_v3_vl_agent"
+
+ASSISTANT_HEAD = ASSISTANT_OPEN + "\n"
+
+# Roles accepted by the ordered Ling SFT encoder, in Swift's canonical naming.
+_LING_SFT_ROLES = frozenset(
+    {"user", "system", "assistant", "tool_call", "tool", "tool_response"}
+)
+# The ling agent protocol names tool results "observation"; normalize it to
+# Swift's "tool", matching the LlamaFactory path's role mapping.
+_OBSERVATION_ROLE = "observation"
 
 
 class BailingVLAgentTemplate(LingV3AgentTemplate):
@@ -92,6 +108,38 @@ class BailingVLAgentTemplate(LingV3AgentTemplate):
         for message in tool_messages:
             prompt.extend(["\n<tool_response>\n", message["content"], "\n</tool_response>"])
         return prompt
+
+
+class BailingVLOrderedAgentTemplate(BailingVLAgentTemplate):
+    """Per-message rendering for the ordered template.
+
+    The base class keeps the folding-path serializers untouched; this
+    subclass renders each tool call and observation group as standalone
+    pieces for the ordered message encoder.
+    """
+
+    @staticmethod
+    def _observations(tool_messages: list[dict[str, Any]]) -> list[str]:
+        """Render the OBSERVATION role body without a leading role_end."""
+        if not tool_messages:
+            raise ValueError("Ling observations require at least one tool response.")
+        parts = [OBSERVATION_OPEN]
+        for message in tool_messages:
+            parts.extend(["\n<tool_response>\n", message["content"], "\n</tool_response>"])
+        return parts
+
+    def render_tool_call(
+        self, message: dict[str, Any], previous: dict[str, Any] | None = None
+    ) -> str:
+        """Render one call, keeping the native inter-call newline."""
+        content = self._format_tool_calls([message])
+        if previous is not None and previous["role"] == "tool_call":
+            return "\n" + content
+        return self._add_tool_call_prefix(content, previous)
+
+    def render_observations(self, tool_messages: list[dict[str, Any]]) -> list[str]:
+        """Render a consecutive observation group without guessing the next role."""
+        return [*self._observations(tool_messages), ROLE_END]
 
 
 class BailingVLTemplate(Template):
@@ -168,7 +216,8 @@ class BailingVLTemplate(Template):
             query["content"] = content + "".join(observations)
         inputs.messages[:] = messages
 
-    def _swift_prepare_inputs(self, inputs: StdTemplateInputs) -> None:
+    def _ling_prepare_thinking(self, inputs: StdTemplateInputs) -> None:
+        """Resolve per-sample auto-thinking and normalize thinking blocks."""
         if (
             self.auto_sft_thinking
             and self.mode == "train"
@@ -182,11 +231,15 @@ class BailingVLTemplate(Template):
                 inputs.messages, system, inputs.chat_template_kwargs.get("enable_thinking")
             )
         if self.use_chat_template and self.template_backend == "swift":
-            # Normalize before Swift merges assistant content with tool calls.
+            # Normalize before calls are rendered: arguments can contain literal
+            # think tags, and a merged string could lose loss boundaries.
             for message in inputs.messages:
                 if message["role"] != "assistant":
                     continue
                 message["content"] = normalize_thinking_content(message.get("content"))
+
+    def _swift_prepare_inputs(self, inputs: StdTemplateInputs) -> None:
+        self._ling_prepare_thinking(inputs)
         super()._swift_prepare_inputs(inputs)
 
     def replace_tag(
@@ -262,26 +315,214 @@ class BailingVLTemplate(Template):
         return inputs
 
 
+class BailingVLOrderedTemplate(BailingVLTemplate):
+    """Agent-format SFT template: ordered rendering, no query/response pairing.
+
+    Renders messages in their original order (native OBSERVATION blocks,
+    per-message supervision) instead of Swift's alternating user/assistant
+    pairing. Swift's tokenization, media expansion and packing remain
+    downstream; its loss policy's per-context hook is reused, not its
+    pair-indexed conversation dispatcher. Select it explicitly with
+    ``--template bailing_moe_v3_vl_agent``; the base template keeps the
+    pairing behavior for inference and ordinary conversations.
+    """
+
+    def init_env_args(self) -> None:
+        super().init_env_args()
+        # Separate cache fingerprint from the pairing template.
+        self._version = "bailing-vl-ordered-agent-encoding-v1"
+
+    def _ling_use_message_encoding(self) -> bool:
+        return (
+            self.mode == "train"
+            and self.task_type == "causal_lm"
+            and self.use_chat_template
+            and self.template_backend == "swift"
+        )
+
+    def _swift_prepare_inputs(self, inputs: StdTemplateInputs) -> None:
+        self._ling_prepare_thinking(inputs)
+        # Keep message order and per-message supervision; no pair folding.
+        return
+
+    def _swift_encode(
+        self, inputs: StdTemplateInputs
+    ) -> tuple[list[Any], list[float], int]:
+        if not self._ling_use_message_encoding():
+            return super()._swift_encode(inputs)
+        messages = inputs.messages
+        if not messages:
+            raise ValueError("Ling SFT requires at least one message.")
+        for message in messages:
+            if message["role"] == _OBSERVATION_ROLE:
+                message["role"] = "tool"
+        for i, message in enumerate(messages):
+            if message["role"] not in _LING_SFT_ROLES:
+                raise ValueError(
+                    f"Unsupported Ling role at message {i}: {message['role']!r}; "
+                    f"accepted roles: {sorted(_LING_SFT_ROLES)}"
+                )
+            if message.get("content") is None:
+                raise ValueError(
+                    f"Ling SFT requires content at message {i}; null is a generation placeholder."
+                )
+            if i > 0 and message["role"] == messages[i - 1]["role"] == "assistant":
+                # Ordinary sample error: strict=False MAP drops the whole row.
+                # Do not merge independent answers or insert a synthetic user.
+                # Canonical assistant -> tool_call is intentionally unaffected.
+                raise ValueError(
+                    "Ling SFT rejects consecutive assistant messages at normalized message indices "
+                    f"{i - 1} and {i}; invalid sample (assistant -> assistant)."
+                )
+        if not any(m["role"] in {"assistant", "tool_call"} for m in messages):
+            raise ValueError("Ling SFT requires an assistant answer or tool call.")
+
+        # Do this before rendering calls: arguments can contain literal think tags.
+        if self.add_non_thinking_prefix:
+            self._add_non_thinking_prefix(inputs)
+        if not self._get_preserve_thinking(inputs):
+            self._remove_history_thinking(inputs)
+        system = self._get_system(inputs)
+        contexts: list[Any] = []
+        weights: list[float] = []
+        # Keep Swift last_round semantics (last user OR tool), independently of
+        # Ling's preserve_thinking boundary (last real user).
+        last_round = max(
+            (i for i, m in enumerate(messages) if m["role"] in {"user", "tool", "tool_response"}),
+            default=-1,
+        )
+        query = None
+
+        def emit(content, kind=ContextType.OTHER, message=None, index=-1):
+            message = message or {}
+            loss, scale = message.get("loss"), message.get("loss_scale")
+            parts = content if isinstance(content, list) and content and not isinstance(content[0], int) else [content]
+            for key, value in (("loss", loss), ("loss_scale", scale)):
+                if isinstance(value, list) and len(value) != len(parts):
+                    raise ValueError(f"Ling {key} length does not match content at message {index}.")
+            for j, part in enumerate(parts):
+                new_contexts, new_weights = self.loss_scale._inner_call(
+                    part,
+                    kind,
+                    query,
+                    loss[j] if isinstance(loss, list) else loss,
+                    scale[j] if isinstance(scale, list) else scale,
+                    index >= last_round,
+                )
+                contexts.extend(new_contexts)
+                weights.extend(new_weights)
+
+        def finish(message, index, final):
+            # Intermediate EOS previously became supervised via dynamic_eos only
+            # after a positive-weight tail. Final EOS follows the suffix policy.
+            # Explicit loss=False must not be resurrected by dynamic_eos.
+            if final:
+                content = message["content"]
+                tail = (
+                    content[-1] if isinstance(content, list) and content and isinstance(content[-1], str) else content
+                )
+                if not isinstance(tail, str):
+                    token_ids = tail["token_ids"] if isinstance(tail, dict) else tail
+                    tail = self.tokenizer.decode(token_ids[-20:])
+                ends = any(tail.endswith(stop) for stop in self.template_meta.stop_words if isinstance(stop, str))
+                add_eos = inputs.extra_kwargs.get("add_eos")
+                if add_eos is None:
+                    add_eos = not ends
+                if not add_eos:
+                    return
+                loss = message.get("loss")
+                if isinstance(loss, list):
+                    loss = loss[-1]
+                emit(ROLE_END, ContextType.SUFFIX, {"loss": loss}, index)
+            else:
+                weight = 1.0 if weights and weights[-1] > 0 else 0.0
+                contexts.append(ROLE_END)
+                weights.append(weight)
+
+        emit(SYS_OPEN + (system or "") + ROLE_END)
+        i = 0
+        while i < len(messages):
+            message = messages[i]
+            role = message["role"]
+            if role in {"user", "system"}:
+                if role == "user":
+                    query = message["content"]
+                emit(HUMAN_OPEN if role == "user" else SYS_OPEN)
+                emit(message["content"])
+                emit(ROLE_END)
+                i += 1
+            elif role in {"tool", "tool_response"}:
+                end = i + 1
+                while end < len(messages) and messages[end]["role"] in {"tool", "tool_response"}:
+                    end += 1
+                for part in self.agent_template.render_observations(messages[i:end]):
+                    emit(part)
+                i = end
+            else:
+                emit(ASSISTANT_HEAD)
+                if role == "assistant":
+                    emit(message["content"], ContextType.RESPONSE, message, i)
+                    i += 1
+                else:
+                    # Canonical standalone calls are assistant actions, not a
+                    # new user turn. The native protocol requires an empty think.
+                    emit("<think></think>", ContextType.RESPONSE, message, i)
+                previous = message if role == "assistant" else None
+                while i < len(messages) and messages[i]["role"] == "tool_call":
+                    message = messages[i]
+                    call = self.agent_template.render_tool_call(message, previous)
+                    emit(call, ContextType.RESPONSE, message, i)
+                    previous = {"role": "tool_call"}
+                    i += 1
+                finish(message, i - 1, i == len(messages))
+        return contexts, weights, 0  # causal LM only; no encoder/decoder split
+
+    def _add_dynamic_eos(
+        self,
+        input_ids: list[int],
+        labels: list[int],
+        loss_scale: list[int] | None,
+        suffix_tokens_id: list[int],
+    ) -> None:
+        if not self._ling_use_message_encoding():
+            super()._add_dynamic_eos(input_ids, labels, loss_scale, suffix_tokens_id)
+            return
+        # All assistant boundaries already have explicit supervision. The generic
+        # heuristic could unmask literal role_end tokens in user/tool content.
+        # Swift only calls this bound to an instance, so the override applies.
+
+
 def _register_agent_template() -> None:
     from swift.agent_template import agent_template_map
 
     agent_template_map[_TEMPLATE_NAME] = BailingVLAgentTemplate
+    agent_template_map[_ORDERED_TEMPLATE_NAME] = BailingVLOrderedAgentTemplate
 
 
-def _make_template_meta() -> TemplateMeta:
+def _make_template_meta(template_type: str, template_cls) -> TemplateMeta:
     """Build the ling v3 template meta with the checkpoint tool-call format."""
-    meta = _make_ling_v3_template_meta(_TEMPLATE_NAME, BailingVLTemplate)
-    meta.agent_template = _TEMPLATE_NAME
+    # The ordered template pairs with its own per-message agent template;
+    # the base template keeps the original folding-path serializer.
+    agent_template_type = (
+        _ORDERED_TEMPLATE_NAME if template_type == _ORDERED_TEMPLATE_NAME else _TEMPLATE_NAME
+    )
+    meta = _make_ling_v3_template_meta(template_type, template_cls)
+    meta.agent_template = agent_template_type
     return meta
 
 
 def register() -> None:
-    """Attach the Bailing VL template to the existing Turbo Swift model entry."""
+    """Attach the Bailing VL templates to the existing Turbo Swift model entry."""
     from swift.model.model_meta import MODEL_MAPPING
     from swift.template.register import register_template
 
     _register_agent_template()
-    register_template(_make_template_meta(), exist_ok=True)
+    templates = [
+        (_TEMPLATE_NAME, BailingVLTemplate),
+        (_ORDERED_TEMPLATE_NAME, BailingVLOrderedTemplate),
+    ]
+    for template_type, template_cls in templates:
+        register_template(_make_template_meta(template_type, template_cls), exist_ok=True)
     model_meta = MODEL_MAPPING[f"turbo_{_TEMPLATE_NAME}"]
     model_meta.template = _TEMPLATE_NAME
-    model_meta.candidate_templates = [_TEMPLATE_NAME]
+    model_meta.candidate_templates = [template_type for template_type, _ in templates]
