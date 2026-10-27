@@ -30,7 +30,21 @@ COPY docker/npu/pkg/* /usr/local/package/
 RUN pip install /usr/local/package/torch_npu-2.10.0.post2-cp311-cp311-manylinux_2_28_aarch64.whl
 RUN pip install /usr/local/package/flash_linear_attention_npu-26.6.0-910_93.aarch64-py3-none-any.whl --force-reinstall --no-deps
 RUN pip install /usr/local/package/flash_linear_attention-0.6.0-py3-none-any.whl
-# Build CPU PyTorch without the forced AArch64 mimalloc allocator.
+# Workaround: disable mimalloc to bypass reuse of MADV_FREE pages as DMA targets.
+# In the affected path, DMA writes are not reflected in the page dirty state,
+# leaving reused pages reclaimable and risking loss of the DMA-written data.
+# This does not fix the underlying issue; why the page state is not updated and
+# which layer is responsible still need investigation. Track the fix here:
+# https://dts-szv.clouddragon.huawei.com/DTSPortal/ticket/DTS2026101313041
+# Disabling mimalloc changes CPU allocation behavior; performance and memory
+# usage may differ and still need workload validation. Removing this workaround
+# or re-enabling mimalloc can reintroduce the failure until a fix is validated.
+# Building torch ourselves is temporary, not the preferred packaging approach.
+# Seek a supported prebuilt wheel, trace DMA/page-state updates in the tracker,
+# and validate the fix with page-reuse/DMA regressions under memory pressure.
+# Return to a standard prebuilt wheel once the underlying fix is validated.
+# PyTorch v2.10.0 forces mimalloc on non-Apple AArch64. Patch that condition so
+# USE_MIMALLOC=OFF takes effect when building the CPU wheel.
 ARG MAX_JOBS=8
 RUN git clone --branch v2.10.0 --depth 1 --recurse-submodules --shallow-submodules \
         https://github.com/pytorch/pytorch.git /tmp/pytorch \
