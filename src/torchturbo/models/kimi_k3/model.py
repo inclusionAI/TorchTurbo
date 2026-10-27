@@ -114,6 +114,34 @@ class KimiK3WeightConverter(BaseWeightConverter):
                 tensor = tensor[:num_heads].clone()
         return tensor
 
+    @override
+    def reverse_transform_checkpoint_tensor(self, hf_name, tensor):
+        """Re-pad A_log from num_heads back to head_dim on save.
+
+        Inverse of the load-side narrowing above: exported checkpoints keep
+        the official zero-padded (head_dim,) layout so they stay byte- and
+        loader-compatible with the published K3 checkpoints and the official
+        inference stack. Tensors that were never narrowed pass through.
+        """
+        if (
+            torch.is_tensor(tensor)
+            and tensor.dim() == 1
+            and hf_name.endswith("self_attn.A_log")
+        ):
+            linear_cfg = self.config.linear_attn_config or {}
+            num_heads = linear_cfg.get("num_heads")
+            head_dim = linear_cfg.get("head_dim")
+            if (
+                num_heads is not None
+                and head_dim is not None
+                and tensor.shape[0] == num_heads
+                and head_dim > num_heads
+            ):
+                tensor = torch.nn.functional.pad(
+                    tensor, (0, head_dim - num_heads)
+                )
+        return tensor
+
     # K3 official bf16 weights store expert MLP as w1/w2/w3 (MegaBlocks style),
     # but the model defines gate_proj/up_proj/down_proj (HF style). Map the
     # checkpoint names so weight_loader's assemble_weight1/2_for_broadcast pops
@@ -233,34 +261,6 @@ class KimiK3WeightConverter(BaseWeightConverter):
             if param_name.endswith(suf):
                 return torch.float32
         return self.dtype
-
-    @override
-    def adjust_checkpoint_tensor(self, name, tensor, target_shape):
-        """Truncate K3 A_log zero-padding to match the model's (num_heads,) shape.
-
-        K3 official bf16 weights store A_log as shape (head_dim=128,) = first
-        num_heads(96) real log-decay values + 32 zero-padding tail (verified
-        across all 93 layers: tail all-zero, first-96 in log(1~16) range). The
-        model defines A_log as (num_heads=96,) and fla chunk_kda expects
-        [HV=96]. FSDP2 broadcasts the owner's checkpoint tensor with
-        target_shape=param.shape=(96,), so we truncate the zero tail on the
-        owner before broadcast — owner and non-owner then agree on (96,).
-
-        Refuses to drop non-zero values (would silently corrupt real data).
-        Mirrors FSDPTurbo PR67's _load_from_state_dict approach, moved here
-        because FSDP2's assign=True path flattens KDA params before that hook
-        fires (verified: hook print produced 0 hits).
-        """
-        if name.endswith("A_log") and tensor.shape[0] > target_shape[0]:
-            want = target_shape[0]
-            tail = tensor[want:]
-            if not torch.all(tail == 0):
-                raise ValueError(
-                    f"{name}: A_log checkpoint tail beyond index {want} is "
-                    f"non-zero; refusing to truncate real values"
-                )
-            tensor = tensor[:want]
-        return tensor
 
 
 @register_model("kimi_k3", config_cls=KimiK3Config, auto_class=AutoModelForImageTextToText)

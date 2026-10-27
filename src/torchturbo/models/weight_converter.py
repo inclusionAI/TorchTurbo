@@ -71,8 +71,18 @@ class BaseWeightConverter:
 
     def transform_checkpoint_tensor(self, hf_name: str, tensor):
         """Per-tensor fixup applied to a full checkpoint tensor before FSDP
-        sharding/broadcast. Default is identity; override for model-specific
-        repairs (e.g. narrowing zero-padded release tensors)."""
+        sharding/broadcast (load direction). Default is identity; override
+        for model-specific repairs (e.g. narrowing zero-padded release
+        tensors)."""
+        return tensor
+
+    def reverse_transform_checkpoint_tensor(self, hf_name: str, tensor):
+        """Save-direction counterpart of transform_checkpoint_tensor.
+
+        Applied to each full tensor before it is written to the HF-format
+        checkpoint, so a model whose load hook repairs an official release
+        layout (e.g. narrowing a zero-padded tensor) exports checkpoints in
+        that same official layout again. Default is identity."""
         return tensor
 
     def get_omitted_tied_source(self, model_name, hf_name):
