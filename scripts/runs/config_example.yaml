@@ -45,6 +45,9 @@ engine_config:
       rms_norm: torch_rms_norm
 
   backend_config:
+    # Benchmark-only expert reassignment. Changes routing and invalidates accuracy!
+    # When enabled, global rank 0 prints the accuracy warning three times.
+    force_expert_balance: false
     reshard_after_forward: true
     prefetch_strategy: auto
     prefetch_direction: forward_backward

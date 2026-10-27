@@ -411,6 +411,30 @@ class FSDP2Backend(BaseBackend):
 
             param.register_post_accumulate_grad_hook(_grad_hook)
 
+    def _configure_moe_routing(self, model: nn.Module) -> None:
+        """Enable benchmark-only balanced routing after module replacement."""
+        if not self.fsdp_config.force_expert_balance:
+            return
+
+        from ....models.modules.moe.router import TopKRouter
+
+        routers = [module for module in model.modules() if isinstance(module, TopKRouter)]
+        if not routers:
+            raise ValueError(
+                "backend_config.force_expert_balance requires TorchTurbo TopKRouter modules."
+            )
+        for router in routers:
+            router.config.moe_router_force_expert_balance = True
+
+        if not dist.is_initialized() or dist.get_rank() == 0:
+            for _ in range(3):
+                logger.warning(
+                    "!!! Forced MoE expert balancing is enabled! This is ONLY for "
+                    "measuring the performance upper bound under balanced expert loads. "
+                    "Expert routing is artificial and training accuracy is INCORRECT! "
+                    "Do NOT use for real training or accuracy evaluation!!!"
+                )
+
     def prepare_model(
         self,
         model: nn.Module,
@@ -433,6 +457,7 @@ class FSDP2Backend(BaseBackend):
 
         # Phase 1: Module replacement (e.g., MoE layers).
         model = self._replace_modules(model, plan)
+        self._configure_moe_routing(model)
 
         # Phase 2: Apply LoRA (after module replacement, before sharding).
         if peft_config is not None:

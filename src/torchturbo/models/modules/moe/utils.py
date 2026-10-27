@@ -267,6 +267,7 @@ def topk_softmax_with_capacity(
     use_hash_routing: bool = False,
     hash_table: Optional[torch.Tensor] = None,
     input_ids: Optional[torch.Tensor] = None,
+    force_expert_balance: bool = False,
 ):
     """Apply capacity and padding to the top-k selection.
     Args:
@@ -285,6 +286,9 @@ def topk_softmax_with_capacity(
         scaling_factor (float): Scaling factor of routing score in top-k selection.
         score_function (str): The score function to use. Can be either "softmax" or "sigmoid".
         expert_bias (torch.Tensor): The bias added to logits for expert routing.
+        force_expert_balance (bool): Benchmark-only round-robin reassignment.
+            Keeps Top-K weights but overrides expert identities, including
+            hash and group restrictions. Invalidates training accuracy.
 
     Returns:
         Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -355,6 +359,12 @@ def topk_softmax_with_capacity(
 
     if scaling_factor:
         probs = probs * scaling_factor
+
+    if force_expert_balance:
+        # Retain the real gate/Top-K work and weights for a balanced-load benchmark.
+        # Each token has distinct experts; local expert counts differ by at most one.
+        top_indices = torch.arange(num_tokens * topk, device=logits.device)
+        top_indices = top_indices.view(num_tokens, topk) % num_experts
 
     # TODO Try using element-wise operations instead of scatter?
     topk_masked_gates = torch.zeros_like(logits).scatter(1, top_indices, probs)
