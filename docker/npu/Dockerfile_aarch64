@@ -1,11 +1,16 @@
 # Use the CANN 9.0.0 runtime for Ascend A3 on openEuler with Python 3.11.
 FROM quay.io/ascend/cann:9.0.0-a3-openeuler24.03-py3.11
 
-# Install tmux, NFS utilities, ossutil, and installation dependencies.
+# Install build tools, tmux, NFS utilities, ossutil, and installation dependencies.
 RUN dnf install -y \
         ca-certificates \
+        cmake \
         curl \
+        gcc-c++ \
+        git \
+        make \
         nfs-utils \
+        patch \
         tmux \
         unzip \
     && dnf clean all \
@@ -22,10 +27,16 @@ RUN pip install triton==3.5.0
 RUN pip install triton-ascend==3.2.2 --extra-index-url=https://triton-ascend.osinfra.cn/pypi/simple
 COPY docker/npu/pkg/* /usr/local/package/
 RUN pip install /usr/local/package/torch_npu-2.10.0.post2-cp311-cp311-manylinux_2_28_aarch64.whl
-RUN pip install /usr/local/package/flash_linear_attention_npu_a3-26.9.1+dev36e67d2-py3-none-manylinux_2_34_aarch64.whl --force-reinstall --no-deps
+# Build fla-npu v26.9.1 for Ascend A3 at commit 36e67d2decea70745554f7aebf9a6a29e9168a91.
+RUN bash -c "source /usr/local/Ascend/ascend-toolkit/set_env.sh \
+    && git clone https://github.com/flashserve/flash-linear-attention-npu.git /tmp/flash-linear-attention-npu \
+    && git -C /tmp/flash-linear-attention-npu checkout 36e67d2decea70745554f7aebf9a6a29e9168a91 \
+    && cd /tmp/flash-linear-attention-npu \
+    && python -m pip install --no-cache-dir 'setuptools>=70.1' wheel -r requirements.txt \
+    && FLA_NPU_SOC=ascend910_93 python scripts/build_wheel.py \
+    && python -m pip install --force-reinstall --no-cache-dir --no-deps dist/flash_linear_attention_npu_a3-*.whl \
+    && rm -rf /tmp/flash-linear-attention-npu"
 RUN pip install /usr/local/package/flash_linear_attention-0.6.0-py3-none-any.whl
-ENV ASCEND_CUSTOM_OPP_PATH=/usr/local/python3.11.15/lib/python3.11/site-packages/fla_npu/opp:/usr/local/python3.11.15/lib/python3.11/site-packages/fla_npu/opp/vendors/fla_npu_transformer:${ASCEND_CUSTOM_OPP_PATH}
-ENV LD_LIBRARY_PATH=/usr/local/python3.11.15/lib/python3.11/site-packages/fla_npu/opp/vendors/fla_npu_transformer/op_api/lib:${LD_LIBRARY_PATH}
 # Install other packages
 RUN pip install py-spy==0.4.2
 
