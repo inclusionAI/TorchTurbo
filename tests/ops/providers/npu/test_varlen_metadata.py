@@ -8,7 +8,7 @@ from torchturbo.utils.functools import cache
 def _gdn_module():
     """Import the fla_npu-backed provider; these tests need an NPU container."""
     pytest.importorskip("fla_npu")
-    from torchturbo.ops.providers.npu import _fla_npu_gdn as gdn
+    from torchturbo.ops.providers.npu import _fla_gdn as gdn
 
     return gdn
 

@@ -1,6 +1,6 @@
 """NPU (AscendC) provider for the causal short-conv1d op.
 
-Wraps the vendored AscendC conv1d in ``ops/providers/npu/_fla_npu_gdn`` which is a
+Wraps the vendored AscendC conv1d in ``ops/providers/npu/_fla_gdn`` which is a
 drop-in for fla's ``causal_conv1d`` (same ``[B,T,D]`` x / ``[D,W]`` weight
 layout, returns ``(y, final_state)``). priority=100 so `auto` on NPU picks it
 over the fla native (priority=0).
@@ -25,7 +25,7 @@ class AscendCCausalConv1d(OpImpl):
     def available(self) -> bool:
         try:
             import fla_npu  # noqa: F401
-            from torchturbo.ops.providers.npu._fla_npu_gdn import (  # noqa: F401
+            from torchturbo.ops.providers.npu._fla_gdn import (  # noqa: F401
                 ascendc_causal_conv1d,
             )
         except Exception as exc:  # pragma: no cover - diagnostic
@@ -55,7 +55,7 @@ class AscendCCausalConv1d(OpImpl):
         packed_params=None,
         **kwargs,
     ):
-        from torchturbo.ops.providers.npu._fla_npu_gdn import ascendc_causal_conv1d
+        from torchturbo.ops.providers.npu._fla_gdn import ascendc_causal_conv1d
 
         return ascendc_causal_conv1d(
             x=x,
