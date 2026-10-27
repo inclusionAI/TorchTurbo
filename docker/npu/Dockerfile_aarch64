@@ -34,15 +34,22 @@ RUN pip install /usr/local/package/flash_linear_attention-0.6.0-py3-none-any.whl
 # In the affected path, DMA writes are not reflected in the page dirty state,
 # leaving reused pages reclaimable and risking loss of the DMA-written data.
 # This does not fix the underlying issue; why the page state is not updated and
-# which layer is responsible still need investigation. Track the fix here:
-# https://dts-szv.clouddragon.huawei.com/DTSPortal/ticket/DTS2026101313041
+# which layer is responsible still need investigation.
+# Planned fix completion: March 2027.
 # Disabling mimalloc changes CPU allocation behavior; performance and memory
 # usage may differ and still need workload validation. Removing this workaround
-# or re-enabling mimalloc can reintroduce the failure until a fix is validated.
+# or re-enabling mimalloc can reintroduce the failure until a replacement
+# mitigation or fix is validated.
 # Building torch ourselves is temporary, not the preferred packaging approach.
-# Seek a supported prebuilt wheel, trace DMA/page-state updates in the tracker,
-# and validate the fix with page-reuse/DMA regressions under memory pressure.
-# Return to a standard prebuilt wheel once the underlying fix is validated.
+# Short term: retain the workaround, investigate and run regression checks,
+# and use a supported prebuilt wheel when a safe replacement is available.
+# Medium term: work with PyTorch upstream to upgrade bundled mimalloc V2 to V3,
+# whose default decommit policy avoids MADV_FREE-based lazy memory release.
+# Long term: add a per-process driver switch to mark DMA-used memory dirty and
+# prevent MADV_FREE reclamation of live pages; leave extra marking off by default.
+# Make torch_npu detect the mimalloc version and let workloads control the switch
+# via an environment variable, forwarding the setting to RTS.
+# The medium- and long-term changes are planned, not implemented here.
 # PyTorch v2.10.0 forces mimalloc on non-Apple AArch64. Patch that condition so
 # USE_MIMALLOC=OFF takes effect when building the CPU wheel.
 ARG MAX_JOBS=8
