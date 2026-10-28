@@ -89,7 +89,7 @@ def _assert_equal(actual, expected):
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("probs_dtype", [None, torch.float32, torch.bfloat16])
 @pytest.mark.parametrize(
-    "counts", [[[2, 0, 1], [0, 3, 2]], [[0, 0, 0], [0, 0, 0]], [[2, 1, 3]]]
+    "counts", [[[2, 0, 1], [0, 3, 2]], [[0, 0, 0], [0, 0, 0]], [[2], [1], [3]]]
 )
 def test_npu_forward_backward_and_inverse(npu_dispatcher, dtype, probs_dtype, counts):
     counts = torch.tensor(counts, dtype=torch.int64)
@@ -188,3 +188,31 @@ def test_native_policy_on_npu(npu_runtime):
     tokens = torch.randn(8, 128, device="npu", dtype=torch.bfloat16)
     output, _ = dispatcher.moe_chunk_reorder(tokens, counts)
     _assert_equal(output, _reference(tokens, counts)[0])
+
+
+@pytest.mark.parametrize("requires_tokens,requires_probs", [(True, True), (True, False), (False, True)])
+@pytest.mark.parametrize("probs_dtype", [torch.float32, torch.bfloat16])
+def test_npu_strided_gradients(npu_dispatcher, requires_tokens, requires_probs, probs_dtype):
+    counts = torch.tensor([[2, 0, 1], [0, 3, 2]])
+    tokens = torch.randn(8, 128, device="npu", dtype=torch.bfloat16, requires_grad=requires_tokens)
+    probs = torch.randn(8, device="npu", dtype=probs_dtype, requires_grad=requires_probs)
+    output, scales = npu_dispatcher.moe_chunk_reorder(tokens, counts, probs)
+    expected, expected_scales = _reference(tokens, counts, probs)
+    dy = torch.randn(8, 256, device="npu", dtype=tokens.dtype)[:, ::2]
+    dp = torch.randn(16, device="npu", dtype=probs_dtype)[::2]
+    outputs, references, gradients, leaves = [], [], [], []
+    if requires_tokens:
+        outputs.append(output)
+        references.append(expected)
+        gradients.append(dy)
+        leaves.append(tokens)
+    if requires_probs:
+        outputs.append(scales)
+        references.append(expected_scales)
+        gradients.append(dp)
+        leaves.append(probs)
+    for retain in (True, False):
+        actual = torch.autograd.grad(outputs, leaves, gradients, retain_graph=retain)
+        reference = torch.autograd.grad(references, leaves, gradients, retain_graph=retain)
+        for value, ref in zip(actual, reference):
+            _assert_equal(value, ref)

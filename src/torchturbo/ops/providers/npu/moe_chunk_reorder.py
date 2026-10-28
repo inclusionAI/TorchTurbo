@@ -12,39 +12,46 @@ from ...registry import register_op
 class _MoeChunkReorder(torch.autograd.Function):
     @staticmethod
     def forward(ctx, tokens, chunk_counts, probs):
-        # Keep device counts per invocation so later micro-batches cannot replace them.
         counts = chunk_counts.to(device=tokens.device, non_blocking=True).contiguous()
-        ctx.save_for_backward(counts)
-        ctx.tokens_shape = tokens.shape
-        ctx.tokens_dtype = tokens.dtype
+        if probs is None:
+            ranks, experts = counts.shape
+            destinations = torch.arange(
+                counts.numel(), dtype=torch.int32, device=tokens.device,
+            ).view(experts, ranks).T.flatten()
+            indices = torch.repeat_interleave(
+                destinations, counts.flatten(), output_size=tokens.shape[0],
+            ).unsqueeze(1)
+            output, inverse_indices = torch_npu.npu_moe_token_permute(tokens.contiguous(), indices)
+            scales = None
+        else:
+            output, scales, row_indices, _ = torch_npu.npu_moe_re_routing(
+                tokens.contiguous(), counts, per_token_scales=probs.float().contiguous(),
+            )
+            if any(ctx.needs_input_grad):
+                positions = torch.arange(
+                    row_indices.numel(), dtype=row_indices.dtype, device=row_indices.device,
+                )
+                inverse_indices = torch_npu.npu_scatter_nd_update_(
+                    torch.empty_like(row_indices), row_indices.unsqueeze(1), positions,
+                )
+        if any(ctx.needs_input_grad):
+            # Each invocation owns its row map, including interleaved microbatches.
+            ctx.save_for_backward(inverse_indices)
         ctx.probs_dtype = None if probs is None else probs.dtype
         ctx.set_materialize_grads(False)
-        output, scales, _, _ = torch_npu.npu_moe_re_routing(
-            tokens.contiguous(), counts,
-            per_token_scales=None if probs is None else probs.float().contiguous(),
-        )
         return output, None if probs is None else scales.to(probs.dtype)
 
     @staticmethod
     def backward(ctx, grad_output, grad_probs):
-        (counts,) = ctx.saved_tensors
         if grad_output is None and grad_probs is None:
             return None, None, None
-        # Transposing the count matrix describes the inverse block permutation.
-        inverse_counts = counts.T.contiguous()
-        if grad_output is None:
-            grad_output = torch.zeros(
-                ctx.tokens_shape, dtype=ctx.tokens_dtype, device=counts.device
-            )
-        grad_tokens, grad_scales, _, _ = torch_npu.npu_moe_re_routing(
-            grad_output.contiguous(), inverse_counts,
-            per_token_scales=None if grad_probs is None else grad_probs.float().contiguous(),
-        )
-        return (
-            grad_tokens,
-            None,
-            None if grad_probs is None else grad_scales.to(ctx.probs_dtype),
-        )
+        (inverse_indices,) = ctx.saved_tensors
+        grad_tokens = grad_scales = None
+        if grad_output is not None and ctx.needs_input_grad[0]:
+            grad_tokens = grad_output.index_select(0, inverse_indices)
+        if grad_probs is not None and ctx.needs_input_grad[2]:
+            grad_scales = grad_probs.index_select(0, inverse_indices).to(ctx.probs_dtype)
+        return grad_tokens, None, grad_scales
 
 
 @register_op(
