@@ -30,28 +30,8 @@ COPY docker/npu/pkg/* /usr/local/package/
 RUN pip install /usr/local/package/torch_npu-2.10.0.post2-cp311-cp311-manylinux_2_28_aarch64.whl
 RUN pip install /usr/local/package/flash_linear_attention_npu-26.6.0-910_93.aarch64-py3-none-any.whl --force-reinstall --no-deps
 RUN pip install /usr/local/package/flash_linear_attention-0.6.0-py3-none-any.whl
-# Workaround: disable mimalloc to bypass reuse of MADV_FREE pages as DMA targets.
-# In the affected path, DMA writes are not reflected in the page dirty state,
-# leaving reused pages reclaimable and risking loss of the DMA-written data.
-# This does not fix the underlying issue; why the page state is not updated and
-# which layer is responsible still need investigation.
-# Planned fix completion: March 2027.
-# Disabling mimalloc changes CPU allocation behavior; performance and memory
-# usage may differ and still need workload validation. Removing this workaround
-# or re-enabling mimalloc can reintroduce the failure until a replacement
-# mitigation or fix is validated.
-# Building torch ourselves is temporary, not the preferred packaging approach.
-# Short term: retain the workaround, investigate and run regression checks,
-# and use a supported prebuilt wheel when a safe replacement is available.
-# Medium term: work with PyTorch upstream to upgrade bundled mimalloc V2 to V3,
-# whose default decommit policy avoids MADV_FREE-based lazy memory release.
-# Long term: add a per-process driver switch to mark DMA-used memory dirty and
-# prevent MADV_FREE reclamation of live pages; leave extra marking off by default.
-# Make torch_npu detect the mimalloc version and let workloads control the switch
-# via an environment variable, forwarding the setting to RTS.
-# The medium- and long-term changes are planned, not implemented here.
-# PyTorch v2.10.0 forces mimalloc on non-Apple AArch64. Patch that condition so
-# USE_MIMALLOC=OFF takes effect when building the CPU wheel.
+# Disable mimalloc to avoid MADV_FREE reclaiming DMA-written pages.
+# Patch PyTorch's AArch64 default so USE_MIMALLOC=OFF takes effect.
 ARG MAX_JOBS=8
 RUN git clone --branch v2.10.0 --depth 1 --recurse-submodules --shallow-submodules \
         https://github.com/pytorch/pytorch.git /tmp/pytorch \
