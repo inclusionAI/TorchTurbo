@@ -50,6 +50,14 @@ class TurboKimiK25ForConditionalGeneration(
     multimodal_input_keys: tuple[str, ...] = ("pixel_values", "grid_thws")
 
     def get_weight_converter(self, parallel_context, model_path):
+        # Transformers 5.x creates `all_tied_weights_keys` unconditionally in
+        # PreTrainedModel.post_init(); 4.x never does. Seed an empty mapping
+        # when it is missing so BaseWeightConverter's strict
+        # dict(model.all_tied_weights_keys) read does not crash if the
+        # environment runs an older transformers than lf_deps.sh pins (5.5.4).
+        # On 5.x this is a no-op: the attribute already exists.
+        if not hasattr(self, "all_tied_weights_keys"):
+            self.all_tied_weights_keys = {}
         return KimiK25WeightConverter(self, parallel_context, model_path)
 
     @override
