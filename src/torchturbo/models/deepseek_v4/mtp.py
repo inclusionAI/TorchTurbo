@@ -538,12 +538,8 @@ class DeepseekV4MTPForwarder:
         output_hidden_states=None,
         return_dict=None,
         cu_seq_lens_q: Optional[torch.Tensor] = None,
-        cu_seqlens: Optional[torch.Tensor] = None,
         **kwargs,
     ):
-        # Backbone and draft losses must use the same packed boundaries.
-        if cu_seqlens is not None:
-            cu_seq_lens_q = cu_seqlens
         mtp = model._modules.get("mtp")
         run_mtp = model.training and mtp is not None and input_ids is not None
         use_dspark = run_mtp and model.config.dspark_block_size > 0
