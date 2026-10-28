@@ -20,13 +20,26 @@ The public entry is ``ChunkGatedDeltaRuleFunction.apply`` with this signature::
         save_backward_intermediates,
     )
 
-The adapter implements the full forward and backward chains, including GVA
-head reduction. The current v26.6.0 ``bwd_dhu`` kernel does not consume
-``h0``/``dht`` or produce ``dh0``. This wrapper therefore supports
-``initial_state`` as a constant forward input, but rejects initial-state
-gradients and final-state-gradient propagation instead of silently returning
-incorrect gradients. Other unsupported combinations are rejected before the
-first compute kernel is launched.
+The forward is the fused ``ChunkGatedDeltaRuleFwd`` composite: one aclnn call
+returns ``o`` plus the ``g_cumsum``/``A`` intermediates the backward consumes.
+Q/K L2 normalization stays in Python (``fla_npu.ops.triton.l2norm_fwd``)
+because the in-kernel normalization switch is an Ascend950-only feature, so the
+composite is always launched with ``use_qk_l2norm_in_kernel=False`` on the
+head-first ``BNSD`` layout that A2/A3 support.
+
+The backward is still the decomposed chain: the fused
+``ChunkGatedDeltaRuleBwd`` composite is Ascend950-only, so on A2/A3 the
+gradients come from ``recompute_w_u_fwd`` -> ``chunk_gated_delta_rule_fwd_h``
+-> ``chunk_bwd_dv_local`` -> ``chunk_gated_delta_rule_bwd_dhu`` ->
+``chunk_bwd_dqkwg`` -> ``prepare_wy_repr_bwd_da`` ->
+``prepare_wy_repr_bwd_full``, including GVA head reduction.
+
+``bwd_dhu`` accepts ``h0``/``dht`` and returns a ``dh0`` slot, but this adapter
+does not wire them up -- it matches the fla-npu reference chain, which leaves
+both state tensors unset. The wrapper therefore supports ``initial_state`` as a
+constant forward input, but rejects initial-state gradients and final-state
+gradient propagation instead of silently dropping them. Other unsupported
+combinations are rejected before the first compute kernel is launched.
 """
 
 from __future__ import annotations
@@ -41,17 +54,15 @@ from torchturbo.ops.packed_params import ValidatedChunkLists, ValidatedOffsets
 from fla_npu.ops.ascendc import (
     npu_chunk_bwd_dqkwg as ascendc_chunk_bwd_dqkwg,
     npu_chunk_bwd_dv_local as ascendc_chunk_bwd_dv_local,
-    npu_chunk_fwd_o as ascendc_chunk_fwd_o,
     npu_chunk_gated_delta_rule_bwd_dhu as ascendc_chunk_gated_delta_rule_bwd_dhu,
+    npu_chunk_gated_delta_rule_fwd as ascendc_chunk_gated_delta_rule_fwd,
     npu_chunk_gated_delta_rule_fwd_h as ascendc_chunk_gated_delta_rule_fwd_h,
     npu_prepare_wy_repr_bwd_da as ascendc_prepare_wy_repr_bwd_da,
     npu_prepare_wy_repr_bwd_full as ascendc_prepare_wy_repr_bwd_full,
     npu_recompute_w_u_fwd as ascendc_recompute_w_u_fwd,
-    solve_tri as ascendc_solve_tri,
 )
 from fla_npu.ops.triton import chunk_local_cumsum
 
-from .kkt import chunk_scaled_dot_kkt_fwd
 from .l2norm import l2norm_bwd, l2norm_fwd
 
 
@@ -61,7 +72,6 @@ ListIndexDict = Dict[str, Optional[list[int]]]
 _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16)
 _SUPPORTED_CHUNK_SIZES = (64, 128)
 _SUPPORTED_VALUE_DIMS = (128, 256)
-_REQUIRED_METADATA_CHUNK_SIZES = (16, 32, 64, 128, 608 * 2)
 
 
 def _require_npu_tensor(name: str, tensor: torch.Tensor) -> None:
@@ -214,9 +224,10 @@ def _normalize_varlen_metadata(
             )
         }
 
-    required_sizes = set(_REQUIRED_METADATA_CHUNK_SIZES)
-    required_sizes.add(chunk_size)
-    for size in sorted(required_sizes):
+    # Only the active chunk size needs metadata. The fused forward consumes the
+    # host int lists directly, and the backward's reverse cumsum is the only
+    # consumer left of the device tensor form.
+    for size in (chunk_size,):
         key = str(size)
         supplied_list = list_indices.get(key)
         if trusted_lists:
@@ -270,18 +281,6 @@ def _normalize_varlen_metadata(
             list_indices[key] = [int(item) for item in supplied_list]
 
     return cu_tensor, offsets, tensor_indices, list_indices
-
-
-def _chunk_tensor(
-    chunk_indices: Optional[TensorIndexDict],
-    chunk_size: int,
-) -> Optional[torch.Tensor]:
-    if chunk_indices is None:
-        return None
-    value = chunk_indices.get(str(chunk_size))
-    if value is None:
-        raise ValueError(f"missing tensor chunk metadata for size {chunk_size}")
-    return value
 
 
 def _chunk_list(
@@ -416,17 +415,6 @@ def _validate_forward_inputs(
     return batch, key_heads, value_heads, tokens, key_dim, value_dim
 
 
-def _expand_k_for_kkt(
-    k: torch.Tensor,
-    *,
-    value_heads: int,
-) -> torch.Tensor:
-    key_heads = k.shape[1]
-    if key_heads == value_heads:
-        return k
-    return k.repeat_interleave(value_heads // key_heads, dim=1).contiguous()
-
-
 def _reduce_gva_key_gradient(
     gradient: torch.Tensor,
     *,
@@ -445,38 +433,26 @@ def _reduce_gva_key_gradient(
     ).sum(dim=2)
 
 
-def _solve_tri(
-    A: torch.Tensor,
+def _recompute_backward_intermediates(
     *,
-    output_dtype: torch.dtype,
-    cu_seqlens_list: Optional[list[int]],
-    chunk_indices_list: Optional[list[int]],
-) -> torch.Tensor:
-    A_input = A.to(output_dtype).contiguous()
-    if cu_seqlens_list is None:
-        return ascendc_solve_tri(A_input, layout="bsnd")
-    if chunk_indices_list is None:
-        raise ValueError("varlen solve_tri requires chunk_indices_list")
-    return ascendc_solve_tri(
-        A_input.squeeze(0),
-        cu_seqlens=cu_seqlens_list,
-        chunk_indices=chunk_indices_list,
-        layout="tnd",
-    ).unsqueeze(0)
-
-
-def _recompute_w_u(
     k: torch.Tensor,
     v: torch.Tensor,
+    g_head: torch.Tensor,
     beta_head: torch.Tensor,
     A_head: torch.Tensor,
-    g_head: torch.Tensor,
-    *,
-    chunk_size: int,
+    initial_state: Optional[torch.Tensor],
     cu_seqlens_list: Optional[list[int]],
-    chunk_indices_list: Optional[list[int]],
-) -> tuple[torch.Tensor, torch.Tensor]:
-    return ascendc_recompute_w_u_fwd(
+    chunk_indices_list: Optional[ListIndexDict],
+    chunk_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Rebuild the ``w``/``u``/``h``/``v_new`` tensors the backward needs.
+
+    The fused forward does not export them on A2/A3 (``return_intermediate_states``
+    belongs to the Ascend950 prepare path), so they are always recomputed from
+    ``k``, ``v`` and the exported ``A``/``g_cumsum``.
+    """
+    chunk_list = _chunk_list(chunk_indices_list, chunk_size)
+    w, u = ascendc_recompute_w_u_fwd(
         k,
         v,
         beta_head,
@@ -485,8 +461,21 @@ def _recompute_w_u(
         g=g_head,
         gk=None,
         cu_seqlens=cu_seqlens_list,
-        chunk_indices=chunk_indices_list,
+        chunk_indices=chunk_list,
     )
+    h, v_new, _ = ascendc_chunk_gated_delta_rule_fwd_h(
+        k,
+        w,
+        u,
+        g=g_head,
+        gk=None,
+        initial_state=initial_state,
+        output_final_state=False,
+        chunk_size=chunk_size,
+        cu_seqlens=cu_seqlens_list,
+        chunk_indices=chunk_list,
+    )
+    return w, u, h, v_new
 
 
 def _forward_chain(
@@ -499,91 +488,56 @@ def _forward_chain(
     scale: float,
     initial_state: Optional[torch.Tensor],
     output_final_state: bool,
-    cu_seqlens: Optional[torch.Tensor],
     cu_seqlens_list: Optional[list[int]],
-    chunk_indices: Optional[TensorIndexDict],
     chunk_indices_list: Optional[ListIndexDict],
     chunk_size: int,
-) -> tuple[
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    Optional[torch.Tensor],
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-]:
-    cumulative_g = chunk_local_cumsum(
-        g,
-        chunk_size=chunk_size,
-        cu_seqlens=cu_seqlens,
-        chunk_indices_out=chunk_indices,
-        head_first=False,
-    )
-    k_for_kkt = _expand_k_for_kkt(k, value_heads=v.shape[1])
-    A = chunk_scaled_dot_kkt_fwd(
-        k=k_for_kkt,
-        g=cumulative_g,
-        beta=beta,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=_chunk_tensor(chunk_indices, chunk_size),
-        chunk_size=chunk_size,
-        output_dtype=torch.float32,
-    )
-    A = _solve_tri(
-        A,
-        output_dtype=k.dtype,
-        cu_seqlens_list=cu_seqlens_list,
-        chunk_indices_list=_chunk_list(chunk_indices_list, chunk_size),
-    )
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    """Run the fused ``ChunkGatedDeltaRuleFwd`` composite.
 
-    g_head = cumulative_g.transpose(1, 2).contiguous()
-    beta_head = beta.transpose(1, 2).contiguous().float()
-    A_head = A.transpose(1, 2).contiguous()
-    chunk_list = _chunk_list(chunk_indices_list, chunk_size)
-    w, u = _recompute_w_u(
+    ``q``/``k``/``v`` are head-first ``[B, H, T, D]``: ``BNSD`` is the only
+    layout the A2/A3 Phase6 path accepts. ``g``/``beta`` stay sequence-major
+    ``[B, T, Hv]`` because the composite requires that spelling regardless of
+    ``layout``. Q/K L2 normalization has already happened in Python, so
+    ``use_qk_l2norm_in_kernel`` stays off -- the in-kernel switch selects the
+    Ascend950-only prepare path.
+
+    Returns ``(o, g_cumsum, A, final_state)`` where ``o`` is already
+    sequence-major ``[B, T, Hv, V]``, ``g_cumsum`` is ``[B, T, Hv]`` fp32 and
+    ``A`` is ``[B, Hv, T, chunk_size]`` -- exactly the layouts the backward
+    consumes. ``disable_recompute=True`` is what makes the composite export
+    ``g_cumsum`` and ``A`` instead of returning ``None`` for them.
+    """
+    # The composite returns a fixed ten-slot tuple; the trailing slots stay
+    # unused because beta sigmoid, intermediate states and in-kernel L2
+    # normalization are all off.
+    (
+        o,
+        final_state,
+        cumulative_g,
+        A_head,
+        _beta_eff,
+        _h,
+        _q_hat,
+        _k_hat,
+        _q_rstd,
+        _k_rstd,
+    ) = ascendc_chunk_gated_delta_rule_fwd(
+        q,
         k,
         v,
-        beta_head,
-        A_head,
-        g_head,
-        chunk_size=chunk_size,
-        cu_seqlens_list=cu_seqlens_list,
-        chunk_indices_list=chunk_list,
-    )
-    h, v_new, final_state = ascendc_chunk_gated_delta_rule_fwd_h(
-        k,
-        w,
-        u,
-        g=g_head,
-        gk=None,
+        g,
+        beta,
         initial_state=initial_state,
         output_final_state=output_final_state,
         chunk_size=chunk_size,
-        save_new_value=True,
         cu_seqlens=cu_seqlens_list,
-        chunk_indices=chunk_list,
-        use_exp2=False,
-        transpose_state_layout=False,
+        chunk_indices=_chunk_list(chunk_indices_list, chunk_size),
+        scale=scale,
+        layout="BNSD",
+        disable_recompute=True,
+        return_intermediate_states=False,
     )
-    output_head = ascendc_chunk_fwd_o(
-        q,
-        k,
-        v_new,
-        h,
-        scale,
-        g=g_head,
-        g_gamma=None,
-        cu_seqlens=cu_seqlens_list,
-        chunk_indices=chunk_list,
-        chunk_size=chunk_size,
-        transpose_state_layout=False,
-    )
-    output = output_head.transpose(1, 2).contiguous()
-    if not output_final_state:
-        final_state = None
-    return cumulative_g, output, A_head, final_state, w, u, h, v_new
+    return o, cumulative_g, A_head, final_state
 
 
 def _backward_chain(
@@ -636,10 +590,10 @@ def _backward_chain(
         raise ValueError("do must have the same dtype/device as v")
     if dht is not None:
         raise NotImplementedError(
-            "final_state gradient is unsupported by the current v26.6.0 "
-            "AscendC chunk_gated_delta_rule_bwd_dhu kernel: the kernel "
-            "ignores dht. Set output_final_state=False, or do not include "
-            "final_state in the differentiated loss."
+            "final_state gradient is not wired through the AscendC "
+            "chunk_gated_delta_rule_bwd_dhu call in this adapter: dht is "
+            "always passed as None. Set output_final_state=False, or do not "
+            "include final_state in the differentiated loss."
         )
 
     g_head = cumulative_g.transpose(1, 2).contiguous()
@@ -647,30 +601,16 @@ def _backward_chain(
     do_head = do.transpose(1, 2).contiguous()
     chunk_list = _chunk_list(chunk_indices_list, chunk_size)
     if saved_w is None:
-        w, u = _recompute_w_u(
-            k,
-            v,
-            beta_head,
-            A_head,
-            g_head,
-            chunk_size=chunk_size,
-            cu_seqlens_list=cu_seqlens_list,
-            chunk_indices_list=chunk_list,
-        )
-        h, v_new, _ = ascendc_chunk_gated_delta_rule_fwd_h(
-            k,
-            w,
-            u,
-            g=g_head,
-            gk=None,
+        w, u, h, v_new = _recompute_backward_intermediates(
+            k=k,
+            v=v,
+            g_head=g_head,
+            beta_head=beta_head,
+            A_head=A_head,
             initial_state=initial_state,
-            output_final_state=False,
+            cu_seqlens_list=cu_seqlens_list,
+            chunk_indices_list=chunk_indices_list,
             chunk_size=chunk_size,
-            save_new_value=True,
-            cu_seqlens=cu_seqlens_list,
-            chunk_indices=chunk_list,
-            use_exp2=False,
-            transpose_state_layout=False,
         )
     else:
         assert saved_u is not None and saved_h is not None and saved_v_new is not None
@@ -697,9 +637,9 @@ def _backward_chain(
         chunk_size,
         g=g_head,
         gK=None,
-        # v26.6.0 ignores both state tensors in the kernel. Passing the
-        # documented 4D h0 also hits an erroneous 5D check in the legacy
-        # torch wrapper, so omit both on supported gradient paths.
+        # Both state tensors stay unset, matching the fla-npu reference chain.
+        # Forward rejects a differentiable initial_state and backward rejects a
+        # non-None dht, so no state gradient can reach this call.
         h0=None,
         dht=None,
         cu_seqlens=cu_seqlens_list,
@@ -766,8 +706,8 @@ def _backward_chain(
         head_first=False,
     )
     dbeta = dbeta.transpose(1, 2).contiguous()
-    # v26.6.0 does not implement dh0. Forward rejects a differentiable
-    # initial_state, so None is the only correct result on supported paths.
+    # bwd_dhu only fills its dh0 slot when h0 was supplied, and forward rejects
+    # a differentiable initial_state, so None is the only correct result here.
     dh0 = None
     return dq, dk, dv, dg, dbeta, dh0
 
@@ -842,11 +782,10 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             )
         if initial_state is not None and ctx.needs_input_grad[6]:
             raise NotImplementedError(
-                "initial_state.requires_grad=True is unsupported by the "
-                "current v26.6.0 AscendC "
-                "chunk_gated_delta_rule_bwd_dhu kernel: the kernel does not "
-                "produce dh0. Pass a detached initial_state until state "
-                "backward is implemented."
+                "initial_state.requires_grad=True is not supported: the "
+                "backward chain never passes h0 to "
+                "chunk_gated_delta_rule_bwd_dhu, so no dh0 is produced. Pass a "
+                "detached initial_state."
             )
 
         q = q.contiguous()
@@ -863,16 +802,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             q_rstd = None
             k_rstd = None
 
-        (
-            cumulative_g,
-            output,
-            A_head,
-            final_state,
-            w,
-            u,
-            h,
-            v_new,
-        ) = _forward_chain(
+        output, cumulative_g, A_head, final_state = _forward_chain(
             q=q,
             k=k,
             v=v,
@@ -881,12 +811,30 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             scale=float(scale),
             initial_state=initial_state,
             output_final_state=output_final_state,
-            cu_seqlens=cu_seqlens,
             cu_seqlens_list=cu_seqlens_list,
-            chunk_indices=chunk_indices,
             chunk_indices_list=chunk_indices_list,
             chunk_size=chunk_size,
         )
+
+        if save_backward_intermediates:
+            # The fused forward cannot export w/u/h/v_new on A2/A3, so honoring
+            # the flag means running the recompute here and holding the results
+            # across the forward-backward gap instead of redoing it in backward.
+            g_head = cumulative_g.transpose(1, 2).contiguous()
+            beta_head = beta.transpose(1, 2).contiguous().float()
+            w, u, h, v_new = _recompute_backward_intermediates(
+                k=k,
+                v=v,
+                g_head=g_head,
+                beta_head=beta_head,
+                A_head=A_head,
+                initial_state=initial_state,
+                cu_seqlens_list=cu_seqlens_list,
+                chunk_indices_list=chunk_indices_list,
+                chunk_size=chunk_size,
+            )
+        else:
+            w = u = h = v_new = None
 
         saved = [q, k, v, cumulative_g, beta, A_head]
         if q_rstd is not None:
