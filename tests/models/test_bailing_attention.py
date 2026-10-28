@@ -90,14 +90,13 @@ def test_kda_preserves_packed_boundaries_and_local_parameters(
         full_heads = torch.cat([x] * sp_size, dim=head_dim)
         return full_heads.chunk(sp_size, dim=head_dim)[sp_rank]
 
-    monkeypatch.setattr(turbo_ops, "ops", SimpleNamespace(causal_conv1d=conv))
+    monkeypatch.setattr(
+        turbo_ops, "ops", SimpleNamespace(causal_conv1d=conv, kda=chunk_kda)
+    )
     monkeypatch.setitem(
         sys.modules,
         "fla.modules.fused_norm_gate",
         SimpleNamespace(rms_norm_gated=gated_norm),
-    )
-    monkeypatch.setitem(
-        sys.modules, "fla.ops.kda", SimpleNamespace(chunk_kda=chunk_kda)
     )
 
     from torchturbo.models.modules.attention.ulysses import ulysses as ulysses_module
@@ -188,7 +187,7 @@ def test_kda_preserves_packed_boundaries_and_local_parameters(
     # final sequence); recurrent KDA shares the same boundaries.
     for call in conv_calls:
         assert call["packed_params"].cu_seqlens_list == expected
-    assert kda_calls[0]["cu_seqlens"].tolist() == expected
+    assert kda_calls[0]["packed_params"] is conv_calls[0]["packed_params"]
     for call in conv_calls:
         assert call["x"].shape == (1, 4, 4 // sp_size)
         expected_weight = module.q_conv1d.weight.chunk(sp_size, dim=0)[sp_rank]

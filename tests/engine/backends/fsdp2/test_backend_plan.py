@@ -1148,6 +1148,126 @@ def test_reentrant_checkpointing_suspends_prefetch_for_its_model(monkeypatch):
     assert suspended_models == [model]
 
 
+@pytest.mark.parametrize("keyword_input", [False, True])
+@pytest.mark.parametrize("output_kind", ["tensor", "tuple", "optional"])
+def test_reentrant_checkpointing_recomputes_with_frozen_inputs(keyword_input, output_kind):
+    from torchturbo.engine.config import ActivationCheckpointingConfig
+
+    torch.manual_seed(43)
+    model = nn.Linear(4, 3)
+    reference = nn.Linear(4, 3)
+    reference.load_state_dict(model.state_dict())
+    backend = make_backend()
+    backend.config = types.SimpleNamespace(
+        activation_checkpointing=ActivationCheckpointingConfig(
+            enabled=True, use_reentrant=True
+        )
+    )
+    suspended_models = []
+    backend.prefetch_manager = types.SimpleNamespace(
+        suspend_expert_forward_prefetch=lambda model: (
+            suspended_models.append(model) or nullcontext()
+        )
+    )
+    forward_modes = []
+    original_forward = model.forward
+
+    def observed_forward(input):
+        forward_modes.append(torch.is_grad_enabled())
+        assert not input.requires_grad
+        output = original_forward(input)
+        if output_kind == "tuple":
+            return (output,)
+        if output_kind == "optional":
+            return output, None
+        return output
+
+    model.forward = observed_forward
+    plan = FSDPParallelPlan(plan={"": FSDPPlanSpec(activation_checkpoint=True)})
+    backend._apply_activation_checkpointing(model, resolve_plan(model, plan))
+    inputs = [torch.randn(2, 4), torch.randn(3, 4)]
+    actual = [model(input=x) if keyword_input else model(x) for x in inputs]
+    if output_kind != "tensor":
+        for output in actual:
+            assert isinstance(output, tuple)
+            assert len(output) == (1 if output_kind == "tuple" else 2)
+            if output_kind == "optional":
+                assert output[1] is None
+        actual = [output[0] for output in actual]
+    expected = [reference(x) for x in inputs]
+    for output, ref in zip(actual, expected, strict=True):
+        torch.testing.assert_close(output, ref)
+        assert output.requires_grad
+    sum(output.square().sum() for output in actual).backward()
+    sum(output.square().sum() for output in expected).backward()
+
+    assert forward_modes == [False, False, True, True]
+    assert suspended_models == [model, model]
+    for parameter, ref in zip(model.parameters(), reference.parameters(), strict=True):
+        assert parameter.grad is not None
+        torch.testing.assert_close(parameter.grad, ref.grad)
+    assert all(not x.requires_grad and x.grad is None for x in inputs)
+
+    before_step = model.weight.detach().clone()
+    torch.optim.SGD(model.parameters(), lr=0.1).step()
+    torch.optim.SGD(reference.parameters(), lr=0.1).step()
+    assert not torch.equal(model.weight, before_step)
+    torch.testing.assert_close(model.weight, reference.weight)
+
+
+@pytest.mark.parametrize("freeze_parameters", [False, True])
+def test_reentrant_checkpointing_preserves_input_gradients(freeze_parameters):
+    from torchturbo.engine.config import ActivationCheckpointingConfig
+
+    torch.manual_seed(44)
+    model = nn.Linear(4, 3).requires_grad_(not freeze_parameters)
+    reference = nn.Linear(4, 3).requires_grad_(not freeze_parameters)
+    reference.load_state_dict(model.state_dict())
+    backend = make_backend()
+    backend.config = types.SimpleNamespace(
+        activation_checkpointing=ActivationCheckpointingConfig(
+            enabled=True, use_reentrant=True
+        )
+    )
+    backend.prefetch_manager = types.SimpleNamespace(
+        suspend_expert_forward_prefetch=lambda model: nullcontext()
+    )
+    plan = FSDPParallelPlan(plan={"": FSDPPlanSpec(activation_checkpoint=True)})
+    backend._apply_activation_checkpointing(model, resolve_plan(model, plan))
+    x = torch.randn(2, 4, requires_grad=True)
+    ref_x = x.detach().clone().requires_grad_()
+    actual = model(x)
+    expected = reference(ref_x)
+    actual.square().sum().backward()
+    expected.square().sum().backward()
+    torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(x.grad, ref_x.grad)
+    for parameter, ref in zip(model.parameters(), reference.parameters(), strict=True):
+        torch.testing.assert_close(parameter.grad, ref.grad)
+
+
+@pytest.mark.parametrize("mode", ["no_grad", "frozen_parameters"])
+def test_reentrant_checkpointing_keeps_frozen_execution_without_gradients(mode):
+    from torchturbo.engine.config import ActivationCheckpointingConfig
+
+    model = nn.Linear(4, 3).requires_grad_(mode != "frozen_parameters")
+    backend = make_backend()
+    backend.config = types.SimpleNamespace(
+        activation_checkpointing=ActivationCheckpointingConfig(
+            enabled=True, use_reentrant=True
+        )
+    )
+    backend.prefetch_manager = types.SimpleNamespace(
+        suspend_expert_forward_prefetch=lambda model: nullcontext()
+    )
+    plan = FSDPParallelPlan(plan={"": FSDPPlanSpec(activation_checkpoint=True)})
+    backend._apply_activation_checkpointing(model, resolve_plan(model, plan))
+    with torch.set_grad_enabled(mode != "no_grad"):
+        output = model(torch.randn(2, 4))
+    assert not output.requires_grad
+    assert all(parameter.grad is None for parameter in model.parameters())
+
+
 def test_activation_checkpointing_eval_uses_original_forward(monkeypatch):
     from torchturbo.engine.config import ActivationCheckpointingConfig
 

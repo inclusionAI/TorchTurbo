@@ -904,6 +904,38 @@ class FSDP2Backend(BaseBackend):
                             return base_fn(*a, **kw)
                     return base_fn(*a, **kw)
 
+                if torch.is_grad_enabled() and not any(
+                    isinstance(arg, torch.Tensor) and arg.requires_grad for arg in args
+                ):
+                    trainable_parameter = next(
+                        (
+                            parameter
+                            for parameter in module.parameters()
+                            if parameter.requires_grad
+                        ),
+                        None,
+                    )
+                    if trainable_parameter is not None:
+                        # Reentrant checkpointing needs a grad-bearing input to run
+                        # backward. Keep frozen activations unchanged and use a scalar
+                        # only to connect the recomputation to autograd.
+                        grad_anchor = torch.zeros(
+                            (), device=trainable_parameter.device, requires_grad=True
+                        )
+
+                        def run_with_grad_anchor(_grad_anchor, *a):
+                            result = run_fn(*a)
+                            is_tuple = isinstance(result, tuple)
+                            outputs = result if is_tuple else (result,)
+                            # Keep a differentiable output even when this call
+                            # skips every trainable parameter (disabled LoRA).
+                            return (*outputs, _grad_anchor, is_tuple)
+
+                        *outputs, _, is_tuple = checkpoint(
+                            run_with_grad_anchor, grad_anchor, *args, use_reentrant=True
+                        )
+                        return tuple(outputs) if is_tuple else outputs[0]
+
                 return checkpoint(
                     run_fn,
                     *args,

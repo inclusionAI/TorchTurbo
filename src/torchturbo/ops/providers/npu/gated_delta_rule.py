@@ -1,6 +1,6 @@
 """NPU (AscendC) provider for the chunk gated-delta-rule op.
 
-Wraps the vendored AscendC kernel in ``ops/providers/npu/_fla_npu_gdn`` which is a
+Wraps the vendored AscendC kernel in ``ops/providers/npu/_fla_gdn`` which is a
 drop-in for fla's ``chunk_gated_delta_rule`` (same ``[B,T,H,D]`` q/k/v /
 ``[B,T,H]`` g/beta layout, same ``head_first=False`` return). priority=100 so
 `auto` on NPU picks it over the fla native (priority=0) — this is the SP32
@@ -34,7 +34,7 @@ class AscendCGatedDeltaRule(OpImpl):
     def available(self) -> bool:
         try:
             import fla_npu  # noqa: F401
-            from torchturbo.ops.providers.npu._fla_npu_gdn import (  # noqa: F401
+            from torchturbo.ops.providers.npu._fla_gdn import (  # noqa: F401
                 ascendc_chunk_gated_delta_rule,
             )
         except Exception as exc:  # pragma: no cover - diagnostic
@@ -67,7 +67,7 @@ class AscendCGatedDeltaRule(OpImpl):
         save_backward_intermediates: bool | None = None,
         **kwargs,
     ):
-        from torchturbo.ops.providers.npu._fla_npu_gdn import (
+        from torchturbo.ops.providers.npu._fla_gdn import (
             ascendc_chunk_gated_delta_rule,
         )
 

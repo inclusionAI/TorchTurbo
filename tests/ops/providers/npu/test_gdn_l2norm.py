@@ -10,7 +10,7 @@ from fla_npu.ops.triton import l2norm_bwd as upstream_bwd
 from fla_npu.ops.triton import l2norm_fwd as upstream_fwd
 from triton.runtime.jit import JITFunction
 
-from torchturbo.ops.providers.npu._fla_npu_gdn import l2norm
+from torchturbo.ops.providers.npu._fla_gdn import l2norm
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
