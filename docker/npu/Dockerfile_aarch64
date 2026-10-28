@@ -28,8 +28,7 @@ ARG PIP_INDEX_URL=https://repo.huaweicloud.com/repository/pypi/simple
 # Install Ascend NPU packages and configure custom operators.
 RUN pip install triton==3.5.0
 RUN pip install triton-ascend==3.2.2 --extra-index-url=https://triton-ascend.osinfra.cn/pypi/simple
-COPY docker/npu/pkg/* /usr/local/package/
-RUN pip install /usr/local/package/torch_npu-2.10.0.post2-cp311-cp311-manylinux_2_28_aarch64.whl
+RUN pip install torch_npu==2.10.0.post2
 # Build fla-npu v26.9.1 for Ascend A3 at commit 36e67d2decea70745554f7aebf9a6a29e9168a91.
 RUN bash -c "source /usr/local/Ascend/ascend-toolkit/set_env.sh \
     && git clone https://github.com/flashserve/flash-linear-attention-npu.git /tmp/flash-linear-attention-npu \
