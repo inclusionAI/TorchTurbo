@@ -126,6 +126,7 @@ class FSDPConfig:
     cpu_offload: CPUOffloadConfig = field(
         default_factory=lambda: CPUOffloadConfig(enabled=False)
     )
+    pin_memory: bool = True
     prefetch_strategy: FSDPPrefetchStrategy = FSDPPrefetchStrategy.AUTO
     prefetch_direction: FSDPPrefetchDirection = FSDPPrefetchDirection.FORWARD_BACKWARD
     forward_prefetch_depth: int = 1

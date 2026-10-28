@@ -617,7 +617,9 @@ class FSDP2Backend(BaseBackend):
         if offload.enabled and offload.mode is CPUOffloadMode.FULL:
             from torch.distributed.fsdp import CPUOffloadPolicy
 
-            fsdp_kwargs["offload_policy"] = CPUOffloadPolicy(pin_memory=True)
+            fsdp_kwargs["offload_policy"] = CPUOffloadPolicy(
+                pin_memory=self.fsdp_config.pin_memory
+            )
 
         return fsdp_kwargs
 

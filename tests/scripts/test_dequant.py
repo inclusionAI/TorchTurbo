@@ -238,6 +238,18 @@ def test_deepseek_v41_dequantizes_fp8_128_blocks():
     )
 
 
+def test_deepseek_v41_dequantizes_fp8_with_fp32_scale():
+    weight = torch.ones((128, 128), dtype=torch.float8_e4m3fn)
+    scale = torch.tensor([[0.5]], dtype=torch.float32)
+
+    result = deepseekv4_1.DeepSeekV41Format.dequantize_weight(weight, scale)
+
+    assert result.shape == (128, 128)
+    torch.testing.assert_close(
+        result.float(), torch.full((128, 128), 0.5), rtol=0, atol=0
+    )
+
+
 def test_deepseek_v41_dequantizes_row_wise_fp8_scales():
     weight = torch.ones((3, 64), dtype=torch.float8_e4m3fn)
     scale = torch.tensor(

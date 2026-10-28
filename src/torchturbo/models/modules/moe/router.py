@@ -306,7 +306,7 @@ class TopKRouter(Router):
                     routing.routing_map, padding_mask
                 )
                 tokens_per_expert = bias_routing_map.sum(dim=0).to(torch.float32)
-                if not hasattr(self, "local_tokens_per_expert"):
+                if "local_tokens_per_expert" not in self._buffers:
                     self.register_buffer(
                         "local_tokens_per_expert",
                         torch.zeros_like(tokens_per_expert),
@@ -335,3 +335,35 @@ class TopKRouter(Router):
         routing = self.routing(logits, input_ids, padding_mask)
 
         return routing, logits
+
+
+def update_router_expert_bias(model, gamma: float, clamp: float = 0.05) -> int:
+    if gamma <= 0.0:
+        return 0
+    updated = 0
+    abs_max = 0.0
+    for module in model.modules():
+        if (
+            not isinstance(module, TopKRouter)
+            or "local_tokens_per_expert" not in module._buffers
+        ):
+            continue
+        with torch.no_grad():
+            dist.all_reduce(module.local_tokens_per_expert, op=dist.ReduceOp.SUM)
+            module.expert_bias.add_(
+                gamma * torch.sign(
+                    module.local_tokens_per_expert.mean() - module.local_tokens_per_expert
+                )
+            )
+            if clamp > 0.0:
+                module.expert_bias.clamp_(-clamp, clamp)
+            module._maintain_float32_expert_bias()
+            abs_max = max(abs_max, module.expert_bias.abs().max().item())
+            module.local_tokens_per_expert.zero_()
+        updated += 1
+    if updated and (not dist.is_initialized() or dist.get_rank() == 0):
+        print(
+            f"[router-bias] gamma={gamma} layers={updated} bias_abs_max={abs_max:.6f}",
+            flush=True,
+        )
+    return updated

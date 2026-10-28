@@ -150,7 +150,7 @@ classDiagram
 
 1. 在 index 中寻找同前缀的 `.weight` 和 `.weight_scale_inv`，并兼容已重命名的 `.scale`；输出继续使用原 `.weight` 名称，`indexer` 等新增子模块也会正常识别。
 2. `int8/uint8` 专家权重按 packed FP4 处理，先按低、高 4-bit 顺序拆成 E2M1 数值，再展开每行每 32 列共享的 scale。
-3. FP8 权重按 E4M3 解码；根据 scale 的实际 shape 选择 `32 x 32` block、`128 x 128` block 或行内 32 列分组展开。UE8M0 scale 会先还原成 FP32 的 2 的幂，再与权重相乘并输出 BF16。
+3. FP8 权重按 E4M3 解码；根据 scale 的实际 shape 选择 `32 x 32` block、`128 x 128` block 或行内 32 列分组展开。UE8M0 scale 会先还原成 FP32 的 2 的幂，FP32 scale 则直接使用，再与权重相乘并输出 BF16。
 
 #### 3.2.3 Kimi-K2.6
 

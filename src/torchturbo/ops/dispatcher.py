@@ -289,6 +289,13 @@ class OpDispatcher:
             else self._overrides.get(op_name)
         )
         impl_obj = self._candidate_impl(op_name, device, impl=selected_impl)
+        from torchturbo.models.modules.comm.comm import _LazyA2ATensor
+
+        def unwrap(tensor):
+            return tensor.view(tensor.shape)
+
+        args = torch.utils._pytree.tree_map_only(_LazyA2ATensor, unwrap, args)
+        kwargs = torch.utils._pytree.tree_map_only(_LazyA2ATensor, unwrap, kwargs)
         return impl_obj(*args, **kwargs)
 
     def rms_norm(

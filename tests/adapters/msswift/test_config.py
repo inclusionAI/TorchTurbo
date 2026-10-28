@@ -412,6 +412,7 @@ def test_training_step_checks_loss_before_metrics_and_optimizer_step(
         pass
 
     trainer = object.__new__(Trainer)
+    trainer.state = SimpleNamespace(global_step=0)
 
     if loss_offset == 0.0:
         assert trainer.training_step(model, {}) is returned_loss
@@ -664,7 +665,12 @@ def test_train_checks_the_output_dir_before_training(
         def train(self, *args, **kwargs):
             calls.append("train")
 
-    engine = SimpleNamespace(model_name_or_path=str(source))
+    engine = SimpleNamespace(
+        model_name_or_path=str(source),
+        config=SimpleNamespace(
+            moe=SimpleNamespace(router_bias_gamma=0.0),
+        ),
+    )
     monkeypatch.setattr(engine_registry, "get_engine_or_none", lambda: engine)
     trainer = object.__new__(type("Trainer", (TurboTrainerMixin, SwiftTrainer), {}))
     trainer.args = SimpleNamespace(output_dir=str(tmp_path / output))

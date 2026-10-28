@@ -476,6 +476,11 @@ class MoEConfig:
 
     aux_loss_coeff: float = 0.0
     z_loss_coeff: float = 0.0
+    async_comm: bool = False
+    inplace_perm: bool = False
+    gmm_fold: bool = False
+    router_bias_gamma: float = 0.0
+    router_bias_clamp: float = 0.05
 
 
 @dataclass
@@ -1180,6 +1185,12 @@ def _validate_config_file(data: Mapping[str, Any], parents: tuple[str, ...] = ()
             "backend_config.cpu_offload.enabled",
             "backend_config.cpu_offload.mode",
             "backend_config.cpu_offload.optimizer_memory_fraction",
+            "backend_config.pin_memory",
+            "moe.async_comm",
+            "moe.inplace_perm",
+            "moe.gmm_fold",
+            "moe.router_bias_gamma",
+            "moe.router_bias_clamp",
         }
     )
     allowed.update(_dataclass_config_paths(OptimizerConfig, ("optimizer",)))
@@ -1301,6 +1312,11 @@ def _build_moe_config(fields: Mapping[str, Any]) -> MoEConfig:
     return MoEConfig(
         aux_loss_coeff=float(moe_d.get("aux_loss_coeff", 0.0)),
         z_loss_coeff=float(moe_d.get("z_loss_coeff", 0.0)),
+        async_comm=string_to_bool(moe_d.get("async_comm", False)),
+        inplace_perm=string_to_bool(moe_d.get("inplace_perm", False)),
+        gmm_fold=string_to_bool(moe_d.get("gmm_fold", False)),
+        router_bias_gamma=float(moe_d.get("router_bias_gamma", 0.0)),
+        router_bias_clamp=float(moe_d.get("router_bias_clamp", 0.05)),
     )
 
 

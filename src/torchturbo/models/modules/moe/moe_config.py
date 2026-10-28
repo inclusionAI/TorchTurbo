@@ -65,6 +65,12 @@ class MoEConfig:
     moe_token_dispatcher_type: str = "allgather"
     """Fuse token rearrangement ops during token dispatching."""
     moe_permute_fusion: bool = False
+    """Launch MoE all-to-all collectives asynchronously and wait at consumers."""
+    moe_async_comm: bool = False
+    """Reorder dispatch and combine rows in place to avoid a second large buffer."""
+    moe_inplace_perm: bool = False
+    """Fuse all-to-allv with grouped matmul for MoE dispatch and combine."""
+    moe_gmm_fold: bool = False
     """Apply probs on input of experts instead of applying after activation and glu."""
     moe_apply_probs_on_input: bool = False
     """Per-layer swiglu limit for clamping gate/up values in SwiGLU activation."""
