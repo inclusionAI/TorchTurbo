@@ -67,7 +67,7 @@ class BaseWeightConverter:
         # Transformers 5.x populates this fully-expanded {target: source}
         # mapping in PreTrainedModel.post_init(). Keep that authoritative
         # snapshot instead of re-expanding names after Turbo/FSDP rewrites.
-        self.tied_weight_keys = dict(getattr(model, "all_tied_weights_keys", None) or {})
+        self.tied_weight_keys = dict(model.all_tied_weights_keys)
 
     def get_omitted_tied_source(self, model_name, hf_name):
         """Return the present checkpoint source for an omitted tied target.
