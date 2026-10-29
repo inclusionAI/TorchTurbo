@@ -172,6 +172,40 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         # flow itself is not conceptually NPU-only.
         return self.device_runtime.turbo_device is TurboDevice.NPU
 
+    def _sort_chunks_by_local_experts(
+        self, tokens: torch.Tensor, probs: Optional[torch.Tensor] = None
+    ):
+        if self.config.moe_inplace_perm:
+            row_perm, inverse = sort_row_perm(
+                self.num_global_tokens_per_local_expert.ravel().tolist(),
+                self.sort_input_by_local_experts.tolist(),
+            )
+            tokens = InplaceRowPermuteFn.apply(tokens, row_perm, inverse)
+        else:
+            tokens, probs = sort_chunks_by_idxs(
+                tokens,
+                self.num_global_tokens_per_local_expert.ravel(),
+                self.sort_input_by_local_experts,
+                probs=probs,
+                fused=self.config.moe_permute_fusion,
+            )
+        return tokens, probs
+
+    def _restore_chunks_from_local_experts(self, tokens: torch.Tensor):
+        if self.config.moe_inplace_perm:
+            row_perm, inverse = sort_row_perm(
+                self.num_global_tokens_per_local_expert.T.ravel().tolist(),
+                self.restore_output_by_local_experts.tolist(),
+            )
+            return InplaceRowPermuteFn.apply(tokens, row_perm, inverse)
+        tokens, _ = sort_chunks_by_idxs(
+            tokens,
+            self.num_global_tokens_per_local_expert.T.ravel(),
+            self.restore_output_by_local_experts,
+            fused=self.config.moe_permute_fusion,
+        )
+        return tokens
+
     def _token_permutation_with_deferred_probs(
         self,
         hidden_states: torch.Tensor,
@@ -212,22 +246,9 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             "before_permutation_2", tokens_per_expert
         )
         if self.num_local_experts > 1:
-            if self.config.moe_inplace_perm:
-                row_perm, inverse = sort_row_perm(
-                    self.num_global_tokens_per_local_expert.ravel().tolist(),
-                    self.sort_input_by_local_experts.tolist(),
-                )
-                global_input_tokens = InplaceRowPermuteFn.apply(
-                    global_input_tokens, row_perm, inverse
-                )
-            else:
-                global_input_tokens, _ = sort_chunks_by_idxs(
-                    global_input_tokens,
-                    self.num_global_tokens_per_local_expert.ravel(),
-                    self.sort_input_by_local_experts,
-                    probs=None,
-                    fused=self.config.moe_permute_fusion,
-                )
+            global_input_tokens, _ = self._sort_chunks_by_local_experts(
+                global_input_tokens
+            )
 
         tokens_per_expert = self._maybe_dtoh_and_synchronize(
             "before_finish", tokens_per_expert
@@ -246,21 +267,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             raise RuntimeError("Deferred probs path requires probs for unpermutation.")
 
         if self.num_local_experts > 1:
-            if self.config.moe_inplace_perm:
-                row_perm, inverse = sort_row_perm(
-                    self.num_global_tokens_per_local_expert.T.ravel().tolist(),
-                    self.restore_output_by_local_experts.tolist(),
-                )
-                hidden_states = InplaceRowPermuteFn.apply(
-                    hidden_states, row_perm, inverse
-                )
-            else:
-                hidden_states, _ = sort_chunks_by_idxs(
-                    hidden_states,
-                    self.num_global_tokens_per_local_expert.T.ravel(),
-                    self.restore_output_by_local_experts,
-                    fused=self.config.moe_permute_fusion,
-                )
+            hidden_states = self._restore_chunks_from_local_experts(hidden_states)
 
         permutated_local_input_tokens = all_to_all(
             self.ep_group, hidden_states, self.input_splits, self.output_splits,
@@ -450,12 +457,8 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             "before_permutation_2", tokens_per_expert
         )
         if self.num_local_experts > 1:
-            global_input_tokens, global_probs = sort_chunks_by_idxs(
-                global_input_tokens,
-                self.num_global_tokens_per_local_expert.ravel(),
-                self.sort_input_by_local_experts,
-                probs=global_probs,
-                fused=self.config.moe_permute_fusion,
+            global_input_tokens, global_probs = self._sort_chunks_by_local_experts(
+                global_input_tokens, global_probs
             )
 
         tokens_per_expert = self._maybe_dtoh_and_synchronize(
@@ -572,21 +575,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
 
         # Unpermutation 2: Unsort tokens by local expert.
         if self.num_local_experts > 1:
-            if self.config.moe_inplace_perm:
-                row_perm, inverse = sort_row_perm(
-                    self.num_global_tokens_per_local_expert.T.ravel().tolist(),
-                    self.restore_output_by_local_experts.tolist(),
-                )
-                hidden_states = InplaceRowPermuteFn.apply(
-                    hidden_states, row_perm, inverse
-                )
-            else:
-                hidden_states, _ = sort_chunks_by_idxs(
-                    hidden_states,
-                    self.num_global_tokens_per_local_expert.T.ravel(),
-                    self.restore_output_by_local_experts,
-                    fused=self.config.moe_permute_fusion,
-                )
+            hidden_states = self._restore_chunks_from_local_experts(hidden_states)
 
         # Perform expert parallel AlltoAll communication
         # hidden_states: [SEQL, H] -> [SEQL, H/TP]

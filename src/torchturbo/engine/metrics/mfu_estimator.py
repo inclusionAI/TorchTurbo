@@ -41,6 +41,8 @@ class MFUEstimator:
         self.sp_size = parallel_context["sp"]["sp_size"]
         self.device = runtime.current_device()
         self.gradient_checkpointing = engine_config.activation_checkpointing.enabled
+        layer_stride = engine_config.activation_checkpointing.layer_stride
+        self.hfactor = 3 + 1 / layer_stride if self.gradient_checkpointing else 3
         card = engine_config.mfu.card
         if card is None:
             if is_npu_available():
@@ -153,15 +155,14 @@ class MFUEstimator:
         if dt <= 0:
             return {}
         fwd = self.window_fwd
-        hfactor = 4 if self.gradient_checkpointing else 3
         model_flops = fwd * 3
         tflops = model_flops / 1e12 / dt
         peak = self.peak_tflops
         mfu = tflops / peak
-        hfu = (fwd * hfactor / 1e12 / dt) / peak
+        hfu = (fwd * self.hfactor / 1e12 / dt) / peak
         self.logger.debug(
-            "MFU window: mfu=%.4f hfu=%.4f tflops_per_gpu=%.2f window_time=%.3f window_flops=%d hfu_factor=%d",
-            mfu, hfu, tflops, dt, int(model_flops), hfactor,
+            "MFU window: mfu=%.4f hfu=%.4f tflops_per_gpu=%.2f window_time=%.3f window_flops=%d hfu_factor=%.2f",
+            mfu, hfu, tflops, dt, int(model_flops), self.hfactor,
         )
 
         metrics: dict[str, "torch.Tensor"] = {

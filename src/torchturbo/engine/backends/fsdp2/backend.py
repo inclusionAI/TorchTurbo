@@ -826,6 +826,9 @@ class FSDP2Backend(BaseBackend):
             if isinstance(spec, FSDPPlanSpec) and spec.activation_checkpoint:
                 target_modules.append((fqn, submodule))
 
+        layer_stride = self.config.activation_checkpointing.layer_stride
+        target_modules = target_modules[::layer_stride]
+
         if not target_modules:
             return model
 

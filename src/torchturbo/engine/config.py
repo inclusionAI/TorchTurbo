@@ -153,6 +153,26 @@ class ActivationCheckpointingConfig:
 
     enabled: bool = True
     use_reentrant: bool = False
+    layer_stride: int = 1
+
+    def __post_init__(self) -> None:
+        self.layer_stride = int(self.layer_stride)
+        if self.layer_stride < 1:
+            raise ValueError(f"layer_stride must be >= 1, got {self.layer_stride}")
+
+
+@dataclass
+class RuntimeConfig:
+    """Process-wide runtime settings applied before backend initialization."""
+
+    hccl_op_expansion_mode: str = "AI_CPU"
+
+    def __post_init__(self) -> None:
+        if self.hccl_op_expansion_mode not in {"AI_CPU", "AIV"}:
+            raise ValueError(
+                "hccl_op_expansion_mode must be AI_CPU or AIV, got "
+                f"{self.hccl_op_expansion_mode!r}"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -479,6 +499,7 @@ class MoEConfig:
     async_comm: bool = False
     inplace_perm: bool = False
     gmm_fold: bool = False
+    permute_fusion: bool = False
     router_bias_gamma: float = 0.0
     router_bias_clamp: float = 0.05
 
@@ -604,6 +625,9 @@ class EngineConfig:
 
     ops: OpsConfig = field(default_factory=OpsConfig)
     """Op dispatch settings."""
+
+    runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
+    """Process-wide runtime settings."""
 
     backend_config: Any = None
     """Backend-specific config (e.g. ``FSDPConfig``, ``MegatronConfig``).
@@ -764,6 +788,7 @@ class EngineConfig:
             if "comm_overlap" in d:
                 comm_d["overlap_comm_compute"] = d["comm_overlap"]
         comm = CommConfig(**comm_d)
+        runtime = RuntimeConfig(**(d.get("runtime") or {}))
 
         optimizer_d = dict(d.get("optimizer") or {})
         optimizer = OptimizerConfig(**optimizer_d)
@@ -817,6 +842,7 @@ class EngineConfig:
             "comm",
             "optimizer",
             "ops",
+            "runtime",
             "checkpoint",
             "dp_size",
             "tp_size",
@@ -854,6 +880,7 @@ class EngineConfig:
             mixed_precision=mp,
             use_deterministic_algorithms=use_deterministic_algorithms,
             ops=ops,
+            runtime=runtime,
             backend_config=backend_config,
             activation_checkpointing=ac,
             comm=comm,
@@ -1101,6 +1128,7 @@ def build_from_args(
         use_deterministic_algorithms=fields.get("use_deterministic_algorithms", False),
         parallel_plan=parallel_plan,
         ops=_build_ops_config(fields),
+        runtime=RuntimeConfig(**(fields.get("runtime") or {})),
         backend_config=_build_fsdp_config(fields),
         activation_checkpointing=ActivationCheckpointingConfig(**ac_d),
         comm=CommConfig(**comm_d),
@@ -1189,11 +1217,18 @@ def _validate_config_file(data: Mapping[str, Any], parents: tuple[str, ...] = ()
             "moe.async_comm",
             "moe.inplace_perm",
             "moe.gmm_fold",
+            "moe.permute_fusion",
             "moe.router_bias_gamma",
             "moe.router_bias_clamp",
         }
     )
     allowed.update(_dataclass_config_paths(OptimizerConfig, ("optimizer",)))
+    allowed.update(_dataclass_config_paths(RuntimeConfig, ("runtime",)))
+    allowed.update(
+        _dataclass_config_paths(
+            ActivationCheckpointingConfig, ("activation_checkpointing",)
+        )
+    )
 
     for key, value in data.items():
         parts = (*parents, key)
@@ -1315,6 +1350,7 @@ def _build_moe_config(fields: Mapping[str, Any]) -> MoEConfig:
         async_comm=string_to_bool(moe_d.get("async_comm", False)),
         inplace_perm=string_to_bool(moe_d.get("inplace_perm", False)),
         gmm_fold=string_to_bool(moe_d.get("gmm_fold", False)),
+        permute_fusion=string_to_bool(moe_d.get("permute_fusion", False)),
         router_bias_gamma=float(moe_d.get("router_bias_gamma", 0.0)),
         router_bias_clamp=float(moe_d.get("router_bias_clamp", 0.05)),
     )

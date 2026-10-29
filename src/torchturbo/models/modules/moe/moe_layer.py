@@ -162,23 +162,16 @@ class MoELayer(BaseMoELayer):
                     probs=routing.probs / routing.probs.sum(dim=-1, keepdim=True),
                 )
             logits = logits.view(-1, logits.shape[-1])
-            if (
+            use_fused_gmm = (
                 self.token_dispatcher.gmm_fold_active
                 and not self.config.moe_apply_probs_on_input
                 and routing.probs.shape[0] > 0
-            ):
-                expert_ids = torch.arange(
-                    routing.routing_map.shape[1], device=routing.routing_map.device
-                )
-                expert_indices = (
-                    expert_ids.unsqueeze(0)
-                    .expand(routing.probs.shape[0], -1)
-                    .masked_select(routing.routing_map)
-                    .view(routing.probs.shape[0], -1)
-                )
+            )
+            if use_fused_gmm:
                 permuted, fused_ctx = self.token_dispatcher.fused_permute_only(
-                    hidden_states, routing.routing_map, expert_indices
+                    hidden_states, routing.routing_map, routing.expert_indices
                 )
+            if use_fused_gmm:
                 fc2_output, _ = self.experts(
                     permuted, None, None, fused_ctx=fused_ctx
                 )

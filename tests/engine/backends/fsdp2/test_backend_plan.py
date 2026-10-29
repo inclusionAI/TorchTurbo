@@ -1124,6 +1124,32 @@ def test_activation_checkpointing_patches_plan_targets(monkeypatch):
     assert suspended_models == [model]
 
 
+def test_activation_checkpointing_stride_patches_every_nth_target():
+    from torchturbo.engine.config import ActivationCheckpointingConfig
+
+    backend = make_backend()
+    backend.config = types.SimpleNamespace(
+        activation_checkpointing=ActivationCheckpointingConfig(
+            enabled=True, layer_stride=2
+        )
+    )
+    backend.rank = 0
+    backend.logger = types.SimpleNamespace(info=lambda *args, **kwargs: None)
+    backend.prefetch_manager = types.SimpleNamespace(
+        suspend_expert_forward_prefetch=lambda model: nullcontext()
+    )
+    model = TaggedModule("root")
+    model.layers = nn.ModuleList([CheckpointBlock("L0"), CheckpointBlock("L1")])
+    plan = FSDPParallelPlan(
+        plan={"layers.*": FSDPPlanSpec(activation_checkpoint=True)}
+    )
+
+    backend._apply_activation_checkpointing(model, resolve_plan(model, plan))
+
+    assert hasattr(model.layers[0], "_tt_original_forward")
+    assert not hasattr(model.layers[1], "_tt_original_forward")
+
+
 def test_reentrant_checkpointing_suspends_prefetch_for_its_model(monkeypatch):
     from torchturbo.engine.config import ActivationCheckpointingConfig
 

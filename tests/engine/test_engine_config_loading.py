@@ -176,6 +176,20 @@ def test_build_from_yaml_with_engineconfig_wrapper(tmp_path):
     assert cfg.activation_checkpointing.enabled is False
 
 
+def test_build_runtime_and_checkpoint_stride_from_yaml(tmp_path):
+    content = _engine_config(
+        "runtime:\n"
+        "  hccl_op_expansion_mode: AIV\n"
+        "activation_checkpointing:\n"
+        "  enabled: true\n"
+        "  layer_stride: 2\n"
+    )
+    cfg = _build_from_argv(["--tt_config", _write(tmp_path, "cfg.yaml", content)])
+
+    assert cfg.runtime.hccl_op_expansion_mode == "AIV"
+    assert cfg.activation_checkpointing.layer_stride == 2
+
+
 def test_build_from_json_with_engineconfig_wrapper(tmp_path):
     data = {
         "engine_config": {
@@ -489,12 +503,15 @@ def test_file_overrides_env(monkeypatch, tmp_path):
 
 def test_moe_async_comm_from_file(tmp_path):
     path = _write(
-        tmp_path, "cfg.yaml", _engine_config("moe:\n  async_comm: true\n")
+        tmp_path, "cfg.yaml", _engine_config(
+            "moe:\n  async_comm: true\n  permute_fusion: true\n"
+        )
     )
 
     cfg = _build_from_argv(["--tt_config", path])
 
     assert cfg.moe.async_comm is True
+    assert cfg.moe.permute_fusion is True
 
 
 @pytest.mark.parametrize("policy", ["fp16", "fp8"])

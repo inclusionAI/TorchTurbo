@@ -189,7 +189,11 @@ class GroupedMLP(torch.nn.Module):
     ):
         """Forward step of the GroupedMLP."""
         if fused_ctx is not None:
-            from .gmm_fold import all2all_grouped_matmul, grouped_matmul_all2all
+            from .gmm_fold import (
+                all2all_grouped_matmul,
+                grouped_matmul_all2all,
+                padded_total,
+            )
 
             ep_group, sc0, sc1, rc0, rc1, gl0, gl1, split_send, split_recv = fused_ctx
             num_half_experts = self.num_local_experts // 2
@@ -210,12 +214,14 @@ class GroupedMLP(torch.nn.Module):
             intermediate = self.activation_func(
                 torch.cat([fc1_first, fc1_second], dim=0), None
             )
+            # fc1 outputs carry the dummy rows that pad zero-count edges.
+            split_recv_padded = padded_total(rc0)
             fc2_first = grouped_matmul_all2all(
-                intermediate[:split_recv], w2[:num_half_experts],
+                intermediate[:split_recv_padded], w2[:num_half_experts],
                 ep_group, rc0, sc0, gl0,
             )
             fc2_second = grouped_matmul_all2all(
-                intermediate[split_recv:], w2[num_half_experts:],
+                intermediate[split_recv_padded:], w2[num_half_experts:],
                 ep_group, rc1, sc1, gl1,
             )
             return torch.cat([fc2_first, fc2_second], dim=0), None

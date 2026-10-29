@@ -982,6 +982,22 @@ class TestEngineSetup:
 
         assert ops_module._OPS is None
 
+    def test_runtime_config_sets_hccl_mode_before_backend_init(self, monkeypatch):
+        monkeypatch.delenv("HCCL_OP_EXPANSION_MODE", raising=False)
+        monkeypatch.setattr(engine_core, "get_device_runtime", CpuRuntime)
+        monkeypatch.setattr(
+            engine_core,
+            "get_backend",
+            lambda backend_name: DummyBackend if backend_name == "fsdp2" else None,
+        )
+        config = EngineConfig.from_dict(
+            {"runtime": {"hccl_op_expansion_mode": "AIV"}}
+        )
+
+        TorchTurboEngine(config)
+
+        assert os.environ["HCCL_OP_EXPANSION_MODE"] == "AIV"
+
     def test_profiling_uses_device_runtime_profiler(self, monkeypatch, tmp_path):
         runtime = CpuRuntime()
         profiler = RecordingProfiler()

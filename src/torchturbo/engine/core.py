@@ -196,6 +196,10 @@ class TorchTurboEngine:
                 f"Available: {get_available_backends()}"
             )
 
+        os.environ["HCCL_OP_EXPANSION_MODE"] = (
+            self.config.runtime.hccl_op_expansion_mode
+        )
+
         # Resolve the process-wide device runtime before backend construction.
         self.device_runtime = get_device_runtime()
         if self.config.use_deterministic_algorithms:

@@ -41,6 +41,7 @@ def _replace_moe_only(
         moe_async_comm=engine_config.moe.async_comm,
         moe_inplace_perm=engine_config.moe.inplace_perm,
         moe_gmm_fold=engine_config.moe.gmm_fold,
+        moe_permute_fusion=engine_config.moe.permute_fusion,
         moe_router_num_groups=hf_config.n_group,
         moe_router_group_topk=hf_config.topk_group,
         moe_router_topk_scaling_factor=hf_config.routed_scaling_factor,

@@ -67,9 +67,15 @@ engine_config:
     # while "final" exports only with the final save.
     hf_export: every
 
+  runtime:
+    # HCCL collective expansion mode: AI_CPU (default) or AIV.
+    hccl_op_expansion_mode: AI_CPU
+
   activation_checkpointing:
     enabled: true
     use_reentrant: false
+    # Checkpoint one out of every N target layers; 1 checkpoints every layer.
+    layer_stride: 1
 
   # Engine-managed optimizer configuration.
   optimizer:
@@ -112,6 +118,10 @@ engine_config:
         strategy: parameter
         # Size limit in MiB. Required for size and unused by other strategies.
         bucket_cap_mb: null
+
+  moe:
+    # Fuse token chunk rearrangement on device instead of host-side split/cat.
+    permute_fusion: false
 
   mtp:
     enabled: false
