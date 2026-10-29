@@ -3,7 +3,7 @@
 import json
 
 import torch
-from transformers import AutoConfig, AutoModelForCausalLM
+from transformers import AutoConfig, AutoModelForCausalLM, AutoProcessor
 
 from ...engine.config import ParameterGroup
 from ..base import TurboVLMModel
@@ -113,6 +113,7 @@ class Glm5NextWeightConverter(BaseWeightConverter):
         path.write_text(json.dumps(config, indent=2) + "\n")
 
 
+@register_model("glm5_3_flash")
 @register_model("glm5_next", config_cls=Glm5NextConfig, auto_class=AutoModelForCausalLM)
 class TurboGlm5NextForConditionalGeneration(
     TurboVLMModel, Glm5NextForConditionalGeneration
@@ -174,6 +175,11 @@ class TurboGlm5NextForConditionalGeneration(
 # Configs and the stable AutoClasses are sufficient; no transformers.models.glm5_next import.
 AutoConfig.register("glm5_next_text", Glm5NextTextConfig, exist_ok=True)
 AutoConfig.register("glm5_next_vision", Glm5NextVisionConfig, exist_ok=True)
+try:
+    from transformers import Glm5NextProcessor
+except ImportError:
+    from .processing_glm5_3_flash import Glm5NextProcessor
+AutoProcessor.register(Glm5NextConfig, Glm5NextProcessor, exist_ok=True)
 try:
     from transformers import AutoModelForImageTextToText
 except ImportError:
