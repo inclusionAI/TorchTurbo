@@ -9,7 +9,7 @@ from math import ceil
 
 import torch
 
-from torchturbo.scripts.dequant.dequantize import DequantizationFormat, Dequantizer, TensorSource
+from dequantize import DequantizationFormat, Dequantizer, TensorSource
 
 
 class DeepSeekV41Format(DequantizationFormat):
@@ -180,7 +180,10 @@ class DeepSeekV41Format(DequantizationFormat):
                 f"shape {valid_shapes} for weight shape {output_shape}"
             )
 
-        decoded = cls._decode_e8m0_scale(scale)
+        if scale.dtype == torch.float32:
+            decoded = scale
+        else:
+            decoded = cls._decode_e8m0_scale(scale)
         expanded = decoded.repeat_interleave(block_size, dim=1)
         if not rows_are_individual:
             expanded = expanded.repeat_interleave(block_size, dim=0)
@@ -195,7 +198,7 @@ class DeepSeekV41Format(DequantizationFormat):
 
 
 def main(argv: list[str] | None = None) -> None:
-    from torchturbo.scripts.dequant.converter import Converter
+    from converter import Converter
 
     parser = argparse.ArgumentParser(
         description="Convert a DeepSeek V4.1 FP8/FP4 checkpoint to BF16."

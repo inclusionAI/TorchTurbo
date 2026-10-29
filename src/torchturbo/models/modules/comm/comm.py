@@ -250,9 +250,117 @@ class _GatherFromSequenceParallelRegion(torch.autograd.Function):
             )
 
 
+class _LazyA2ATensor(torch.Tensor):
+    __slots__ = ["_elem", "_work", "_completed"]
+
+    @staticmethod
+    def __new__(cls, elem, work):
+        result = torch.Tensor._make_wrapper_subclass(
+            cls,
+            elem.size(),
+            strides=elem.stride(),
+            dtype=elem.dtype,
+            device=elem.device,
+            requires_grad=False,
+        )
+        result._elem = elem
+        result._work = work
+        result._completed = False
+        return result
+
+    def __tensor_flatten__(self):
+        return ["_elem"], None
+
+    @staticmethod
+    def __tensor_unflatten__(inner_tensors, meta, outer_size, outer_stride):
+        if meta is not None:
+            raise AssertionError("meta must be None for _LazyA2ATensor")
+        return inner_tensors["_elem"]
+
+    def trigger_wait(self):
+        if not self._completed:
+            self._work.wait()
+            self._completed = True
+        return self._elem
+
+    def __del__(self):
+        if not self._completed:
+            self.trigger_wait()
+
+    def __repr__(self):
+        return f"_LazyA2ATensor({self.trigger_wait()!r})"
+
+    @classmethod
+    def __torch_dispatch__(cls, func, types, args=(), kwargs=None):
+        def unwrap(tensor):
+            return tensor.trigger_wait()
+
+        unwrapped_args = torch.utils._pytree.tree_map_only(
+            _LazyA2ATensor, unwrap, args
+        )
+        unwrapped_kwargs = torch.utils._pytree.tree_map_only(
+            _LazyA2ATensor, unwrap, (kwargs or {})
+        )
+        return func(*unwrapped_args, **unwrapped_kwargs)
+
+
+class _AllToAllLazyWait(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, group, input, output_split_sizes, input_split_sizes):
+        ctx.group = group
+        ctx.output_split_sizes = output_split_sizes
+        ctx.input_split_sizes = input_split_sizes
+        if output_split_sizes is None:
+            output = torch.empty_like(input)
+        else:
+            output = input.new_empty(
+                size=[sum(output_split_sizes)] + list(input.size()[1:]),
+                dtype=input.dtype,
+                device=input.device,
+            )
+        work = dist.all_to_all_single(
+            output,
+            input,
+            output_split_sizes=output_split_sizes,
+            input_split_sizes=input_split_sizes,
+            group=group,
+            async_op=True,
+        )
+        return _LazyA2ATensor(output, work)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        grad_output = grad_output.contiguous()
+        if ctx.output_split_sizes is None:
+            output = torch.empty_like(grad_output)
+        else:
+            output = grad_output.new_empty(
+                size=[sum(ctx.input_split_sizes)] + list(grad_output.size()[1:]),
+                dtype=grad_output.dtype,
+                device=grad_output.device,
+            )
+        work = dist.all_to_all_single(
+            output,
+            grad_output,
+            output_split_sizes=ctx.input_split_sizes,
+            input_split_sizes=ctx.output_split_sizes,
+            group=ctx.group,
+            async_op=True,
+        )
+        grad_input = _LazyA2ATensor(output, work).trigger_wait()
+        return None, grad_input, None, None
+
+
 # all_to_all
-def all_to_all(group, input_, output_split_sizes_=None, input_split_sizes=None):
+def all_to_all(
+    group, input_, output_split_sizes_=None, input_split_sizes=None,
+    async_comm=False,
+):
     """Wrapper for autograd function"""
+    if async_comm and torch.distributed.get_world_size(group=group) > 1:
+        return _AllToAllLazyWait.apply(
+            group, input_.contiguous(), output_split_sizes_, input_split_sizes
+        )
     return _AllToAll.apply(group, input_, output_split_sizes_, input_split_sizes)
 
 

@@ -405,6 +405,7 @@ class TestEngineSetup:
         engine.parallel_plan = None
         engine._checkpoint = None
         engine.backend = Mock(spec=BaseBackend)
+        engine.plugin_manager = Mock()
         checkpoint_manager = Mock(spec=BaseCheckpointManager)
         checkpoint_manager.load_hf.side_effect = checkpoint_load
         engine.backend.prepare_model.side_effect = backend_prepare
@@ -1014,6 +1015,32 @@ class TestEngineSetup:
         assert profiler_kwargs["output_dir"] == str(tmp_path / "profiling")
         assert profiler_kwargs["worker_name"].startswith("rank")
         assert (tmp_path / "profiling").is_dir()
+
+    def test_profiling_only_enables_rank_zero(self, monkeypatch, tmp_path):
+        runtime = CpuRuntime()
+        profiler = RecordingProfiler()
+        profiling_enabled = None
+
+        def fake_profiler(**kwargs):
+            nonlocal profiling_enabled
+            profiling_enabled = kwargs["profiling_enabled"]
+            return profiler
+
+        monkeypatch.setenv("RANK", "1")
+        monkeypatch.setattr(runtime, "profiler", fake_profiler)
+        monkeypatch.setattr(engine_core, "get_device_runtime", lambda: runtime)
+        monkeypatch.setattr(
+            engine_core,
+            "get_backend",
+            lambda backend_name: DummyBackend if backend_name == "fsdp2" else None,
+        )
+
+        engine = TorchTurboEngine(EngineConfig())
+        engine.start_profiling(str(tmp_path), True, None)
+        engine.stop_profiling()
+
+        assert profiling_enabled is False
+        assert profiler.calls == ["start", "stop"]
 
     def test_profiling_start_failure_clears_previous_profiler(
         self, monkeypatch, tmp_path

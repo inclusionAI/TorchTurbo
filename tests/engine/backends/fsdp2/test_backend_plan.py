@@ -82,11 +82,11 @@ def make_preparing_backend(order, sp_info):
     return backend
 
 
-def fsdp_config(*, full_offload=False):
+def fsdp_config(*, full_offload=False, pin_memory=True):
     cpu_offload = types.SimpleNamespace(
         enabled=full_offload, mode=CPUOffloadMode.FULL
     )
-    return types.SimpleNamespace(cpu_offload=cpu_offload)
+    return types.SimpleNamespace(cpu_offload=cpu_offload, pin_memory=pin_memory)
 
 
 def resolve_plan(model, plan=None):
@@ -510,6 +510,16 @@ def test_global_cpu_offload_applies_to_all_fsdp_units(monkeypatch):
 
     assert [call[0] for call in calls] == ["L1", "L0", "root"]
     assert all("offload_policy" in kwargs for _, kwargs in calls)
+
+
+def test_full_cpu_offload_can_disable_pinned_memory():
+    backend = make_backend()
+    backend.mixed_precision = types.SimpleNamespace(value="no")
+    backend.fsdp_config = fsdp_config(full_offload=True, pin_memory=False)
+
+    kwargs = backend._build_fsdp_kwargs(set())
+
+    assert kwargs["offload_policy"].pin_memory is False
 
 
 def test_carves_tail_unit_with_reshard_false_and_root(monkeypatch):

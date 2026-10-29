@@ -45,9 +45,9 @@ class _NpuProfiler(BaseProfiler):
 
             experimental_config = torch_npu.profiler._ExperimentalConfig(
                 export_type=[torch_npu.profiler.ExportType.Text],
-                profiler_level=torch_npu.profiler.ProfilerLevel.Level0,
+                profiler_level=torch_npu.profiler.ProfilerLevel.Level1,
                 mstx=False,
-                aic_metrics=torch_npu.profiler.AiCMetrics.AiCoreNone,
+                aic_metrics=torch_npu.profiler.AiCMetrics.PipeUtilization,
                 l2_cache=False,
                 op_attr=False,
                 data_simplification=False,

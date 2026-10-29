@@ -46,6 +46,34 @@ from . import engine_registry
 logger = get_logger(__name__)
 
 
+def gradient_completeness(model: torch.nn.Module) -> dict[str, dict[str, int]]:
+    groups = {
+        "experts": [0, 0],
+        "router": [0, 0],
+        "backbone": [0, 0],
+    }
+    for name, parameter in model.named_parameters():
+        if not parameter.requires_grad:
+            continue
+        if "router" in name:
+            group = "router"
+        elif ".experts." in name or name.startswith("experts."):
+            group = "experts"
+        else:
+            group = "backbone"
+        groups[group][0] += 1
+        if parameter.grad is not None:
+            groups[group][1] += 1
+    return {
+        name: {
+            "required": counts[0],
+            "present": counts[1],
+            "missing": counts[0] - counts[1],
+        }
+        for name, counts in groups.items()
+    }
+
+
 def install_clip_override(trainer, engine) -> None:
     """Route ``accelerator.clip_grad_norm_`` through the FSDP2 backend.
 
@@ -232,6 +260,8 @@ class TurboTrainerMixin:
             if engine is not None and tt_args is not None
             else None
         )
+        if engine is not None and engine.config.moe.router_bias_gamma > 0.0:
+            self.add_callback(self._make_router_bias_callback())
         if profiling_enabled or memory_snapshot_steps is not None:
             self.add_callback(self._make_torchturbo_profiling_callback())
             engine.start_profiling(
@@ -244,6 +274,25 @@ class TurboTrainerMixin:
         finally:
             if profiling_enabled or memory_snapshot_steps is not None:
                 engine.stop_profiling()
+
+    def _make_router_bias_callback(self):
+        from transformers import TrainerCallback
+
+        from ...models.modules.moe.router import update_router_expert_bias
+
+        engine = engine_registry.get_engine()
+        trainer = self
+
+        class RouterBiasCallback(TrainerCallback):
+            def on_step_end(self, args, state, control, **kwargs):
+                update_router_expert_bias(
+                    trainer.model,
+                    engine.config.moe.router_bias_gamma,
+                    engine.config.moe.router_bias_clamp,
+                )
+                return control
+
+        return RouterBiasCallback()
 
     def _make_torchturbo_profiling_callback(self):
         """HF ``TrainerCallback`` that advances TorchTurbo profiling per step.
@@ -360,6 +409,10 @@ class TurboTrainerMixin:
     def training_step(self, model, inputs, *args, **kwargs):
         """Check loss and collect engine metrics after backward."""
         result = super().training_step(model, inputs, *args, **kwargs)
+        if self.state.global_step == 0:
+            logger.info_rank0(
+                "First-step gradient completeness: %s", gradient_completeness(model)
+            )
         engine = engine_registry.get_engine_or_none()
         if engine is not None:
             assert_finite(result, "loss")

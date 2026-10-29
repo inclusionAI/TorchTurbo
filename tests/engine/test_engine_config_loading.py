@@ -487,6 +487,16 @@ def test_file_overrides_env(monkeypatch, tmp_path):
     assert cfg.mixed_precision is MixedPrecisionPolicy.FP32
 
 
+def test_moe_async_comm_from_file(tmp_path):
+    path = _write(
+        tmp_path, "cfg.yaml", _engine_config("moe:\n  async_comm: true\n")
+    )
+
+    cfg = _build_from_argv(["--tt_config", path])
+
+    assert cfg.moe.async_comm is True
+
+
 @pytest.mark.parametrize("policy", ["fp16", "fp8"])
 def test_file_rejects_unsupported_mixed_precision(tmp_path, policy):
     path = _write(
