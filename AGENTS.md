@@ -20,6 +20,8 @@ For the project overview and directory layout, see `README.md`.
 
 6. **No speculative defensive checks.** Don't add checks, casts, fallbacks, or conversions "just in case." Only validate explicit contracts, user-facing configuration, or invariants whose failure would otherwise be silent or unclear.
 
+7. **Use project skills.** Before starting any task, list `.agents/skills/*/SKILL.md` and use the matching skill if present.
+
 ## Code Style
 
 ### Readability and Structure

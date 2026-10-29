@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Any
+
 from transformers import AutoModelForCausalLM
 
 from torchturbo.engine.metrics.flops import BaseModelFlops
@@ -10,6 +12,7 @@ from torchturbo.models.qwen3_5_moe.model import (
 from torchturbo.runtime import get_device_runtime
 
 from ..base import TurboModel
+from ..modules.attention.gdn import build_gdn_sp_forward
 from ..registry import register_model
 from .configuration_qwen3_5_moe_text import Qwen3_5MoeTextConfig
 from .modeling_qwen3_5_moe_text import Qwen3_5MoeTextForCausalLM
@@ -22,7 +25,6 @@ class TurboQwen3_5MoeTextForCausalLM(TurboModel, Qwen3_5MoeTextForCausalLM):
     config_class = Qwen3_5MoeTextConfig
     base_model_prefix = "model"
 
-    patch_gated_delta_net_for_sp = _qwen3_5_moe_vlm.patch_gated_delta_net_for_sp
     patch_mtp_for_sp = _qwen3_5_moe_vlm.patch_mtp_for_sp
 
     @classmethod
@@ -39,22 +41,22 @@ class TurboQwen3_5MoeTextForCausalLM(TurboModel, Qwen3_5MoeTextForCausalLM):
 
         return Qwen3_5MoeFlops
 
-    def on_parallelized(self, parallel_context):
+    def on_parallelized(self, parallel_context: dict[str, Any]) -> None:
+        from torchturbo.models.qwen3_5_moe.modeling_qwen3_5_moe import (
+            Qwen3_5MoeGatedDeltaNet,
+            Qwen3_5MoeMultiTokenPredictor,
+        )
+
         sp_info = parallel_context["sp"]
         sp_group = sp_info["sp_group"]
         sp_size = sp_info["sp_size"]
         sp_rank = sp_info["sp_rank"]
+        Qwen3_5MoeGatedDeltaNet.forward = build_gdn_sp_forward(
+            sp_group, sp_size, sp_rank
+        )
+
         if sp_size > 1:
-            from torchturbo.models.qwen3_5_moe.modeling_qwen3_5_moe import (
-                Qwen3_5MoeGatedDeltaNet,
-                Qwen3_5MoeMultiTokenPredictor,
-            )
-
             self.register_sp_attention_interface(sp_info)
-
-            self.patch_gated_delta_net_for_sp(
-                Qwen3_5MoeGatedDeltaNet, sp_group, sp_size, sp_rank
-            )
 
             if self.mtp is not None:
                 self.patch_mtp_for_sp(

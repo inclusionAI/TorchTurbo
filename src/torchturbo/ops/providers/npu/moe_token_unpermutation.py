@@ -20,10 +20,12 @@ from ...registry import register_op
 class NpuMoeTokenUnpermutation(OpImpl):
     def available(self) -> bool:
         try:
-            from mindspeed.ops.npu_moe_token_unpermute import (  # noqa: F401
-                npu_moe_token_unpermute,
-            )
+            import torch_npu
+
+            torch_npu.npu_moe_token_unpermute  # noqa: B018
         except ImportError:
+            return False
+        except AttributeError:
             return False
         return True
 
@@ -33,6 +35,8 @@ class NpuMoeTokenUnpermutation(OpImpl):
         sorted_indices: torch.Tensor,
         probs: Optional[torch.Tensor] = None,
     ):
-        from mindspeed.ops.npu_moe_token_unpermute import npu_moe_token_unpermute
+        import torch_npu
 
-        return npu_moe_token_unpermute(permuted_tokens, sorted_indices, probs=probs)
+        return torch_npu.npu_moe_token_unpermute(
+            permuted_tokens, sorted_indices, probs=probs
+        )

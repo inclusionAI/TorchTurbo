@@ -9,10 +9,11 @@ from typing import Any
 import torch
 import torch.nn as nn
 
-from ...engine.distributed import assert_finite
 from ...engine.checkpoint import CheckpointFormat
 from ...engine.checkpoint.layout import validate_output_dir
+from ...engine.distributed import assert_finite
 from ...logging import get_logger
+from ...models.modules.cpu_resident import CPUResidentParameter
 
 logger = get_logger(__name__)
 
@@ -541,7 +542,8 @@ class TorchTurboDPOTrainer(TorchTurboTrainerBase):
 
         with torch.no_grad():
             for name in sorted(src_state):
-                src = src_state[name].detach()
+                source = src_state[name]
+                src = source.detach()
                 dst = dst_state[name]
                 if src.shape != dst.shape:
                     raise RuntimeError(
@@ -549,7 +551,26 @@ class TorchTurboDPOTrainer(TorchTurboTrainerBase):
                         f"{name} shape differs ({tuple(src.shape)} vs "
                         f"{tuple(dst.shape)})."
                     )
-                dst.copy_(src)
+                if isinstance(dst, CPUResidentParameter):
+                    sizes = (
+                        source.shard_sizes
+                        if isinstance(source, CPUResidentParameter)
+                        else None
+                    )
+                    copy_sizes = sizes
+                    if copy_sizes is None:
+                        copy_sizes = (src.shape[0] if src.ndim else 1,)
+                    shards = src.split(copy_sizes) if src.ndim else (src,)
+
+                    def copy_cpu(index: int, target: torch.Tensor) -> None:
+                        target.copy_(shards[index])
+
+                    dst.load_(copy_sizes, copy_cpu, dtype=src.dtype)
+                    # load_ records the copy partition; a source without a known
+                    # layout must leave the reference without one as well.
+                    dst.shard_sizes = sizes
+                else:
+                    dst.copy_(src)
 
     @staticmethod
     def _named_persistent_buffers(model: Any) -> dict[str, torch.Tensor]:
@@ -568,6 +589,7 @@ class TorchTurboDPOTrainer(TorchTurboTrainerBase):
 
     def concatenated_forward(self, model, batch, is_ref_model: bool = False):
         from llamafactory.train.trainer_utils import nested_detach
+
         from torchturbo.models.modules.attention.ulysses import slice_input_tensor
 
         sp_info = self._engine().get_sp_info()
@@ -642,6 +664,7 @@ class TorchTurboDPOTrainer(TorchTurboTrainerBase):
 
     def get_batch_loss_metrics(self, model, inputs, train_eval: str = "train"):
         from torch.distributed.nn.functional import all_reduce
+
         from torchturbo.models.modules.attention.ulysses import ulysses_pad_inputs
 
         inputs = dict(inputs)

@@ -113,6 +113,19 @@ def register_plugin(name: str) -> Callable:
 # ---------------------------------------------------------------------------
 
 
+class CheckpointExportPlugin(Plugin):
+    """Consume completed HF exports on global rank zero.
+
+    Other ranks wait for the callback. Finish reading before returning, since
+    later saves or rotation may remove the directory. Failures are logged and
+    training continues.
+    """
+
+    def on_hf_export(self, export_dir: str) -> None:
+        """Consume an export whose weights and metadata have been saved."""
+        raise NotImplementedError
+
+
 @dataclass(frozen=True)
 class DatasetPrepareContext:
     """Context for DatasetPlugin"""
@@ -159,6 +172,7 @@ __all__ = [
     "Plugin",
     "PluginConsumer",
     "PluginManager",
+    "CheckpointExportPlugin",
     "DatasetPlugin",
     "DatasetPrepareContext",
     "register_plugin",

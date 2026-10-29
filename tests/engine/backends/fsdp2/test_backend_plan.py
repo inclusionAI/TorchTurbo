@@ -20,6 +20,7 @@ from torchturbo.engine.backends.fsdp2.backend import FSDP2Backend
 from torchturbo.engine.backends.fsdp2.config import CPUOffloadMode
 from torchturbo.engine.model_fqn import build_model_fqn_map
 from torchturbo.models.bailing_moe_v3_vl.vision_balance import BailingVisionBalanceIO
+from torchturbo.models.modules.cpu_resident import NodeSharedCPUResidentParameter
 from torchturbo.parallel import (
     FSDPParallelPlan,
     FSDPPlanSpec,
@@ -154,6 +155,40 @@ def test_cpu_offload_grad_norm_counts_replicated_grad_once(monkeypatch):
     torch.testing.assert_close(total_norm, torch.sqrt(torch.tensor(52.0)))
 
 
+@pytest.mark.parametrize("norm_type", [2.0, float("inf")])
+@pytest.mark.parametrize("max_norm", [1.0, 1000.0])
+def test_cpu_offload_norm_scales_experts_before_clipping(monkeypatch, norm_type, max_norm):
+    backend = make_backend()
+    backend.gradient_scaling_factor = 0.125
+    backend._device_runtime = types.SimpleNamespace(
+        device=torch.device("cpu"), synchronize=lambda: None
+    )
+    expert_grad = torch.tensor([24.0, 32.0])
+    dense_grad = torch.tensor([12.0])
+    expert_alias = expert_grad.view_as(expert_grad)
+    expert = types.SimpleNamespace(grad=types.SimpleNamespace(_local_tensor=expert_grad))
+    empty = types.SimpleNamespace(grad=types.SimpleNamespace(_local_tensor=torch.empty(0)))
+    dense = types.SimpleNamespace(grad=types.SimpleNamespace(_local_tensor=dense_grad))
+    replicated = nn.Parameter(torch.zeros(1))
+    replicated.grad = torch.tensor([5.0])
+
+    def reduce_shards(tensor, op, group):
+        if op == torch.distributed.ReduceOp.SUM:
+            tensor.mul_(4)
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", reduce_shards)
+    expected_norm = torch.tensor(12.0 if norm_type == float("inf") else (4 * 169 + 25) ** 0.5)
+    factor = min(1.0, max_norm / (expected_norm.item() + 1e-6))
+    norm = backend._clip_grad_norm_cpu_offload(
+        [expert, empty], [dense], [replicated], max_norm, norm_type
+    )
+
+    torch.testing.assert_close(norm, expected_norm)
+    torch.testing.assert_close(expert_alias, torch.tensor([3.0, 4.0]) * factor)
+    torch.testing.assert_close(dense_grad, torch.tensor([12.0]) * factor)
+    torch.testing.assert_close(replicated.grad, torch.tensor([5.0]) * factor)
+
+
 @pytest.mark.parametrize("full_offload", [False, True])
 @pytest.mark.parametrize("norm_type", [2.0, float("inf")])
 @pytest.mark.parametrize("max_norm", [1.0, float("inf")])
@@ -223,6 +258,28 @@ def test_standalone_world_shard_skips_default_descendant_wrapping(monkeypatch):
         ("language_model", "world"),
         ("root", "world"),
     ]
+
+
+@pytest.mark.parametrize("device", ["meta", "cpu"])
+@pytest.mark.parametrize("requires_grad", [False, True])
+def test_cpu_resident_parameters_must_be_frozen(tmp_path, device, requires_grad):
+    backend = make_backend()
+    model = nn.Module()
+    model.table = NodeSharedCPUResidentParameter(
+        torch.ones(2, device=device), requires_grad=requires_grad, directory=tmp_path
+    )
+    model.weight = nn.Parameter(torch.ones(2, device=device))
+    plan = resolve_plan(
+        model, FSDPParallelPlan(plan={"weight": FSDPPlanSpec(no_shard=True)})
+    )
+
+    if requires_grad:
+        with pytest.raises(AssertionError, match="CPU resident.*frozen.*table"):
+            backend._collect_no_shard(model, plan)
+    else:
+        ignored, modules = backend._collect_no_shard(model, plan)
+        assert ignored == {model.table, model.weight}
+        assert modules == []
 
 
 def test_no_shard_matches_parameter_names(monkeypatch):
@@ -1089,6 +1146,126 @@ def test_reentrant_checkpointing_suspends_prefetch_for_its_model(monkeypatch):
     model.layers[0](torch.ones(1))
 
     assert suspended_models == [model]
+
+
+@pytest.mark.parametrize("keyword_input", [False, True])
+@pytest.mark.parametrize("output_kind", ["tensor", "tuple", "optional"])
+def test_reentrant_checkpointing_recomputes_with_frozen_inputs(keyword_input, output_kind):
+    from torchturbo.engine.config import ActivationCheckpointingConfig
+
+    torch.manual_seed(43)
+    model = nn.Linear(4, 3)
+    reference = nn.Linear(4, 3)
+    reference.load_state_dict(model.state_dict())
+    backend = make_backend()
+    backend.config = types.SimpleNamespace(
+        activation_checkpointing=ActivationCheckpointingConfig(
+            enabled=True, use_reentrant=True
+        )
+    )
+    suspended_models = []
+    backend.prefetch_manager = types.SimpleNamespace(
+        suspend_expert_forward_prefetch=lambda model: (
+            suspended_models.append(model) or nullcontext()
+        )
+    )
+    forward_modes = []
+    original_forward = model.forward
+
+    def observed_forward(input):
+        forward_modes.append(torch.is_grad_enabled())
+        assert not input.requires_grad
+        output = original_forward(input)
+        if output_kind == "tuple":
+            return (output,)
+        if output_kind == "optional":
+            return output, None
+        return output
+
+    model.forward = observed_forward
+    plan = FSDPParallelPlan(plan={"": FSDPPlanSpec(activation_checkpoint=True)})
+    backend._apply_activation_checkpointing(model, resolve_plan(model, plan))
+    inputs = [torch.randn(2, 4), torch.randn(3, 4)]
+    actual = [model(input=x) if keyword_input else model(x) for x in inputs]
+    if output_kind != "tensor":
+        for output in actual:
+            assert isinstance(output, tuple)
+            assert len(output) == (1 if output_kind == "tuple" else 2)
+            if output_kind == "optional":
+                assert output[1] is None
+        actual = [output[0] for output in actual]
+    expected = [reference(x) for x in inputs]
+    for output, ref in zip(actual, expected, strict=True):
+        torch.testing.assert_close(output, ref)
+        assert output.requires_grad
+    sum(output.square().sum() for output in actual).backward()
+    sum(output.square().sum() for output in expected).backward()
+
+    assert forward_modes == [False, False, True, True]
+    assert suspended_models == [model, model]
+    for parameter, ref in zip(model.parameters(), reference.parameters(), strict=True):
+        assert parameter.grad is not None
+        torch.testing.assert_close(parameter.grad, ref.grad)
+    assert all(not x.requires_grad and x.grad is None for x in inputs)
+
+    before_step = model.weight.detach().clone()
+    torch.optim.SGD(model.parameters(), lr=0.1).step()
+    torch.optim.SGD(reference.parameters(), lr=0.1).step()
+    assert not torch.equal(model.weight, before_step)
+    torch.testing.assert_close(model.weight, reference.weight)
+
+
+@pytest.mark.parametrize("freeze_parameters", [False, True])
+def test_reentrant_checkpointing_preserves_input_gradients(freeze_parameters):
+    from torchturbo.engine.config import ActivationCheckpointingConfig
+
+    torch.manual_seed(44)
+    model = nn.Linear(4, 3).requires_grad_(not freeze_parameters)
+    reference = nn.Linear(4, 3).requires_grad_(not freeze_parameters)
+    reference.load_state_dict(model.state_dict())
+    backend = make_backend()
+    backend.config = types.SimpleNamespace(
+        activation_checkpointing=ActivationCheckpointingConfig(
+            enabled=True, use_reentrant=True
+        )
+    )
+    backend.prefetch_manager = types.SimpleNamespace(
+        suspend_expert_forward_prefetch=lambda model: nullcontext()
+    )
+    plan = FSDPParallelPlan(plan={"": FSDPPlanSpec(activation_checkpoint=True)})
+    backend._apply_activation_checkpointing(model, resolve_plan(model, plan))
+    x = torch.randn(2, 4, requires_grad=True)
+    ref_x = x.detach().clone().requires_grad_()
+    actual = model(x)
+    expected = reference(ref_x)
+    actual.square().sum().backward()
+    expected.square().sum().backward()
+    torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(x.grad, ref_x.grad)
+    for parameter, ref in zip(model.parameters(), reference.parameters(), strict=True):
+        torch.testing.assert_close(parameter.grad, ref.grad)
+
+
+@pytest.mark.parametrize("mode", ["no_grad", "frozen_parameters"])
+def test_reentrant_checkpointing_keeps_frozen_execution_without_gradients(mode):
+    from torchturbo.engine.config import ActivationCheckpointingConfig
+
+    model = nn.Linear(4, 3).requires_grad_(mode != "frozen_parameters")
+    backend = make_backend()
+    backend.config = types.SimpleNamespace(
+        activation_checkpointing=ActivationCheckpointingConfig(
+            enabled=True, use_reentrant=True
+        )
+    )
+    backend.prefetch_manager = types.SimpleNamespace(
+        suspend_expert_forward_prefetch=lambda model: nullcontext()
+    )
+    plan = FSDPParallelPlan(plan={"": FSDPPlanSpec(activation_checkpoint=True)})
+    backend._apply_activation_checkpointing(model, resolve_plan(model, plan))
+    with torch.set_grad_enabled(mode != "no_grad"):
+        output = model(torch.randn(2, 4))
+    assert not output.requires_grad
+    assert all(parameter.grad is None for parameter in model.parameters())
 
 
 def test_activation_checkpointing_eval_uses_original_forward(monkeypatch):

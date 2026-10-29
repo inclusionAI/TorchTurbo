@@ -12,6 +12,7 @@ import torch.nn as nn
 from torchturbo.logging import get_logger
 
 from ..optimizers import OptimizersContainer
+from ..plugins import CheckpointExportPlugin, Plugin, PluginConsumer
 from ..utils import is_peft_adapter_param
 from . import layout
 from .distributed import collective_check, rank_zero_call
@@ -29,6 +30,38 @@ if TYPE_CHECKING:
 logger = get_logger(__name__)
 
 
+class CheckpointExportPluginConsumer(PluginConsumer):
+    """Register export plugins and notify them on global rank zero."""
+
+    def __init__(self) -> None:
+        self._export_plugins: list[CheckpointExportPlugin] = []
+
+    def matches(self, plugin: Plugin) -> bool:
+        return isinstance(plugin, CheckpointExportPlugin)
+
+    def consume(self, plugin: Plugin) -> None:
+        if not isinstance(plugin, CheckpointExportPlugin):
+            raise TypeError("Expected a CheckpointExportPlugin.")
+        self._export_plugins.append(plugin)
+
+    def notify_hf_export(self, export_dir: str) -> None:
+        """Notify plugins after an HF export, waiting on all ranks."""
+        if not self._export_plugins:
+            return
+
+        def notify() -> None:
+            for plugin in self._export_plugins:
+                try:
+                    plugin.on_hf_export(export_dir)
+                except Exception:
+                    logger.warning_rank0(
+                        "HF export plugin %s failed for %s; continuing training.",
+                        type(plugin).__name__, export_dir, exc_info=True,
+                    )
+
+        rank_zero_call(notify)
+
+
 class CheckpointCoordinator:
     """Coordinate checkpoint policy above a backend checkpoint manager."""
 
@@ -38,7 +71,9 @@ class CheckpointCoordinator:
         manager: BaseCheckpointManager,
         *,
         parallel_context: dict[str, Any],
+        export_plugin_consumer: CheckpointExportPluginConsumer,
     ) -> None:
+        self._export_plugin_consumer = export_plugin_consumer
         self._config = config
         self._manager = manager
         self._parallel_context = parallel_context
@@ -105,6 +140,9 @@ class CheckpointCoordinator:
                     os.path.join(output_dir, layout.HF_MODEL_DIR),
                     source_path=source_path,
                     weight_converter=self._weight_converter(model, source_path),
+                )
+                self._export_plugin_consumer.notify_hf_export(
+                    os.path.join(output_dir, layout.HF_MODEL_DIR)
                 )
         return formats
 
@@ -187,6 +225,16 @@ class CheckpointCoordinator:
                     f"Optimizer state in {optimizer_dir} is incomplete; the save was "
                     "interrupted. Resume from an earlier checkpoint."
                 )
+            metadata = load_metadata(checkpoint_dir)
+            if metadata is not None:
+                saved_ep_size = metadata["engine_config"]["parallel_plan"]["ep_size"]
+                current_ep_size = self._parallel_context["ep"]["ep_size"]
+                if saved_ep_size != current_ep_size:
+                    raise ValueError(
+                        f"Checkpoint {checkpoint_dir} saved EP size {saved_ep_size}, "
+                        f"but the current run uses EP size {current_ep_size}. "
+                        "Optimizer state requires matching EP sizes."
+                    )
             scheduler_state = None
             if lr_scheduler is not None:
                 scheduler_state = layout.load_scheduler(checkpoint_dir)

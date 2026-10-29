@@ -23,8 +23,10 @@ class TorchCrossEntropyLoss(OpImpl):
         reduction: str = "sum",
         ignore_index: int = -100,
     ):
+        # F.cross_entropy keeps the input dtype outside autocast. Compute in
+        # FP32 so BF16 logits do not lose precision in the loss or gradient.
         return F.cross_entropy(
-            logits,
+            logits.float(),
             labels,
             reduction=reduction,
             ignore_index=ignore_index,

@@ -95,22 +95,29 @@ def _all_to_all_single(
             async_op=True,
         )
         comm.wait()
-    else:
-        device_runtime = get_device_runtime()
-        a2a_stream.wait_stream(device_runtime.current_stream())
-        with device_runtime.stream(a2a_stream):
-            comm = dist.all_to_all_single(
-                packed_output,
-                packed_input,
-                group=sp_group,
-                async_op=True,
-            )
-            comm.wait()
-        packed_input.record_stream(a2a_stream)
-        packed_output.record_stream(a2a_stream)
+        return packed_output.movedim(0, gather_dim).flatten(
+            gather_dim, gather_dim + 1
+        )
 
-    output = packed_output.movedim(0, gather_dim).flatten(gather_dim, gather_dim + 1)
-    return output.contiguous()
+    device_runtime = get_device_runtime()
+    a2a_stream.wait_stream(device_runtime.current_stream())
+    with device_runtime.stream(a2a_stream):
+        comm = dist.all_to_all_single(
+            packed_output,
+            packed_input,
+            group=sp_group,
+            async_op=True,
+        )
+        comm.wait()
+        # In the scatter direction the gathered axis is not a contiguous
+        # view of the receive buffer, so flatten copies it; that copy must
+        # stay on this stream, the only one ordered after the collective.
+        output = packed_output.movedim(0, gather_dim).flatten(
+            gather_dim, gather_dim + 1
+        )
+    packed_input.record_stream(a2a_stream)
+    packed_output.record_stream(a2a_stream)
+    return output
 
 
 def all_to_all_tensor(
@@ -224,13 +231,21 @@ def gather_seq_scatter_heads(
 
 
 def gather_heads_scatter_seq(
-    x: Tensor, head_dim: int, seq_dim: int, sp_group: ProcessGroup, sp_size: int
+    x: Tensor,
+    head_dim: int,
+    seq_dim: int,
+    sp_group: ProcessGroup,
+    sp_size: int,
+    a2a_stream: Optional[Any] = None,
 ) -> Tensor:
     """
     A func to sync attention result with alltoall in sequence parallel
     gather head dimension and scatter seq dim:
     e.g. seq_dim: 1, head_dim: 2
     [bsz, seq, h/n, ...] -> [bsz, seq/n, h, ...]
+
+    With ``a2a_stream``, the exchange runs on that stream; the caller must
+    wait on the stream before reading the result.
     """
     if not sp_group:
         return x
@@ -238,7 +253,7 @@ def gather_heads_scatter_seq(
     if dim_size % sp_size != 0:
         padding_size = sp_size - (dim_size % sp_size)
         x = pad_tensor(x, seq_dim, padding_size)
-    return SeqAllToAll.apply(x, sp_group, sp_size, seq_dim, head_dim, None)
+    return SeqAllToAll.apply(x, sp_group, sp_size, seq_dim, head_dim, a2a_stream)
 
 
 def ulysses_flash_attention_forward(

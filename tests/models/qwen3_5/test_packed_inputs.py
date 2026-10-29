@@ -5,6 +5,7 @@ import pytest
 import torch
 
 import torchturbo.ops as turbo_ops
+from torchturbo.models.modules.attention.gdn import build_gdn_sp_forward
 from torchturbo.models.modules.attention.ulysses import ulysses_pad_inputs
 from torchturbo.models.qwen3_5 import modeling_qwen3_5 as dense
 from torchturbo.models.qwen3_5.model import TurboQwen3_5ForConditionalGeneration
@@ -12,6 +13,7 @@ from torchturbo.models.qwen3_5.swift_template import _post_process_inputs
 from torchturbo.models.qwen3_5_moe import modeling_qwen3_5_moe as moe
 from torchturbo.models.qwen3_5_moe.model import TurboQwen3_5MoeForConditionalGeneration
 from torchturbo.ops.dispatcher import OpDispatcher
+from torchturbo.runtime.cpu import CpuRuntime
 
 
 @pytest.mark.parametrize(
@@ -84,13 +86,11 @@ def _attention():
         dt_bias=torch.zeros(2),
         norm=lambda x, z: x,
         out_proj=lambda x: x,
-        _sp_a2a_stream=None,
     )
 
 
-@pytest.mark.parametrize("family", ["dense", "moe"])
 @pytest.mark.parametrize("sp_size", [1, 2])
-def test_gated_delta_ops_cover_padding_and_share_metadata(monkeypatch, family, sp_size):
+def test_gated_delta_ops_cover_padding_and_share_metadata(monkeypatch, sp_size):
     captured = []
 
     def dispatch(op_name, *args, **kwargs):
@@ -108,13 +108,6 @@ def test_gated_delta_ops_cover_padding_and_share_metadata(monkeypatch, family, s
     monkeypatch.setattr(dispatcher, "_dispatch", dispatch)
     monkeypatch.setattr(turbo_ops, "ops", dispatcher)
     attention = _attention()
-    if family == "dense":
-        attention_cls = dense.Qwen3_5GatedDeltaNet
-        wrapper = TurboQwen3_5ForConditionalGeneration
-    else:
-        attention_cls = moe.Qwen3_5MoeGatedDeltaNet
-        wrapper = TurboQwen3_5MoeForConditionalGeneration
-
     if sp_size > 1:
         ulysses = importlib.import_module("torchturbo.models.modules.attention.ulysses.ulysses")
 
@@ -126,14 +119,12 @@ def test_gated_delta_ops_cover_padding_and_share_metadata(monkeypatch, family, s
 
         monkeypatch.setattr(ulysses, "gather_seq_scatter_heads", gather_sequence)
         monkeypatch.setattr(ulysses, "gather_heads_scatter_seq", gather_heads)
-        runtime = SimpleNamespace(current_stream=lambda: SimpleNamespace(wait_stream=lambda stream: None))
-        dense_wrapper = importlib.import_module("torchturbo.models.qwen3_5.model")
-        monkeypatch.setattr(dense_wrapper, "get_device_runtime", lambda: runtime)
-        monkeypatch.setattr(attention_cls, "forward", attention_cls.forward)
-        wrapper.patch_gated_delta_net_for_sp(attention_cls, None, sp_size, 0)
+        gdn_forward = importlib.import_module("torchturbo.models.modules.attention.gdn.forward")
+        monkeypatch.setattr(gdn_forward, "get_device_runtime", CpuRuntime)
 
     cu = torch.tensor([0, 2, 5], dtype=torch.int32)
-    output = attention_cls.forward(attention, torch.ones(1, 6 // sp_size, 4), cu_seq_lens=cu)
+    forward = build_gdn_sp_forward(None, sp_size, 0)
+    output = forward(attention, torch.ones(1, 6 // sp_size, 4), cu_seq_lens=cu)
 
     assert output.shape == (1, 6 // sp_size, 4)
     assert captured[0] is captured[1]

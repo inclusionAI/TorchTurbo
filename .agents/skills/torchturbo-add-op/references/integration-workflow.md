@@ -19,7 +19,7 @@ Read the nearest existing provider pair as a template:
 | `torch.compile` based device implementation | `providers/cuda/swiglu.py`, `providers/cuda/gated_activation.py` |
 | Op whose native baseline runs only on CPU | `providers/native/attention.py` (`devices=(TurboDevice.CPU,)`) |
 | Op needing argument normalization in the facade | `dispatcher.py` `gated_delta_rule` / `causal_conv1d` (`cu_seqlens` -> `packed_params`) |
-| Device implementation backed by local kernel code | `providers/npu/gated_delta_rule.py` with `providers/npu/_fla_npu_gdn/` |
+| Device implementation backed by local kernel code | `providers/npu/gated_delta_rule.py` with `providers/npu/_fla_gdn/` |
 
 ## 2. Define the semantic contract first
 
@@ -123,7 +123,7 @@ Rules:
 
 Priorities in use today: `0` for native baselines, `50` for `torch.compile` variants, `100` for the common fused device kernel, `200` when a device has two kernels and one should win (`mindspeed_matmul_add` over `torch_npu_matmul_add`). A device implementation at the same priority as a device-agnostic one still wins, because `OpRegistry.list` ranks non-empty `devices` first, then `custom` over `native`. Prefer a distinct priority over relying on the tie-break, and cover the intended winner in a test when several candidates exist.
 
-Provider filenames and every path component must not start with `_`; `_iter_package_modules` skips those, which is how `npu/_fla_npu_gdn/` stays a private helper package. Re-exporting an `OpImpl` defined in another module does not register it either, because `_index_provider_module` only indexes classes whose `__module__` is the provider module.
+Provider filenames and every path component must not start with `_`; `_iter_package_modules` skips those, which is how `npu/_fla_gdn/` stays a private helper package. Re-exporting an `OpImpl` defined in another module does not register it either, because `_index_provider_module` only indexes classes whose `__module__` is the provider module.
 
 ## 5. Decide whether to add an explicit facade
 

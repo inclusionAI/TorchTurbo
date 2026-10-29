@@ -46,7 +46,7 @@ def test_local_token_counts_are_lazily_initialized_and_accumulated():
             [[1.0, 2.0, 3.0]],
         ]
     )
-    _, routing_map = router.routing(logits)
+    routing_map = router.routing(logits).routing_map
     expected = routing_map.sum(dim=0).to(torch.float32)
 
     assert router.local_tokens_per_expert is not None
@@ -69,7 +69,7 @@ def test_local_token_counts_exclude_padding_without_changing_dispatch_map():
     )
     padding_mask = torch.tensor([[False], [True], [False]])
 
-    _, routing_map = router.routing(logits, padding_mask=padding_mask)
+    routing_map = router.routing(logits, padding_mask=padding_mask).routing_map
 
     expected_counts = routing_map[~padding_mask.reshape(-1)].sum(dim=0).float()
     torch.testing.assert_close(router.local_tokens_per_expert, expected_counts)
