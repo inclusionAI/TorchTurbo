@@ -373,7 +373,7 @@ class DistParamLoader:
             # model-specific fixups (e.g. narrowing zero-padded release
             # tensors) must run on the full checkpoint tensor, before any
             # FSDP sharded narrow/copy sees it.
-            tensor = self.param_converter.transform_checkpoint_tensor(
+            tensor = self.param_converter.hf_to_model_tensor(
                 name, self.local_sd[name]
             ).to(self.device)
         else:

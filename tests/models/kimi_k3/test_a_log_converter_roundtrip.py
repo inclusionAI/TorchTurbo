@@ -35,7 +35,7 @@ def _official_a_log():
 
 def test_load_narrows_zero_padded_a_log():
     official = _official_a_log()
-    out = _k3_converter().transform_checkpoint_tensor(A_LOG_NAME, official.clone())
+    out = _k3_converter().hf_to_model_tensor(A_LOG_NAME, official.clone())
     assert out.shape == (NUM_HEADS,)
     assert torch.equal(out, official[:NUM_HEADS])
 
@@ -44,12 +44,12 @@ def test_load_refuses_nonzero_padding():
     official = _official_a_log()
     official[-1] = 1.0
     with pytest.raises(ValueError, match="non-zero padding"):
-        _k3_converter().transform_checkpoint_tensor(A_LOG_NAME, official)
+        _k3_converter().hf_to_model_tensor(A_LOG_NAME, official)
 
 
 def test_save_pads_a_log_back_to_head_dim():
     trained = torch.rand(NUM_HEADS, dtype=torch.float32)
-    out = _k3_converter().reverse_transform_checkpoint_tensor(A_LOG_NAME, trained)
+    out = _k3_converter().model_to_hf_tensor(A_LOG_NAME, trained)
     assert out.shape == (HEAD_DIM,)
     assert torch.equal(out[:NUM_HEADS], trained)
     assert torch.equal(out[NUM_HEADS:], torch.zeros(HEAD_DIM - NUM_HEADS))
@@ -58,14 +58,14 @@ def test_save_pads_a_log_back_to_head_dim():
 def test_save_load_roundtrip_is_bitwise_identical():
     official = _official_a_log()
     converter = _k3_converter()
-    narrowed = converter.transform_checkpoint_tensor(A_LOG_NAME, official.clone())
-    restored = converter.reverse_transform_checkpoint_tensor(A_LOG_NAME, narrowed)
+    narrowed = converter.hf_to_model_tensor(A_LOG_NAME, official.clone())
+    restored = converter.model_to_hf_tensor(A_LOG_NAME, narrowed)
     assert torch.equal(restored, official)
 
 
 def test_reverse_hook_leaves_other_tensors_untouched():
     weight = torch.rand(8, 4, dtype=torch.bfloat16)
-    out = _k3_converter().reverse_transform_checkpoint_tensor(
+    out = _k3_converter().model_to_hf_tensor(
         "language_model.model.layers.0.self_attn.q_proj.weight", weight
     )
     assert out is weight
@@ -74,8 +74,8 @@ def test_reverse_hook_leaves_other_tensors_untouched():
 def test_base_default_hooks_are_identity():
     base = object.__new__(BaseWeightConverter)
     t = torch.rand(4)
-    assert base.transform_checkpoint_tensor("x", t) is t
-    assert base.reverse_transform_checkpoint_tensor("x", t) is t
+    assert base.hf_to_model_tensor("x", t) is t
+    assert base.model_to_hf_tensor("x", t) is t
 
 
 def test_normalize_tensor_runs_reverse_hook():
@@ -86,7 +86,7 @@ def test_normalize_tensor_runs_reverse_hook():
     calls = []
 
     class _FakeConverter:
-        def reverse_transform_checkpoint_tensor(self, name, tensor):
+        def model_to_hf_tensor(self, name, tensor):
             calls.append(name)
             return tensor
 

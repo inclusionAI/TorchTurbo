@@ -85,7 +85,7 @@ class KimiK3WeightConverter(BaseWeightConverter):
                 self.dtype = _map.get(getattr(self.config, 'torch_dtype', 'bfloat16'), torch.bfloat16)
 
     @override
-    def transform_checkpoint_tensor(self, hf_name, tensor):
+    def hf_to_model_tensor(self, hf_name, tensor):
         """Narrow zero-padded A_log from Kimi-K3 release checkpoints.
 
         Published K3 checkpoints store ``self_attn.A_log`` padded from
@@ -115,7 +115,7 @@ class KimiK3WeightConverter(BaseWeightConverter):
         return tensor
 
     @override
-    def reverse_transform_checkpoint_tensor(self, hf_name, tensor):
+    def model_to_hf_tensor(self, hf_name, tensor):
         """Re-pad A_log from num_heads back to head_dim on save.
 
         Inverse of the load-side narrowing above: exported checkpoints keep

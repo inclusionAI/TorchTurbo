@@ -69,15 +69,15 @@ class BaseWeightConverter:
         # snapshot instead of re-expanding names after Turbo/FSDP rewrites.
         self.tied_weight_keys = dict(getattr(model, "all_tied_weights_keys", None) or {})
 
-    def transform_checkpoint_tensor(self, hf_name: str, tensor):
+    def hf_to_model_tensor(self, hf_name: str, tensor):
         """Per-tensor fixup applied to a full checkpoint tensor before FSDP
         sharding/broadcast (load direction). Default is identity; override
         for model-specific repairs (e.g. narrowing zero-padded release
         tensors)."""
         return tensor
 
-    def reverse_transform_checkpoint_tensor(self, hf_name: str, tensor):
-        """Save-direction counterpart of transform_checkpoint_tensor.
+    def model_to_hf_tensor(self, hf_name: str, tensor):
+        """Save-direction counterpart of hf_to_model_tensor.
 
         Applied to each full tensor before it is written to the HF-format
         checkpoint, so a model whose load hook repairs an official release
