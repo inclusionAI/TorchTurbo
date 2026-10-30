@@ -20,7 +20,14 @@ def configure_token_bound(config: Any, args: Any) -> None:
     tokens = length * args.per_device_train_batch_size
     sp_size = config.parallel_plan.sp_size
     local_tokens = (tokens + sp_size - 1) // sp_size
-    config.extra["mega_moe_local_tokens"] = ((local_tokens + 127) // 128) * 128
+    required = ((local_tokens + 127) // 128) * 128
+    capacity = config.extra.get("mega_moe_local_tokens", required)
+    if not isinstance(capacity, int) or capacity < required or capacity % 128:
+        raise ValueError(
+            "mega_moe_local_tokens must be 128-aligned and at least "
+            f"{required} for the configured sequence length, batch size and SP size."
+        )
+    config.extra["mega_moe_local_tokens"] = capacity
 
 
 class RoutedExpertsBackend:
