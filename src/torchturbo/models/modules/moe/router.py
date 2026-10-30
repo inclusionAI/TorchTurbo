@@ -279,6 +279,7 @@ class TopKRouter(Router):
                 use_hash_routing=self.use_hash_routing,
                 hash_table=getattr(self, "tid2eid", None),
                 input_ids=input_ids,
+                force_expert_balance=self.config.moe_router_force_expert_balance,
             )
         else:
             raise ValueError(f"Unsupported MoE routing type: {self.routing_type}")

@@ -17,7 +17,7 @@ import torch
 import torch.nn as nn
 
 from torchturbo.engine.backends.fsdp2.backend import FSDP2Backend
-from torchturbo.engine.backends.fsdp2.config import CPUOffloadMode
+from torchturbo.engine.backends.fsdp2.config import CPUOffloadMode, FSDPConfig
 from torchturbo.engine.model_fqn import build_model_fqn_map
 from torchturbo.models.bailing_moe_v3_vl.vision_balance import BailingVisionBalanceIO
 from torchturbo.models.modules.cpu_resident import NodeSharedCPUResidentParameter
@@ -68,6 +68,7 @@ def make_backend(*, mtp_enabled=False):
 
 def make_preparing_backend(order, sp_info):
     backend = make_backend()
+    backend.fsdp_config = FSDPConfig()
     backend.prefetch_manager = types.SimpleNamespace(
         setup=lambda model: order.append("prefetch")
     )

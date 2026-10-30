@@ -1180,6 +1180,7 @@ def _validate_config_file(data: Mapping[str, Any], parents: tuple[str, ...] = ()
             "backend_config.cpu_offload.enabled",
             "backend_config.cpu_offload.mode",
             "backend_config.cpu_offload.optimizer_memory_fraction",
+            "backend_config.force_expert_balance",
         }
     )
     allowed.update(_dataclass_config_paths(OptimizerConfig, ("optimizer",)))
@@ -1239,6 +1240,7 @@ def _build_fsdp_config(fields: Mapping[str, Any]) -> Any:
         prefetch_direction=fsdp_d.get("prefetch_direction", "forward_backward"),
         forward_prefetch_depth=fsdp_d.get("forward_prefetch_depth", 1),
         backward_prefetch_depth=fsdp_d.get("backward_prefetch_depth", 1),
+        force_expert_balance=fsdp_d.get("force_expert_balance", False),
     )
 
 

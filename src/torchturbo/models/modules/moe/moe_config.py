@@ -47,6 +47,8 @@ class MoEConfig:
     moe_z_loss_coeff: float = 0.0
     """Number of experts to route to for each token."""
     moe_router_topk: int = 2
+    """Benchmark-only balanced expert assignment; changes model semantics."""
+    moe_router_force_expert_balance: bool = False
     """Number of groups to divide experts into for group-limited routing."""
     moe_router_num_groups: Optional[int] = None
     """Number of selected groups for group-limited routing."""

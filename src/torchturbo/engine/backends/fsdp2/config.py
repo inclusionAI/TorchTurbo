@@ -123,6 +123,8 @@ class FSDPConfig:
 
     sharding_strategy: ShardingStrategy = ShardingStrategy.FULL_SHARD
     reshard_after_forward: bool = True
+    force_expert_balance: bool = False
+    """Benchmark-only expert reassignment. Invalidates training accuracy."""
     cpu_offload: CPUOffloadConfig = field(
         default_factory=lambda: CPUOffloadConfig(enabled=False)
     )
@@ -132,6 +134,13 @@ class FSDPConfig:
     backward_prefetch_depth: int = 1
 
     def __post_init__(self) -> None:
+        if isinstance(self.force_expert_balance, str):
+            # Lazy import: engine.args imports this module.
+            from ...args import string_to_bool
+
+            self.force_expert_balance = string_to_bool(self.force_expert_balance)
+        else:
+            self.force_expert_balance = bool(self.force_expert_balance)
         cpu_offload = self.cpu_offload
         if cpu_offload is None:
             self.cpu_offload = CPUOffloadConfig(enabled=False)
