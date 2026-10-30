@@ -19,6 +19,7 @@ from torchturbo.utils.flash_attn_utils import cu_seqlens_to_segment_ids
 from . import packing_utils as pu
 from torchturbo.models.modules.moe.moe_layer import MoELayer
 from torchturbo.models.modules.moe.moe_utils import MoEAuxLossAutoScaler
+from torchturbo.models.modules.rope import get_shared_rope_table
 from torchturbo.runtime import TurboDevice, get_device_runtime
 from torchturbo.runtime import is_npu_available  # noqa: F401 - module-level availability probe
 
@@ -202,15 +203,19 @@ class TurboDeepseekV4ForCausalLM(TurboModel, DeepseekV4ForCausalLM):
                 original_seq_len = 0
                 rope_theta = attn.config.rope_theta
 
-            freqs_cis = dsv4.get_shared_freqs_cis(
-                attn.rope_head_dim,
-                attn.config.max_position_embeddings,
-                original_seq_len,
-                rope_theta,
-                attn.config.rope_factor,
-                attn.config.beta_fast,
-                attn.config.beta_slow,
+            freqs_cis = get_shared_rope_table(
+                dsv4.DeepseekV4Attention._precompute_freqs_cis,
+                (
+                    attn.rope_head_dim,
+                    attn.config.max_position_embeddings,
+                    original_seq_len,
+                    rope_theta,
+                    attn.config.rope_factor,
+                    attn.config.beta_fast,
+                    attn.config.beta_slow,
+                ),
                 device=attn.attn_sink.device,
+                dtype=torch.complex64,
             )
             attn.register_buffer("freqs_cis", freqs_cis, persistent=False)
 
