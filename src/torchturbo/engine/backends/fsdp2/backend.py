@@ -357,6 +357,10 @@ class FSDP2Backend(BaseBackend):
                     else:
                         logger.debug_rank0("FSDP2Backend patched module %s in-place", fqn)
 
+        if self.config.mega_moe:
+            from ....optimizations.mega_moe.integration import install
+
+            install(model, self.config, self.get_ep_info()["ep_group"])
         return model
 
     @staticmethod
@@ -449,6 +453,13 @@ class FSDP2Backend(BaseBackend):
             )
         else:
             plan = parallel_plan
+
+        if self.config.mega_moe and peft_config is not None:
+            logger.warning_rank0(
+                "MegaMoE + MoonEP does not support LoRA. Disabling mega_moe "
+                "and using the native MoE modules; LoRA remains enabled."
+            )
+            self.config.mega_moe = False
 
         self.parallel_plan = plan
 

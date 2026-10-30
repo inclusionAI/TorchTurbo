@@ -48,6 +48,7 @@ class GroupedMLP(torch.nn.Module):
         super().__init__()
         self.config = config
         self.num_local_experts = num_local_experts
+        self._execution_backend = None
         self.layer_number = layer_number
         limit_list = getattr(config, "moe_swiglu_limit", None)
         if (
@@ -187,6 +188,11 @@ class GroupedMLP(torch.nn.Module):
         permuted_probs: torch.Tensor,
     ):
         """Forward step of the GroupedMLP."""
+        if self._execution_backend is not None:
+            return ops.mega_moe(
+                permuted_local_hidden_states, tokens_per_expert, permuted_probs,
+                experts=self, backend=self._execution_backend,
+            ), None
         if self.config.moe_apply_probs_on_input:
             assert (
                 self.config.moe_router_topk == 1

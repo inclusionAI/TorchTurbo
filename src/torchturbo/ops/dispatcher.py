@@ -307,6 +307,27 @@ class OpDispatcher:
             impl=impl,
         )
 
+    def mega_moe(
+        self,
+        hidden_states: torch.Tensor,
+        expert_indices: torch.Tensor,
+        probs: torch.Tensor,
+        *,
+        experts: torch.nn.Module,
+        backend: Any,
+        impl: str | None = None,
+    ) -> torch.Tensor:
+        """Execute routed SwiGLU experts, preserving selected zero-weight routes.
+
+        Expert IDs and final routing weights have shape (tokens, top_k). Expert
+        parameters remain owned by the calling module and its FSDP hooks. The
+        backend carries the EP group and shared native execution resources.
+        """
+        return self._dispatch(
+            "mega_moe", hidden_states, expert_indices, probs,
+            experts=experts, backend=backend, impl=impl,
+        )
+
     def grouped_matmul(
         self,
         x,
