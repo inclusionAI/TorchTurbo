@@ -113,6 +113,16 @@ engine_config:
         # Size limit in MiB. Required for size and unused by other strategies.
         bucket_cap_mb: null
 
+  moe:
+    # Periodically re-place experts across EP ranks by observed token load
+    # (FlexMoE-style; checkpoints do not record the active placement).
+    expert_rebalance:
+      enabled: false
+      # Steps between re-placement decisions.
+      interval_steps: 20
+      # EMA decay for the per-expert load estimate.
+      ema_decay: 0.9
+
   mtp:
     enabled: false
     loss_scaling_factor: 0.1

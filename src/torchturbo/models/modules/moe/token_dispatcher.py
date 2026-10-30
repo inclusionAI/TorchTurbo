@@ -15,6 +15,7 @@ from torchturbo.ops import ops
 from torchturbo.runtime import TurboDevice, get_device_runtime
 
 from .moe_config import MoEConfig
+from .expert_placement import ExpertPlacementManager, activate_from_config
 
 # from torch_turbo.distributed.parallel_state import get_expert_model_parallel_group
 from ..comm.comm import all_to_all, gather_from_sequence_parallel_region
@@ -163,6 +164,11 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         self.device_runtime = get_device_runtime()
         self.dtoh_stream = self.device_runtime.new_stream()
 
+        # Expert re-placement: the dispatcher works in slot space; the shared
+        # manager maps expert ids to slots and migrates weights between steps.
+        activate_from_config(config, ep_group)
+        self._placement = ExpertPlacementManager.active()
+
     @property
     def deferred_probs_to_unpermutation(self) -> bool:
         # This currently reflects the availability of the fused NPU path; the
@@ -173,6 +179,8 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         self,
         hidden_states: torch.Tensor,
         routing: RoutingResult,
+        slot_counts: Optional[torch.Tensor] = None,
+        slot_indices: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         probs = routing.probs
         routing_map = routing.routing_map
@@ -183,7 +191,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         assert routing_map.dim() == 2, "Expected 2D tensor for token2expert mask"
         assert routing_map.dtype == torch.bool, "Expected bool tensor for mask"
         hidden_states = hidden_states.view(-1, self.hidden_shape[-1])
-        tokens_per_expert = self.preprocess(self.routing_map)
+        tokens_per_expert = self.preprocess(self.routing_map, counts=slot_counts)
 
         tokens_per_expert = self._maybe_dtoh_and_synchronize(
             "before_permutation_1", tokens_per_expert
@@ -192,7 +200,10 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         (
             permutated_local_input_tokens,
             self.reversed_local_input_permutation_mapping,
-        ) = ops.moe_token_permutation(hidden_states, routing.expert_indices)
+        ) = ops.moe_token_permutation(
+            hidden_states,
+            slot_indices if slot_indices is not None else routing.expert_indices,
+        )
 
         tokens_per_expert = self._maybe_dtoh_and_synchronize(
             "before_ep_alltoall", tokens_per_expert
@@ -255,7 +266,9 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
 
         return output, None
 
-    def preprocess(self, routing_map: torch.Tensor) -> torch.Tensor:
+    def preprocess(
+        self, routing_map: torch.Tensor, counts: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         """
         Preprocess token routing map for AlltoAll communication and token permutation.
 
@@ -268,13 +281,18 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         Args:
             routing_map (torch.Tensor): The mapping of tokens to experts, with shape
                 [num_tokens, num_experts].
+            counts (torch.Tensor, optional): Per-slot token counts in slot
+                order, precomputed by the expert placement manager. When given,
+                the routing map column sum is skipped.
 
         Returns:
             torch.Tensor: Tensor containing the number of tokens assigned to local expert.
         """
 
         # [num_experts], number of tokens assigned to each expert from the current rank's input.
-        num_local_tokens_per_expert = routing_map.sum(dim=0).long()
+        num_local_tokens_per_expert = (
+            counts.long() if counts is not None else routing_map.sum(dim=0).long()
+        )
 
         self.num_out_tokens = routing_map.size(0) * self.config.moe_router_topk
 
@@ -372,6 +390,25 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
                 - Number of tokens per expert.
                 - Permuted probs of each token produced by the router.
         """
+        if self._placement is not None:
+            true_counts = torch.bincount(
+                routing.expert_indices.reshape(-1), minlength=self.num_experts
+            )
+            self._placement.accumulate_counts(true_counts)
+            if self.deferred_probs_to_unpermutation:
+                # Lean remap: only the small expert-index gather and the count
+                # reorder run per layer; routing_map and dense probs stay
+                # untouched.
+                return self._token_permutation_with_deferred_probs(
+                    hidden_states,
+                    routing,
+                    slot_counts=self._placement.slot_counts(true_counts),
+                    slot_indices=self._placement.remap_indices(
+                        routing.expert_indices
+                    ),
+                )
+            routing = self._placement.remap_routing(routing)
+
         if self.deferred_probs_to_unpermutation:
             return self._token_permutation_with_deferred_probs(
                 hidden_states, routing

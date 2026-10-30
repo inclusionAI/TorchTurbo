@@ -176,6 +176,21 @@ def test_build_from_yaml_with_engineconfig_wrapper(tmp_path):
     assert cfg.activation_checkpointing.enabled is False
 
 
+def test_build_expert_rebalance_from_yaml(tmp_path):
+    content = _engine_config(
+        "moe:\n"
+        "  expert_rebalance:\n"
+        "    enabled: true\n"
+        "    interval_steps: 5\n"
+        "    ema_decay: 0.8\n"
+    )
+    cfg = _build_from_argv(["--tt_config", _write(tmp_path, "cfg.yaml", content)])
+
+    assert cfg.moe.expert_rebalance.enabled is True
+    assert cfg.moe.expert_rebalance.interval_steps == 5
+    assert cfg.moe.expert_rebalance.ema_decay == 0.8
+
+
 def test_build_from_json_with_engineconfig_wrapper(tmp_path):
     data = {
         "engine_config": {
