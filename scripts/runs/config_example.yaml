@@ -39,6 +39,10 @@ engine_config:
   mixed_precision: bf16
   use_deterministic_algorithms: false
 
+  # Fused MoonEP + MegaMoE on Ascend A3.
+  # Swift derives the local token capacity from length, batch size and SP.
+  mega_moe: false
+
   ops:
     policy: auto
     overrides:
