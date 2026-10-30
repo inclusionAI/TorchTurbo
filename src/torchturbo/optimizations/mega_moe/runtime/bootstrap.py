@@ -1,6 +1,7 @@
 """Activate this component's native loader paths before importing Torch."""
 import os
 import importlib.util
+from importlib.metadata import version
 from pathlib import Path
 import sys
 
@@ -17,12 +18,23 @@ NATIVE_LIBRARIES: tuple[str, ...] = (
 def activate() -> bool:
     package = Path(__file__).resolve().parent
     vendor = package / "lib/vendors/mega_moe"
-    if not vendor.is_dir():
-        raise RuntimeError(f"MegaMoE native payload is missing: {vendor}")
+    missing = [name for name in NATIVE_LIBRARIES if not (package / name).is_file()]
+    if missing:
+        raise RuntimeError(
+            f"MegaMoE native libraries are missing: {missing}. "
+            "Run bash scripts/runs/deps/mega_moe.sh once in the training environment."
+        )
     spec = importlib.util.find_spec("shmem")
     if spec is None or spec.origin is None:
-        raise RuntimeError("Install official cann-shmem==1.6.0 before enabling mega_moe")
+        raise RuntimeError(
+            "MegaMoE requires official cann-shmem==1.6.0. "
+            "Run bash scripts/runs/deps/mega_moe.sh once in the training environment."
+        )
+    if version("cann-shmem") != "1.6.0":
+        raise RuntimeError("MegaMoE requires cann-shmem==1.6.0; run bash scripts/runs/deps/mega_moe.sh")
     shmem_lib = Path(spec.origin).resolve().parent / "backends/910"
+    if not all((shmem_lib / name).is_file() for name in ("libshmem.so", "libshmem_utils.so")):
+        raise RuntimeError("The installed cann-shmem package has no complete Ascend 910 runtime")
     paths = {
         "ASCEND_CUSTOM_OPP_PATH": [vendor],
         "LD_LIBRARY_PATH": [vendor / "op_api/lib", shmem_lib],

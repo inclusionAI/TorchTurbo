@@ -58,6 +58,16 @@ RUN git clone --branch v2.10.0 --depth 1 --recurse-submodules --shallow-submodul
 # Install other packages
 RUN pip install py-spy==0.4.2
 
+# Compile MoonEP + MegaMoE against the final Torch ABI during image construction.
+WORKDIR /opt/torchturbo
+COPY pyproject.toml README.md ./
+COPY src ./src
+COPY scripts/runs/deps/mega_moe.sh ./scripts/runs/deps/mega_moe.sh
+RUN bash -c "source /usr/local/Ascend/ascend-toolkit/set_env.sh \
+    && bash scripts/runs/deps/mega_moe.sh --jobs ${MAX_JOBS} \
+    && python -m pip install --no-build-isolation --no-deps -e . \
+    && rm -rf /opt/torchturbo/src/torchturbo/optimizations/mega_moe/build"
+
 # Configure shell startup and SSH access.
 RUN rm -f /etc/profile.d/system-info.sh /etc/motd
 RUN sed -i \
