@@ -1,0 +1,331 @@
+# Copyright 2026 Huawei Technologies Co., Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ============================================================================
+"""
+torchturbo.optimizations.mega_moe.runtime.torch.ops
+=============================================
+Out-of-tree PyTorch operator registration for MoE-FFN operators.
+
+Registers into the ``mega_moe`` PyTorch namespace; does not modify
+op-plugin or any PyTorch source. The operators are accessible via:
+
+    torch.ops.mega_moe.mega_moe(...)
+    torch.ops.mega_moe.mega_moe_grad(...)
+
+Or via the Python wrappers in this module:
+
+    from torchturbo.optimizations.mega_moe.runtime.torch.ops import mega_moe, mega_moe_grad
+
+Forward and backward ACLNN symbols are packaged in one component-owned
+``mega_moe`` vendor. Activate the feature bootstrap before
+importing Torch so CANN can discover that vendor.
+"""
+__all__ = [
+    "mega_moe",
+    "mega_moe_grad",
+    "moe_token_permute_grad",
+    "moe_token_permute_out",
+]
+
+from functools import lru_cache
+
+import torch
+import torch_npu  # noqa: F401  # pylint: disable=unused-import  # Registers native NPU operators.
+
+from torchturbo.optimizations.mega_moe.runtime._loader import (
+    NativeComponentUnavailableError,
+    get_multicore_paths,
+    preload_vendor_library,
+)
+
+
+@lru_cache(maxsize=1)
+def _load_native() -> None:
+    """Register the ABI-specific native adapter once on first operation."""
+    vendor_root, adapter_path = get_multicore_paths()
+    preload_vendor_library(vendor_root)
+    try:
+        torch.ops.load_library(str(adapter_path))
+        if torch.ops.mega_moe.mega_moe_transport_version() != 1:
+            raise RuntimeError("adapter transport ABI mismatch; rebuild the Torch adapter")
+        # Torch exposes operator alias metadata through this private schema attribute.
+        schema = torch.ops.mega_moe.mega_moe_grad.default._schema  # pylint: disable=protected-access
+        dispatch_alias = schema.arguments[0].alias_info.before_set
+        input_grad_alias = schema.arguments[12].alias_info.before_set
+        if not dispatch_alias or dispatch_alias != input_grad_alias:
+            raise RuntimeError("adapter does not declare backward dispatch storage reuse; rebuild the Torch adapter")
+    except (AttributeError, OSError, RuntimeError) as error:
+        raise NativeComponentUnavailableError(
+            "[NATIVE-FRAMEWORK-ADAPTER-LOAD-FAILED] component=multicore framework=torch "
+            f"library={adapter_path} error={error}. "
+            "Check the Python/Torch/torch_npu/CANN version combination and rebuild the Torch adapter."
+        ) from error
+
+
+# ---------------------------------------------------------------------------
+
+
+# Python wrappers — thin pass-through to the registered C++ ops
+# ---------------------------------------------------------------------------
+
+
+def moe_token_permute_out(
+    tokens: torch.Tensor,
+    indices: torch.Tensor,
+    output: torch.Tensor,
+    mapping: torch.Tensor,
+) -> None:
+    """Permute all routed rows directly into caller-owned contiguous storage.
+
+    Args:
+        tokens: Contiguous token states shaped ``[tokens, hidden]``.
+        indices: Contiguous INT32/INT64 expert IDs shaped ``[tokens, top_k]``.
+        output: Output shaped ``[tokens * top_k, hidden]``, matching token dtype.
+        mapping: Independent INT32 inverse mapping shaped ``[tokens * top_k]``.
+    """
+    _load_native()
+    torch.ops.mega_moe.moe_token_permute_out(tokens, indices, output, mapping)
+
+
+def mega_moe_unpermute_grad_out(
+    permuted_tokens: torch.Tensor,
+    grad_output: torch.Tensor,
+    sorted_indices: torch.Tensor,
+    probs: torch.Tensor,
+    grad_permuted: torch.Tensor,
+    grad_probs: torch.Tensor,
+) -> None:
+    """Write routing gradients into owned outputs inside a workspace lease.
+
+    Args:
+        permuted_tokens: Independently saved expert-major forward outputs.
+        grad_output: Token-major output gradients.
+        sorted_indices: Flat INT32 inverse mapping from input permutation.
+        probs: Contiguous FP32 top-k probabilities saved by forward.
+        grad_permuted: Contiguous symmetric source receiving expert-major dY.
+        grad_probs: Independent FP32 output matching the probabilities.
+    """
+    _load_native()
+    torch.ops.mega_moe.mega_moe_unpermute_grad_out(
+        permuted_tokens, grad_output, sorted_indices, probs, grad_permuted, grad_probs,
+    )
+
+
+def mega_moe(
+    dispatch_target: torch.Tensor,
+    dispatch_target_off: torch.Tensor,
+    dispatch_src: torch.Tensor,
+    dispatch_src_off: torch.Tensor,
+    dispatch_size: torch.Tensor,
+    up_proj_weight: torch.Tensor,
+    up_proj_glist: torch.Tensor,
+    up_proj_y: torch.Tensor,
+    swiglu_out: torch.Tensor,
+    down_proj_weight: torch.Tensor,
+    down_proj_glist: torch.Tensor,
+    down_proj_y: torch.Tensor,
+    combine_target: torch.Tensor,
+    combine_target_off: torch.Tensor,
+    combine_src_off: torch.Tensor,
+    combine_size: torch.Tensor,
+    gmm_workspace: torch.Tensor,
+    up_proj_tiling: torch.Tensor,
+    swiglu_tiling: torch.Tensor,
+    down_proj_tiling: torch.Tensor,
+    runtime_config: torch.Tensor,
+    all_event_counters: torch.Tensor,
+    rank_id: int,
+    ep: int,
+    expert_num: int,
+    hidden_size: int,
+    seq_size: int,
+) -> None:
+    """
+    MoE-FFN forward operator.
+
+    Args:
+        dispatch_target: First operator tensor; the detailed ABI is documented below.
+
+    Writes in-place to: dispatch_target, up_proj_y, swiglu_out, down_proj_y,
+                        combine_target.
+    All output tensors must be pre-allocated with correct shapes.
+
+    Args:
+        dispatch_target: First tensor in the fixed flat forward ABI; the complete parameter groups are documented
+            below and retain their registered schema order.
+
+    Parameters
+    ----------
+    dispatch_target, dispatch_target_off, dispatch_src, dispatch_src_off,
+    dispatch_size :
+        AllToAll dispatch buffers — dispatch_target written in-place.
+    up_proj_weight, up_proj_glist :
+        Expert weight and cumulative group sizes for GMM1 (up-projection).
+    up_proj_y, swiglu_out :
+        GMM1 output and SwiGLU output — written in-place.
+    down_proj_weight, down_proj_glist, down_proj_y :
+        Expert weight, cumulative group sizes, and output for GMM2 (down-projection).
+    combine_target, combine_target_off, combine_src_off, combine_size :
+        AllToAll combine buffers — combine_target written in-place.
+    gmm_workspace, up_proj_tiling, swiglu_tiling, down_proj_tiling :
+        Pre-computed tiling tensors (from gen_runtime_data.py).
+    runtime_config :
+        Per-rank runtime config tensor (from gen_runtime_data.py).
+    all_event_counters :
+        Event synchronization counter tensor.
+    rank_id, ep, expert_num, hidden_size, seq_size :
+        Topology / shape attributes.
+    """
+    _load_native()
+    torch.ops.mega_moe.mega_moe(
+        dispatch_target,
+        dispatch_target_off,
+        dispatch_src,
+        dispatch_src_off,
+        dispatch_size,
+        up_proj_weight,
+        up_proj_glist,
+        up_proj_y,
+        swiglu_out,
+        down_proj_weight,
+        down_proj_glist,
+        down_proj_y,
+        combine_target,
+        combine_target_off,
+        combine_src_off,
+        combine_size,
+        gmm_workspace,
+        up_proj_tiling,
+        swiglu_tiling,
+        down_proj_tiling,
+        runtime_config,
+        all_event_counters,
+        all_event_counters,
+        rank_id,
+        ep,
+        expert_num,
+        hidden_size,
+        seq_size,
+    )
+
+
+def mega_moe_grad(
+    dispatch_target: torch.Tensor,
+    dispatch_target_off: torch.Tensor,
+    dy: torch.Tensor,
+    dispatch_src_off: torch.Tensor,
+    dispatch_size: torch.Tensor,
+    hidden: torch.Tensor,
+    hidden_dw: torch.Tensor,
+    w2: torch.Tensor,
+    act_grad_y: torch.Tensor,
+    gate: torch.Tensor,
+    grad_gate: torch.Tensor,
+    w1: torch.Tensor,
+    gate_dx: torch.Tensor,
+    grad_x: torch.Tensor,
+    combine_target_off: torch.Tensor,
+    combine_src_off: torch.Tensor,
+    combine_size: torch.Tensor,
+    permute_out: torch.Tensor,
+    gate_dw: torch.Tensor,
+    group_list: torch.Tensor,
+    act_grad_tiling: torch.Tensor,
+    gate_grad_tiling: torch.Tensor,
+    w1_grad_tiling: torch.Tensor,
+    w2_grad_tiling: torch.Tensor,
+    swiglu_grad_tiling: torch.Tensor,
+    gmm_workspace: torch.Tensor,
+    swiglu_grad_workspace: torch.Tensor,
+    runtime_config: torch.Tensor,
+    all_event_counters: torch.Tensor,
+    rank_id: int,
+    ep: int,
+    expert_num: int,
+    hidden_size: int,
+    seq_size: int,
+) -> None:
+    """Launch the public MoE-FFN backward operator.
+
+    Tensor arguments describe dispatch/combine buffers, saved activations,
+    output gradients, weights, tiling data, workspaces, RuntimeConfig and
+    event counters. Integer arguments describe the rank-local topology and
+    shape. Output and workspace tensors must be pre-allocated; the operator
+    writes gradients and communication results in place.
+
+    Args:
+        dispatch_target: First tensor in the fixed flat backward ABI; remaining tensor and topology arguments retain
+            their registered schema order.
+    """
+    _load_native()
+    torch.ops.mega_moe.mega_moe_grad(
+        dispatch_target,
+        dispatch_target_off,
+        dy,
+        dispatch_src_off,
+        dispatch_size,
+        hidden,
+        hidden_dw,
+        w2,
+        act_grad_y,
+        gate,
+        grad_gate,
+        w1,
+        gate_dx,
+        grad_x,
+        combine_target_off,
+        combine_src_off,
+        combine_size,
+        permute_out,
+        gate_dw,
+        group_list,
+        act_grad_tiling,
+        gate_grad_tiling,
+        w1_grad_tiling,
+        w2_grad_tiling,
+        swiglu_grad_tiling,
+        gmm_workspace,
+        swiglu_grad_workspace,
+        runtime_config,
+        all_event_counters,
+        all_event_counters,
+        rank_id,
+        ep,
+        expert_num,
+        hidden_size,
+        seq_size,
+    )
+
+
+def moe_token_permute_grad(
+    grad_permuted_tokens: torch.Tensor,
+    sorted_indices: torch.Tensor,
+    num_tokens: int,
+    top_k: int,
+) -> torch.Tensor:
+    """Reduce dropless permuted gradients without retaining original token values.
+
+    Args:
+        grad_permuted_tokens: Expert-major gradients with shape [T * K, H].
+        sorted_indices: Int32 inverse mapping returned by token permutation.
+        num_tokens: Original token count T.
+        top_k: Number of routes K per token.
+
+    Returns:
+        Owned [T, H] gradients with the input gradient's dtype and device.
+    """
+    _load_native()
+    return torch.ops.mega_moe.moe_token_permute_grad(
+        grad_permuted_tokens, sorted_indices, num_tokens, top_k
+    )
