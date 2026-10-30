@@ -65,7 +65,7 @@ class MoonEPMegaMoeBackend(RoutedExpertsBackend):
             executor.symmetric_bytes
             for executor in self.executors.values()
         ]
-        native_bytes = sum(layouts) * (2 * local_experts + 4)
+        native_bytes = sum(layouts)
         transfer_bytes = (
             2 * local_experts * 3 * config.hidden_size * config.moe_ffn_hidden_size * 2
         )
@@ -86,7 +86,8 @@ class MoonEPMegaMoeBackend(RoutedExpertsBackend):
         )
         self.resources.execution_pools.append(self.plan_pool)
         _automatic.register(self.close, self.ep_group)
-
+        for _, limit in self.modes:
+            self.plan_pool.prepare_all(hidden, config, limit)
 
     def execute(
         self,
