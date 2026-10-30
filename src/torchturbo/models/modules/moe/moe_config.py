@@ -65,6 +65,12 @@ class MoEConfig:
     moe_token_dispatcher_type: str = "allgather"
     """Fuse token rearrangement ops during token dispatching."""
     moe_permute_fusion: bool = False
+    """Periodically re-place experts across EP ranks by observed token load."""
+    moe_expert_rebalance: bool = False
+    """Steps between expert re-placement decisions."""
+    moe_expert_rebalance_interval_steps: int = 20
+    """EMA decay for the expert load estimate used by the placement solver."""
+    moe_expert_rebalance_ema_decay: float = 0.9
     """Apply probs on input of experts instead of applying after activation and glu."""
     moe_apply_probs_on_input: bool = False
     """Per-layer swiglu limit for clamping gate/up values in SwiGLU activation."""

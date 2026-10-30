@@ -47,6 +47,13 @@ def _replace_moe_only(
         moe_swiglu_limit=getattr(hf_config, "expert_swiglu_limit_list", None),
         # Match BailingMoeV3MLP, which computes min(silu(gate), limit).
         moe_swiglu_clamp_gate_after_activation=True,
+        moe_expert_rebalance=engine_config.moe.expert_rebalance.enabled,
+        moe_expert_rebalance_interval_steps=(
+            engine_config.moe.expert_rebalance.interval_steps
+        ),
+        moe_expert_rebalance_ema_decay=(
+            engine_config.moe.expert_rebalance.ema_decay
+        ),
     )
     moe_config = MoEConfig(**moe_config_kwargs)
     layer_number = getattr(original_module, "layer_idx", None)

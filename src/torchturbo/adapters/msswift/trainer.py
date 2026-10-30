@@ -239,11 +239,32 @@ class TurboTrainerMixin:
                 profiling_enabled,
                 memory_snapshot_steps,
             )
+        if (
+            engine is not None
+            and engine.config.moe.expert_rebalance.enabled
+        ):
+            self.add_callback(self._make_expert_rebalance_callback())
         try:
             return super().train(*args, **kwargs)
         finally:
             if profiling_enabled or memory_snapshot_steps is not None:
                 engine.stop_profiling()
+
+    def _make_expert_rebalance_callback(self):
+        from transformers import TrainerCallback
+
+        from ...models.modules.moe.expert_placement import ExpertPlacementManager
+
+        trainer = self
+
+        class ExpertRebalanceCallback(TrainerCallback):
+            def on_step_end(self, args, state, control, **kwargs):
+                manager = ExpertPlacementManager.active()
+                if manager is not None:
+                    manager.on_step_end(trainer.model, trainer.optimizer)
+                return control
+
+        return ExpertRebalanceCallback()
 
     def _make_torchturbo_profiling_callback(self):
         """HF ``TrainerCallback`` that advances TorchTurbo profiling per step.
