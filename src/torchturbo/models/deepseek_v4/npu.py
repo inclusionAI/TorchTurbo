@@ -9,25 +9,15 @@ from torchturbo.ops import ops
 from .packing_utils import _segment_spans
 
 
-def patch_deepseek_v4_npu_sfa_li(
-    sp_rank: int, sp_group: torch.distributed.ProcessGroup | None, sp_size: int
-) -> None:
+def patch_deepseek_v4_npu_sfa_li(sp_rank: int, sp_group, sp_size: int):
     """Install fused NPU sparse-attention and lightning-indexer forwards."""
     from . import modeling_deepseek_v4 as dsv4
 
-    native_sfa_forward = dsv4.SparseAttention.forward
-
-    def sparse_attention_forward(self, *args, **kwargs):
-        # CANN supports a 128-token window; keep the model's PyTorch path
-        # for configurations outside that kernel contract.
-        if self.window_size != 128:
-            return native_sfa_forward(self, *args, **kwargs)
-        return _npu_sfa(self, *args, sp_rank=sp_rank, **kwargs)
-
-    dsv4.SparseAttention.forward = sparse_attention_forward
+    dsv4.SparseAttention.forward = partialmethod(_npu_sfa, sp_rank=sp_rank)
     dsv4.LiCompute.forward = partialmethod(
         _npu_li,
         sp_rank=sp_rank,
+        sp_group=sp_group,
         sp_size=sp_size,
     )
 
@@ -310,6 +300,7 @@ def _npu_li(
     q_global_positions: torch.LongTensor,
     segment_ids: torch.Tensor,
     sp_rank: int = 0,
+    sp_group=None,
     sp_size: int = 1,
 ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
     """Fused lightning-indexer forward."""
