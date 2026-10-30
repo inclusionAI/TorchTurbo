@@ -69,14 +69,12 @@ def install(model: nn.Module, config: Any, ep_group: dist.ProcessGroup) -> None:
             raise ValueError("mega_moe requires SwiGLU experts.")
         if layer.config.moe_apply_probs_on_input:
             raise ValueError("mega_moe requires routing weights on expert outputs.")
-
     geometries = {
         (
             layer.config.hidden_size,
             layer.config.moe_ffn_hidden_size,
             layer.config.num_moe_experts,
             layer.config.moe_router_topk,
-            layer.config.moe_swiglu_clamp_gate_after_activation,
         )
         for layer in layers
     }
