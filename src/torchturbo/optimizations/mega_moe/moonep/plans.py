@@ -133,25 +133,64 @@ class SharedMegaMoePlanPool:
             "event_pool_bytes": 0,
         }
 
-    def _state(self, hidden, config, limit):
-        mode = ("post_activation" if config.moe_swiglu_clamp_gate_after_activation else "pre_activation") if limit else "none"
+    def _state(self, hidden: torch.Tensor, config: Any, limit: float) -> dict:
+        maximum = 2 * self.resources.root_size * self.resources.local_experts
+        mode = (
+            (
+                "post_activation"
+                if config.moe_swiglu_clamp_gate_after_activation
+                else "pre_activation"
+            )
+            if limit
+            else "none"
+        )
         key = (mode, limit)
-        if key not in self.states:
-            self.states[key] = {"owner": self.executors[key], "plans": {}, "workspaces": {}}
-        return self.states[key]
+        if key in self.states:
+            return self.states[key]
+        executor = self.executors[key]
+        owner = executor
+        owner.workspace.ensure(owner.spec, hidden.dtype, hidden.device)
+        event_bytes = event_workspace_bytes(owner.spec.ep_size, maximum)
+        stride = (event_bytes + 511) // 512 * 512
+        slots = self.resources.local_experts + 1
+        pools = tuple(
+            shmem.empty((stride * slots,), dtype=torch.uint8, alignment=512)
+            for _ in range(2)
+        )
+        state = {
+            "owner": owner,
+            "pools": pools,
+            "stride": stride,
+            "plans": {},
+            "workspaces": {},
+        }
+        self.states[key] = state
+        self.statistics["data_workspaces"] += 1
+        self.statistics["event_pool_bytes"] += 2 * stride * slots
+        return state
 
-    def _plan(self, state, experts, extra, device, nominal=False, batch=False):
+    def _plan(
+        self, state: dict, experts: int, extra: int, device: torch.device, nominal: bool = False, batch: bool = False
+    ) -> tuple[Any, MegaMoeWorkspace]:
         key = (extra, nominal, batch)
         if key not in state["plans"]:
-            spec = replace(state["owner"].spec, num_experts=experts,
-                           nominal_schedule=nominal, batch_experts=batch)
-            state["plans"][key] = build_mega_moe_plan(spec, device)
-            workspace = MegaMoeWorkspace(shared=True)
-            workspace.capacity_floor = state["owner"].workspace.capacity_floor
-            workspace.ensure(spec, state["owner"].workspace.dtype or torch.bfloat16, device)
-            state["workspaces"][key] = workspace
+            started = time.perf_counter()
+            with torch.profiler.record_function(f"MoonEP::build_plan_C{extra}"):
+                owner = state["owner"]
+                spec = replace(owner.spec, num_experts=experts, nominal_schedule=nominal, batch_experts=batch)
+                plan = build_mega_moe_plan(spec, device)
+                size = event_workspace_bytes(spec.ep_size, spec.num_experts)
+                begin = extra * state["stride"]
+                view = SharedPlanWorkspace(
+                    owner.workspace,
+                    state["pools"][0][begin : begin + size],
+                    state["pools"][1][begin : begin + size],
+                    mega_moe_event_capacity(spec.num_experts, spec.ep_size) * 4,
+                )
+                state["plans"][key] = plan
+                state["workspaces"][key] = view
             self.statistics["plan_builds"] += 1
-            self.statistics["data_workspaces"] += 1
+            self.statistics["plan_build_seconds"] += time.perf_counter() - started
         return state["plans"][key], state["workspaces"][key]
 
     def prepare_all(self, hidden: torch.Tensor, config: Any, limit: float) -> None:
@@ -244,8 +283,12 @@ class SharedMegaMoePlanPool:
 
     def close(self) -> None:
         for state in self.states.values():
-            for workspace in state["workspaces"].values():
-                workspace.close()
+            assert (
+                not state["owner"].workspace.in_use
+                and not state["owner"].workspace.graphs
+            )
+            for pool in state["pools"]:
+                shmem.free(pool)
 
 
 def bucket_extra_width(needed: int, local_experts: int) -> int:
