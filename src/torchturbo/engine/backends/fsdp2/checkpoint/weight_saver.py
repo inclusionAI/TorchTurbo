@@ -451,6 +451,12 @@ class ShardedParamManager:
         return full_sd
 
     def _normalize_tensor(self, name, tensor):
+        # Model-specific save-side fixups (e.g. re-padding tensors that the
+        # load hook narrowed) run before dtype conversion so the hook sees
+        # the trained values in their working dtype.
+        tensor = self.param_converter.model_to_hf_tensor(
+            name, tensor
+        )
         dtype = self.param_converter.get_default_hf_dtype(name)
         tensor = tensor.to(dtype).contiguous()
         if self.move_to_cpu:

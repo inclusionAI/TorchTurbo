@@ -67,7 +67,23 @@ class BaseWeightConverter:
         # Transformers 5.x populates this fully-expanded {target: source}
         # mapping in PreTrainedModel.post_init(). Keep that authoritative
         # snapshot instead of re-expanding names after Turbo/FSDP rewrites.
-        self.tied_weight_keys = dict(model.all_tied_weights_keys)
+        self.tied_weight_keys = dict(getattr(model, "all_tied_weights_keys", None) or {})
+
+    def hf_to_model_tensor(self, hf_name: str, tensor):
+        """Per-tensor fixup applied to a full checkpoint tensor before FSDP
+        sharding/broadcast (load direction). Default is identity; override
+        for model-specific repairs (e.g. narrowing zero-padded release
+        tensors)."""
+        return tensor
+
+    def model_to_hf_tensor(self, hf_name: str, tensor):
+        """Save-direction counterpart of hf_to_model_tensor.
+
+        Applied to each full tensor before it is written to the HF-format
+        checkpoint, so a model whose load hook repairs an official release
+        layout (e.g. narrowing a zero-padded tensor) exports checkpoints in
+        that same official layout again. Default is identity."""
+        return tensor
 
     def get_omitted_tied_source(self, model_name, hf_name):
         """Return the present checkpoint source for an omitted tied target.
