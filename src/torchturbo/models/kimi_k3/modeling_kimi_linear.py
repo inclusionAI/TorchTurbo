@@ -69,6 +69,7 @@ except ImportError:
 # e.g. old triton-ascend aicore timeout).
 from torchturbo import ops
 
+from .chunk_kda_naive import chunk_kda_naive
 from .configuration_kimi_k3 import KimiLinearConfig
 
 assert version.parse(transformers.__version__) >= version.parse("4.56.0"), \
@@ -680,30 +681,45 @@ class KimiDeltaAttention(nn.Module):
 
         if mode == 'chunk':
             # Routed through the shared ops.kda facade (fla_kda on GPU,
-            # ascendc_kda on NPU; naive impl is private per model).
-            # kda_implementation='naive' forces the private naive impl
-            # (for stacks where the kernel imports but deadlocks at runtime).
-            o, recurrent_state = ops.kda(
-                q=q,
-                k=k,
-                v=v,
-                g=g,
-                beta=beta,
-                A_log=self.A_log,
-                dt_bias=self.dt_bias,
-                initial_state=recurrent_state,
-                output_final_state=True,
-                use_qk_l2norm_in_kernel=True,
-                use_gate_in_kernel=True,
-                safe_gate=self.gate_lower_bound is not None,
-                lower_bound=self.gate_lower_bound,
-                cu_seqlens=cu_seqlens,
-                impl=(
-                    "naive_chunk_kda"
-                    if getattr(self.config, 'kda_implementation', 'fused') == 'naive'
-                    else None
-                ),
-            )
+            # ascendc_kda on NPU). kda_implementation='naive' bypasses the
+            # registry and calls the model-private pure-PyTorch impl
+            # directly (for stacks where the kernel imports but deadlocks
+            # at runtime, e.g. old triton-ascend aicore timeout).
+            if getattr(self.config, 'kda_implementation', 'fused') == 'naive':
+                o, recurrent_state = chunk_kda_naive(
+                    q=q,
+                    k=k,
+                    v=v,
+                    g=g,
+                    beta=beta,
+                    A_log=self.A_log,
+                    dt_bias=self.dt_bias,
+                    initial_state=recurrent_state,
+                    output_final_state=True,
+                    use_qk_l2norm_in_kernel=True,
+                    use_gate_in_kernel=True,
+                    safe_gate=self.gate_lower_bound is not None,
+                    lower_bound=self.gate_lower_bound,
+                    cu_seqlens=cu_seqlens,
+                    transpose_state_layout=True,
+                )
+            else:
+                o, recurrent_state = ops.kda(
+                    q=q,
+                    k=k,
+                    v=v,
+                    g=g,
+                    beta=beta,
+                    A_log=self.A_log,
+                    dt_bias=self.dt_bias,
+                    initial_state=recurrent_state,
+                    output_final_state=True,
+                    use_qk_l2norm_in_kernel=True,
+                    use_gate_in_kernel=True,
+                    safe_gate=self.gate_lower_bound is not None,
+                    lower_bound=self.gate_lower_bound,
+                    cu_seqlens=cu_seqlens,
+                )
         else:
             o, recurrent_state = fused_recurrent_kda(
                 q=q,

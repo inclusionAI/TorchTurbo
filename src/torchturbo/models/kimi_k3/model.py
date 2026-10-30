@@ -425,21 +425,31 @@ class TurboKimiK3ForConditionalGeneration(
 
             # Same routing as the official forward: shared ops.kda facade
             # (fla_kda on GPU, ascendc_kda on NPU; kda_implementation='naive'
-            # forces the private naive impl).
+            # calls the model-private pure-PyTorch impl directly).
             from torchturbo import ops
 
             kda_impl = getattr(self.config, "kda_implementation", "naive")
-            impl = None if kda_impl == "fused" else "naive_chunk_kda"
 
-            o, _ = ops.kda(
-                q=q, k=k, v=v, g=g, beta=beta,
-                A_log=A_log_local, dt_bias=dt_bias_local,
-                initial_state=None, output_final_state=True,
-                use_qk_l2norm_in_kernel=True, use_gate_in_kernel=True,
-                safe_gate=getattr(self, "safe_gate", False),
-                lower_bound=self.gate_lower_bound,
-                impl=impl,
-            )
+            if kda_impl == "naive":
+                from .chunk_kda_naive import chunk_kda_naive
+
+                o, _ = chunk_kda_naive(
+                    q=q, k=k, v=v, g=g, beta=beta,
+                    A_log=A_log_local, dt_bias=dt_bias_local,
+                    initial_state=None, output_final_state=True,
+                    use_qk_l2norm_in_kernel=True, use_gate_in_kernel=True,
+                    safe_gate=getattr(self, "safe_gate", False),
+                    lower_bound=self.gate_lower_bound,
+                )
+            else:
+                o, _ = ops.kda(
+                    q=q, k=k, v=v, g=g, beta=beta,
+                    A_log=A_log_local, dt_bias=dt_bias_local,
+                    initial_state=None, output_final_state=True,
+                    use_qk_l2norm_in_kernel=True, use_gate_in_kernel=True,
+                    safe_gate=getattr(self, "safe_gate", False),
+                    lower_bound=self.gate_lower_bound,
+                )
 
             o = gather_heads_scatter_seq(o, seq_dim=1, head_dim=2, sp_group=sp_group, sp_size=sp_size)
 
