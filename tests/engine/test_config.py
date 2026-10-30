@@ -533,6 +533,110 @@ def test_engine_config_from_dict_rejects_unknown_freeze_policy_fields():
         )
 
 
+def test_freeze_policy_from_list_splits_groups_and_patterns():
+    from torchturbo.engine.config import FreezePolicy
+    from torchturbo.engine.config import ParameterGroup
+
+    policy = FreezePolicy.from_list(
+        [
+            ParameterGroup.VISION_TOWER,
+            "vision_tower",
+            "model.layers.*.mlp.**",
+            "  lm_head.weight  ",
+            "model.layers.*.mlp.**",
+        ]
+    )
+
+    assert policy.parameter_groups == (ParameterGroup.VISION_TOWER,)
+    assert policy.patterns == ("model.layers.*.mlp.**", "lm_head.weight")
+    assert policy.enabled is True
+
+
+def test_freeze_policy_from_list_rejects_empty_or_non_string_patterns():
+    from torchturbo.engine.config import FreezePolicy
+
+    with pytest.raises(ValueError, match="non-empty strings"):
+        FreezePolicy.from_list(["   "])
+
+    with pytest.raises(TypeError, match="ParameterGroup members or strings"):
+        FreezePolicy.from_list([123])
+
+
+def test_freeze_policy_enabled_false_when_empty():
+    from torchturbo.engine.config import FreezePolicy
+
+    assert FreezePolicy().enabled is False
+    assert FreezePolicy(patterns=()).enabled is False
+
+
+def test_engine_config_from_dict_parses_freeze_policy_patterns():
+    from torchturbo.engine.config import EngineConfig
+    from torchturbo.engine.config import ParameterGroup
+
+    cfg = EngineConfig.from_dict(
+        {
+            "backend": "fsdp2",
+            "freeze_policy": {
+                "parameter_groups": ["vision_tower"],
+                "patterns": ["model.layers.*.q_proj.weight", "lm_head.weight"],
+            },
+        }
+    )
+
+    assert cfg.freeze_policy.parameter_groups == (ParameterGroup.VISION_TOWER,)
+    assert cfg.freeze_policy.patterns == (
+        "model.layers.*.q_proj.weight",
+        "lm_head.weight",
+    )
+
+
+def test_engine_config_from_dict_parses_freeze_policy_patterns_only():
+    from torchturbo.engine.config import EngineConfig
+
+    cfg = EngineConfig.from_dict(
+        {
+            "backend": "fsdp2",
+            "freeze_policy": {"patterns": ["model.layers.**"]},
+        }
+    )
+
+    assert cfg.freeze_policy.parameter_groups == ()
+    assert cfg.freeze_policy.patterns == ("model.layers.**",)
+
+
+def test_engine_config_from_dict_parses_scalar_freeze_entries():
+    from torchturbo.engine.config import EngineConfig
+    from torchturbo.engine.config import ParameterGroup
+
+    cfg = EngineConfig.from_dict(
+        {
+            "backend": "fsdp2",
+            "freeze_policy": {
+                "parameter_groups": "vision_tower",
+                "patterns": "lm_head.weight",
+            },
+        }
+    )
+
+    assert cfg.freeze_policy.parameter_groups == (ParameterGroup.VISION_TOWER,)
+    assert cfg.freeze_policy.patterns == ("lm_head.weight",)
+
+
+def test_engine_config_from_dict_parses_freeze_policy_list_form():
+    from torchturbo.engine.config import EngineConfig
+    from torchturbo.engine.config import ParameterGroup
+
+    cfg = EngineConfig.from_dict(
+        {
+            "backend": "fsdp2",
+            "freeze_policy": ["language_model", "model.layers.*.mlp.**"],
+        }
+    )
+
+    assert cfg.freeze_policy.parameter_groups == (ParameterGroup.LANGUAGE_MODEL,)
+    assert cfg.freeze_policy.patterns == ("model.layers.*.mlp.**",)
+
+
 def test_engine_config_from_dict_parses_mtp_config():
     from torchturbo.engine.config import EngineConfig
 

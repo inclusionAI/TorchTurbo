@@ -137,6 +137,11 @@ engine_config:
     vision_tower: false
     multi_modal_projector: false
     language_model: false
+    # YAML-only FQN wildcard patterns ('*' one segment, '**' multiple) to
+    # freeze arbitrary parameters, matched on base-model FQNs.
+    # patterns:
+    #   - "model.layers.*.self_attn.**"
+    #   - "lm_head.weight"
 
   diffusion:
     cap_lambda: 0.0
