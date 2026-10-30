@@ -28,6 +28,7 @@ class MoonEPMegaMoeBackend(RoutedExpertsBackend):
         self.plan_pool = None
         self.executors: dict[tuple[str, float], Any] = {}
 
+    @torch.inference_mode(False)
     def _initialize(self, hidden: torch.Tensor, config: Any) -> None:
         from ..runtime import _automatic, shmem
         from ..runtime.resources import ExecutionResources
