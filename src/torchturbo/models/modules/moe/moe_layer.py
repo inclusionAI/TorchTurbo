@@ -106,6 +106,7 @@ class MoELayer(BaseMoELayer):
     ):
         self.use_fused_permute_unpermute = use_fused_permute_unpermute
         self.use_te = use_te
+        self._routed_experts_backend = None
         self.submodules = submodules
         super(MoELayer, self).__init__(
             config=config, ep_group=ep_group, layer_number=layer_number
@@ -162,25 +163,30 @@ class MoELayer(BaseMoELayer):
                     probs=routing.probs / routing.probs.sum(dim=-1, keepdim=True),
                 )
             logits = logits.view(-1, logits.shape[-1])
-            (dispatched_input, tokens_per_expert, permuted_probs) = (
-                self.token_dispatcher.token_permutation(
-                    hidden_states, routing
-                )
-            )
-            expert_output, mlp_bias = self.experts(
-                dispatched_input, tokens_per_expert, permuted_probs
-            )
-
-            if self.token_dispatcher.deferred_probs_to_unpermutation:
-                probs_for_unpermutation = routing.selected_probs()
-                output, mlp_bias = self.token_dispatcher.token_unpermutation(
-                    expert_output, mlp_bias, probs=probs_for_unpermutation
+            if self._routed_experts_backend is not None:
+                output, mlp_bias = self._routed_experts_backend.route(
+                    self.experts, hidden_states, routing.probs, routing.routing_map
                 )
             else:
-                expert_output = expert_output * permuted_probs.unsqueeze(-1)
-                output, mlp_bias = self.token_dispatcher.token_unpermutation(
-                    expert_output, mlp_bias
+                (dispatched_input, tokens_per_expert, permuted_probs) = (
+                    self.token_dispatcher.token_permutation(
+                        hidden_states, routing
+                    )
                 )
+                expert_output, mlp_bias = self.experts(
+                    dispatched_input, tokens_per_expert, permuted_probs
+                )
+
+                if self.token_dispatcher.deferred_probs_to_unpermutation:
+                    probs_for_unpermutation = routing.selected_probs()
+                    output, mlp_bias = self.token_dispatcher.token_unpermutation(
+                        expert_output, mlp_bias, probs=probs_for_unpermutation
+                    )
+                else:
+                    expert_output = expert_output * permuted_probs.unsqueeze(-1)
+                    output, mlp_bias = self.token_dispatcher.token_unpermutation(
+                        expert_output, mlp_bias
+                    )
             output = output.to(hidden_states_dtype)
 
             if hasattr(self, "shared_expert") and self.shared_expert is not None:
@@ -195,7 +201,7 @@ class MoELayer(BaseMoELayer):
                 shared_expert_output = self.shared_experts(hidden_states)
                 output = output + shared_expert_output
 
-            if rank == 0 and int(os.environ.get('TORCH_TURBO_DEBUG', '0')):
+            if self._routed_experts_backend is None and rank == 0 and int(os.environ.get('TORCH_TURBO_DEBUG', '0')):
                 logger.debug_rank0(
                     "hidden_states.shape %s hidden_states %s",
                     hidden_states.shape, hidden_states,
