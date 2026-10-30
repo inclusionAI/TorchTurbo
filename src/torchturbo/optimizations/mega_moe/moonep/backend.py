@@ -106,6 +106,11 @@ class MoonEPMegaMoeBackend(RoutedExpertsBackend):
         if hidden_states.dtype != torch.bfloat16 or hidden_states.device.type != "npu":
             raise ValueError("MegaMoE + MoonEP requires BF16 NPU activations.")
         config = experts.config
+        # Preserve the autograd cast from FP32 master parameters.
+        weights = tuple(
+            weight.to(hidden_states.dtype)
+            for weight in (experts.weight1, experts.weight2)
+        )
         shape = hidden_states.shape
         flat = hidden_states.reshape(-1, config.hidden_size)
         tokens = flat.shape[0]
@@ -132,8 +137,8 @@ class MoonEPMegaMoeBackend(RoutedExpertsBackend):
             from .local_routing import LocalRouting
 
             routed, mapping, counts = LocalRouting.apply(flat, indices, config.num_moe_experts)
-            weight1 = experts.weight1.view(config.num_moe_experts, config.hidden_size, -1)
-            weight2 = experts.weight2.view(config.num_moe_experts, -1, config.hidden_size)
+            weight1 = weights[0].view(config.num_moe_experts, config.hidden_size, -1)
+            weight2 = weights[1].view(config.num_moe_experts, -1, config.hidden_size)
             projected = ops.grouped_matmul(routed, weight1, counts, trans_b=False)
             activated = experts.activation_func_with_probs(projected, None)
             projected = ops.grouped_matmul(activated, weight2, counts, trans_b=False)
@@ -163,7 +168,7 @@ class MoonEPMegaMoeBackend(RoutedExpertsBackend):
             flat,
             planned.virtual_ids,
             probs,
-            (experts.weight1, experts.weight2),
+            weights,
             virtual_config,
             experts.swiglu_limit or 0.0,
             planned.copies,
