@@ -87,8 +87,11 @@ class MoonEPMegaMoeBackend(RoutedExpertsBackend):
         )
         self.resources.execution_pools.append(self.plan_pool)
         _automatic.register(self.close, self.ep_group)
-        for _, limit in self.modes:
-            self.plan_pool.prepare_all(hidden, config, limit)
+        for mode, limit in self.modes:
+            mode_config = replace(
+                config, moe_swiglu_clamp_gate_after_activation=mode == "post_activation"
+            )
+            self.plan_pool.prepare_all(hidden, mode_config, limit)
 
     def execute(
         self,
