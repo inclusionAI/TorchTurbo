@@ -84,3 +84,62 @@ class BaseVisionBalanceIO(ABC):
         """Build minimal valid media for a rank the distribution assigns no
         media, which happens when the world pool holds fewer media than
         ranks."""
+
+
+class PackedPatchVisionBalanceIO(BaseVisionBalanceIO):
+    """Shared input layout for towers taking flat patches and THW grids."""
+
+    @abstractmethod
+    def output_lengths(
+        self, tower: nn.Module, grid_thw: torch.Tensor
+    ) -> dict[str, list[int]]:
+        """Describe each model-owned output stream's rows per medium."""
+
+    def read_inputs(
+        self, tower: nn.Module, args: tuple[Any, ...], kwargs: dict[str, Any]
+    ) -> VisionBatch:
+        pixels = args[0] if args else kwargs.get("hidden_states")
+        grid_thw = args[1] if len(args) > 1 else kwargs.get("grid_thw")
+        if pixels is None or grid_thw is None:
+            raise ValueError(
+                "Vision balance requires hidden_states and grid_thw together"
+            )
+        return VisionBatch(pixels, grid_thw, self.output_lengths(tower, grid_thw))
+
+    def write_inputs(
+        self,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+        batch: VisionBatch,
+    ) -> tuple[tuple[Any, ...], dict[str, Any]]:
+        new_args = list(args)
+        new_kwargs = dict(kwargs)
+        if new_args:
+            new_args[0] = batch.pixels
+        else:
+            new_kwargs["hidden_states"] = batch.pixels
+        if len(new_args) > 1:
+            new_args[1] = batch.grid_thw
+        else:
+            new_kwargs["grid_thw"] = batch.grid_thw
+        return tuple(new_args), new_kwargs
+
+    def make_dummy(self, tower: nn.Module) -> VisionBatch:
+        parameter = next(tower.parameters())
+        merge = tower.spatial_merge_size
+        patch_embed = tower.patch_embed
+        pixel_width = (
+            patch_embed.in_channels
+            * patch_embed.temporal_patch_size
+            * patch_embed.patch_size**2
+        )
+        grid_thw = torch.tensor(
+            [[1, merge, merge]], dtype=torch.long, device=parameter.device
+        )
+        return VisionBatch(
+            pixels=torch.zeros(
+                merge**2, pixel_width, dtype=parameter.dtype, device=parameter.device
+            ),
+            grid_thw=grid_thw,
+            output_lengths=self.output_lengths(tower, grid_thw),
+        )

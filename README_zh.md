@@ -62,7 +62,8 @@ def get_parallel_plan() -> FSDPParallelPlan:
 
 包装类通过 `get_default_parallel_plan()` 返回该策略。引擎随后将 `EngineConfig.parallel_plan` 合并到默认策略中，其中包括通过环境变量、配置文件或 CLI 参数指定的运行时 `sp_size` 和 `ep_size`。
 
-视觉编码均衡直接配置在兼容模块的 plan 条目中。Bailing V3 VL 可以在
+视觉编码均衡直接配置在兼容模块的 plan 条目中。Bailing V3 VL 和 Qwen3.5 Dense
+（包括 Qwen3.8-27B）可以在
 `--tt_config` 指定的文件里为 `model.visual` 开启：
 
 ```yaml
@@ -75,7 +76,7 @@ engine_config:
 ```
 
 `patch` 按整份媒体的 patch 数估算负载，`patch_sq` 使用 patch 数的平方。
-模型的 Python plan 提供 `VisionBalanceSpec(io=BailingVisionBalanceIO())`，
+模型的 Python plan 提供对应模型的 `VisionBalanceSpec(io=...)`，
 默认 `mode=None`，保持关闭。配置文件只覆盖 mode 时，会保留模型声明的 I/O 实例。
 Python 调用使用 `VisionBalanceMode.PATCH` 或 `VisionBalanceMode.PATCH_SQ`；
 文件中的文本在解析时转换成 enum。
@@ -84,7 +85,12 @@ Python 调用使用 `VisionBalanceMode.PATCH` 或 `VisionBalanceMode.PATCH_SQ`�
 以及合法 dummy 输入的构造。`VisionBatch` 描述按媒体拼接的 patch、网格和各输出字段中
 每个媒体对应的行数。`register_vision_balance` 通过这个实例，在交换媒体、恢复顺序后
 保持原有参数及返回格式。所有 WORLD rank 必须按相同顺序进入该调用边界。
-目前 Bailing V3 VL 提供了对应实现，其他 tower 需要提供自己的 I/O 协议。
+目前 Bailing V3 VL 和 Qwen3.5 Dense 提供了对应实现，其他 tower 需要提供自己的 I/O 协议。
+Qwen3.5 会同时恢复 `last_hidden_state` 和 `pooler_output`。其 ms-swift 模板将图片和
+视频合并为一次视觉塔调用，并为纯文本 batch 提供 dummy 媒体，满足集体通信的调用约定。
+直接调用模型时，开启均衡也必须遵守这个约定。27B 是 Dense 模型，使用 `ep_size: 1`。
+CANN 9.0 / A3 环境启动前设置 `HCCL_OP_EXPANSION_MODE=AICPU_CacheDisable`，
+规避已观察到的 HCCL AlltoAllV 缓存元数据错误。
 
 ### Backend
 当前 backend：

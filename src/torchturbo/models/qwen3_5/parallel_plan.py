@@ -1,4 +1,5 @@
-from ...parallel import FSDPPlanSpec, FSDPParallelPlan
+from ...parallel import FSDPPlanSpec, FSDPParallelPlan, VisionBalanceSpec
+from .vision_balance import Qwen3_5VisionBalanceIO
 
 
 def get_parallel_plan() -> FSDPParallelPlan:
@@ -13,6 +14,7 @@ def get_parallel_plan() -> FSDPParallelPlan:
             ),
             "model.visual": FSDPPlanSpec(
                 standalone_world_shard=True,
+                vision_balance=VisionBalanceSpec(io=Qwen3_5VisionBalanceIO()),
             ),
             "model.language_model.embed_tokens": FSDPPlanSpec(
                 standalone_world_shard=True,

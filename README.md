@@ -77,7 +77,8 @@ def get_parallel_plan() -> FSDPParallelPlan:
 The wrapper class returns this plan from `get_default_parallel_plan()`. The engine then merges `EngineConfig.parallel_plan` into it, including runtime `sp_size` and `ep_size` values supplied through environment variables, a configuration file, or CLI arguments.
 
 Vision balancing is configured on a compatible module's plan entry. For Bailing
-V3 VL, enable it on `model.visual` in the file passed to `--tt_config`:
+V3 VL and Qwen3.5 dense (including Qwen3.8-27B), enable it on `model.visual` in
+the file passed to `--tt_config`:
 
 ```yaml
 engine_config:
@@ -89,7 +90,7 @@ engine_config:
 ```
 
 `patch` weights whole media by patch count; `patch_sq` uses squared patch count.
-The model's Python plan supplies `VisionBalanceSpec(io=BailingVisionBalanceIO())`;
+The model's Python plan supplies a model-specific `VisionBalanceSpec(io=...)`;
 its default `mode=None` leaves balancing disabled. A mode-only file override
 preserves that I/O instance. Python callers use `VisionBalanceMode.PATCH` or
 `VisionBalanceMode.PATCH_SQ`; file values are converted to the enum when parsed.
@@ -100,7 +101,14 @@ declares packed patch rows, media grids, and per-medium lengths for each output
 stream. `register_vision_balance` uses the instance to preserve the model's
 argument and return formats while exchanging media and restoring their order.
 The boundary must be called in the same order on every WORLD rank. Bailing V3 VL
-provides this implementation; other towers require their own I/O contract.
+and Qwen3.5 dense provide this implementation; other towers require their own
+I/O contract. Qwen3.5 restores both `last_hidden_state` and `pooler_output`.
+Its ms-swift template combines images and videos in one tower call and gives
+text-only batches dummy media, satisfying this collective call contract.
+Direct model callers must maintain the same contract when enabling balancing.
+For the dense 27B model, use `ep_size: 1`.
+On CANN 9.0 / A3, set `HCCL_OP_EXPANSION_MODE=AICPU_CacheDisable` before launch
+to work around the observed HCCL AlltoAllV cache metadata failure.
 
 ### Backend
 
