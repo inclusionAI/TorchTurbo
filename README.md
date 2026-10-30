@@ -246,8 +246,8 @@ Before running a script, you will typically need to check:
 ### Checkpoints
 
 Training checkpoints let you resume an interrupted run. Model weights are saved
-in DCP format. For inference or sharing, export the model to HF format; LoRA/DoRA
-weights are merged into the model during export.
+in DCP format. For inference or sharing, export the model to HF format; by
+default, LoRA/DoRA weights are merged into the model during export.
 
 ```text
 checkpoint-<step>/
@@ -263,6 +263,11 @@ is `checkpoint.hf_export`:
 
 - `every` (default): export an HF model with every checkpoint.
 - `final`: export an HF model only at the end of training. Intermediate checkpoints still save DCP.
+
+For LoRA runs, `--tt_hf_export_lora` controls the export content. The
+corresponding config field is `checkpoint.hf_export_lora`: `merge` (default)
+writes merged model weights, and `adapter` writes a standalone PEFT adapter
+directory (`adapter_config.json` and `adapter_model.safetensors`).
 
 LlamaFactory saves the final HF model to `<output_dir>/huggingface/`.
 ms-swift saves it inside the last `checkpoint-*/huggingface/`.

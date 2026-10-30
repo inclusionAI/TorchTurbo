@@ -213,7 +213,8 @@ bash scripts/runs/qwen3_5_moe/lf_text_sft.sh
 ### Checkpoint
 
 训练 checkpoint 用于断点续训，其中的模型权重以 DCP 格式保存。
-如果要用模型做推理或分享给别人，可以导出为 HF 格式。LoRA/DoRA 权重会在导出时合并到模型中。
+如果要用模型做推理或分享给别人，可以导出为 HF 格式。默认情况下，LoRA/DoRA
+权重会在导出时合并到模型中。
 
 ```text
 checkpoint-<step>/
@@ -228,6 +229,11 @@ checkpoint-<step>/
 
 - `every`（默认）：每次保存 checkpoint 时，同时导出 HF 模型。
 - `final`：只在训练结束时导出 HF 模型，中间的 checkpoint 仍保存 DCP。
+
+LoRA 训练可使用 `--tt_hf_export_lora` 控制导出内容，对应配置字段为
+`checkpoint.hf_export_lora`：`merge`（默认）导出合并后的完整模型权重；
+`adapter` 导出独立的 PEFT 适配器目录（`adapter_config.json` 和
+`adapter_model.safetensors`）。
 
 训练结束后，LlamaFactory 将 HF 模型保存到 `<output_dir>/huggingface/`，
 ms-swift 保存到最后一个 `checkpoint-*/huggingface/`。

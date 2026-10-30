@@ -747,6 +747,22 @@ def test_hf_export_can_be_seeded_on_torchturbo_args():
     assert checkpoint.hf_export == "every"
 
 
+def test_hf_export_lora_comes_from_file_and_cli(tmp_path):
+    path = _write(
+        tmp_path,
+        "cfg.yaml",
+        _engine_config("checkpoint:\n  hf_export_lora: adapter\n"),
+    )
+
+    assert _build_from_argv(["--tt_config", path]).checkpoint.hf_export_lora == "adapter"
+    assert (
+        _build_from_argv(
+            ["--tt_config", path, "--tt_hf_export_lora", "merge"]
+        ).checkpoint.hf_export_lora
+        == "merge"
+    )
+
+
 def test_default_save_format_is_not_supported(tmp_path):
     path = _write(
         tmp_path,

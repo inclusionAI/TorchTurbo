@@ -144,6 +144,143 @@ def _write_hf_export(checkpoint_dir):
     return hf_dir
 
 
+def test_save_hf_adapter_exports_a_peft_adapter_directory(tmp_path):
+    import peft
+    from safetensors.torch import load_file
+
+    parallel_context = {
+        "ep": {"ep_rank": 0, "ep_size": 1},
+        "sp": {"sp_rank": 0, "sp_size": 1},
+    }
+    checkpoint_manager = FSDP2CheckpointManager(
+        rank=0,
+        mesh={"edp": object()},
+        world_mesh=None,
+        parallel_context=parallel_context,
+        device_runtime=CpuRuntime(),
+        cpu_offload=False,
+        require_optimizer_not_suspended=lambda: None,
+    )
+    model = peft.get_peft_model(
+        ConvertibleModel(),
+        peft.LoraConfig(r=1, target_modules=["layer"], bias="none"),
+    )
+    with torch.no_grad():
+        model.base_model.model.layer.lora_A["default"].weight.fill_(0.5)
+        model.base_model.model.layer.lora_B["default"].weight.fill_(2.0)
+
+    checkpoint_manager.save_hf(
+        model,
+        str(tmp_path),
+        source_path="unused",
+        weight_converter=object(),
+        hf_export_lora="adapter",
+    )
+
+    saved = load_file(str(tmp_path / "adapter_model.safetensors"))
+    expected = peft.get_peft_model_state_dict(model)
+    assert set(saved) == set(expected)
+    for name, tensor in expected.items():
+        torch.testing.assert_close(saved[name], tensor)
+    config = json.loads((tmp_path / "adapter_config.json").read_text())
+    assert config["r"] == 1
+    assert config["peft_type"] == "LORA"
+
+
+def test_adapter_export_requires_lora(manager, tmp_path):
+    config = EngineConfig.from_dict(
+        {"checkpoint": {"hf_export": "final", "hf_export_lora": "adapter"}}
+    )
+    manager._config = config
+    model = ConvertibleModel()
+
+    with pytest.raises(ValueError, match="requires a LoRA model"):
+        manager.save_model(
+            model,
+            str(tmp_path),
+            source_path="unused",
+            format=CheckpointFormat.HF,
+        )
+
+
+def test_save_model_uses_adapter_hf_export_mode(manager, tmp_path):
+    import peft
+    from safetensors.torch import load_file
+
+    manager._config = EngineConfig.from_dict(
+        {"checkpoint": {"hf_export": "final", "hf_export_lora": "adapter"}}
+    )
+    model = peft.get_peft_model(
+        ConvertibleModel(),
+        peft.LoraConfig(r=1, target_modules=["layer"], bias="none"),
+    )
+
+    manager.save_model(
+        model,
+        str(tmp_path),
+        source_path="unused",
+        format=CheckpointFormat.HF,
+    )
+
+    export_dir = tmp_path / layout.HF_MODEL_DIR
+    assert set(export_dir.glob("*")) == {
+        export_dir / "adapter_config.json",
+        export_dir / "adapter_model.safetensors",
+    }
+    assert load_file(str(export_dir / "adapter_model.safetensors"))
+
+
+def _expert_lora_gather_worker(rank, init_file):
+    import torch.distributed as dist
+    from torch.distributed.device_mesh import init_device_mesh
+    from torch.distributed.tensor import DTensor, Shard
+
+    parallel_context = {
+        "ep": {"ep_rank": rank % 2, "ep_size": 2},
+        "sp": {"sp_rank": 0, "sp_size": 1},
+    }
+    dist.init_process_group(
+        "gloo", init_method=f"file://{init_file}", rank=rank, world_size=4
+    )
+    try:
+        mesh = init_device_mesh("cpu", (2, 2), mesh_dim_names=("edp", "ep"))
+        checkpoint_manager = FSDP2CheckpointManager(
+            rank=rank,
+            mesh=mesh,
+            world_mesh=mesh,
+            parallel_context=parallel_context,
+            device_runtime=CpuRuntime(),
+            cpu_offload=False,
+            require_optimizer_not_suspended=lambda: None,
+        )
+        edp_rank = mesh.get_local_rank("edp")
+        ep_rank = mesh.get_local_rank("ep")
+        local = torch.full((1, 3, 4), float(2 * ep_rank + edp_rank + 1))
+        edp_shard = DTensor.from_local(local, mesh["edp"], (Shard(0),))
+        gathered = checkpoint_manager._gather_expert_lora_tensor(edp_shard, 4)
+        expected = torch.cat(
+            (
+                torch.full((1, 3, 4), 1.0),
+                torch.full((1, 3, 4), 2.0),
+                torch.full((1, 3, 4), 3.0),
+                torch.full((1, 3, 4), 4.0),
+            ),
+            dim=0,
+        )
+        torch.testing.assert_close(gathered, expected)
+    finally:
+        dist.destroy_process_group()
+
+
+def test_grouped_lora_adapter_gathers_all_ep_experts(tmp_path):
+    torch.multiprocessing.spawn(
+        _expert_lora_gather_worker,
+        args=(str(tmp_path / "init"),),
+        nprocs=4,
+        join=True,
+    )
+
+
 @pytest.mark.parametrize("accelerated", [False, True])
 def test_resume_matches_uninterrupted_training(manager, tmp_path, accelerated):
     from accelerate import Accelerator

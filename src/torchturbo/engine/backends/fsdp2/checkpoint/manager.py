@@ -6,15 +6,23 @@ import os
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
+import torch
+from safetensors.torch import save_file
+from torch.distributed.tensor import DTensor
 import torch.nn as nn
+import torch.distributed as dist
 from torch.optim import Optimizer
 
 from ...base import BaseCheckpointManager
 from ....checkpoint.format import ComponentStatus
+from ....checkpoint.distributed import rank_zero_call
+from ....checkpoint.layout import sync_directory
+from ....utils import strip_peft_prefix
 from .layout import MODEL_DCP_DIR, OPTIMIZER_DCP_DIR, dcp_status
 from .dcp import DcpCheckpoint
 from .weight_loader import DistParamLoader
 from .weight_saver import ShardedParamManager
+
 
 if TYPE_CHECKING:
     from torch.distributed.device_mesh import DeviceMesh
@@ -87,8 +95,127 @@ class FSDP2CheckpointManager(BaseCheckpointManager):
         *,
         source_path: str,
         weight_converter: BaseWeightConverter,
+        hf_export_lora: str = "merge",
     ) -> None:
+        if hf_export_lora == "adapter":
+            self._save_adapter(model, output_dir)
+            return
         self._hf_saver(model, source_path, weight_converter).save_model(output_dir)
+
+    def _save_adapter(self, model: nn.Module, output_dir: str) -> None:
+        """Write a standalone PEFT adapter directory on rank zero.
+
+        Adapter tensors are gathered to full tensors on every rank because
+        LoRA parameters can be DTensors under the backend's parallel mesh.
+        Only rank zero writes the resulting, typically small, state dict.
+        """
+        from peft import get_peft_model_state_dict
+
+        adapter_state_dict = get_peft_model_state_dict(model)
+        expert_tensors = self._grouped_lora_tensors(model)
+        gathered_state_dict = {}
+        for name, tensor in adapter_state_dict.items():
+            if name in expert_tensors:
+                # Expert tensors have a two-level layout (EDP shard and EP
+                # local experts) and use a dedicated global gather.
+                source_tensor, num_global_experts = expert_tensors[name]
+                gathered_state_dict[name] = self._gather_expert_lora_tensor(
+                    source_tensor, num_global_experts
+                )
+            else:
+                gathered_state_dict[name] = self._full_cpu_tensor(tensor)
+
+        def write_adapter() -> None:
+            os.makedirs(output_dir, exist_ok=True)
+            save_file(
+                gathered_state_dict,
+                os.path.join(output_dir, "adapter_model.safetensors"),
+            )
+            for config in model.peft_config.values():
+                config.save_pretrained(output_dir)
+            sync_directory(output_dir)
+
+        rank_zero_call(write_adapter)
+
+    def _grouped_lora_tensors(self, model: nn.Module) -> dict[str, tuple[Any, int]]:
+        """Map saved GroupedMLPLoRA keys to their source tensors."""
+        from ....peft.lora import GroupedMLPLoRA
+
+        experts = {}
+        for module_name, module in model.named_modules():
+            if not isinstance(module, GroupedMLPLoRA):
+                continue
+            clean_name = strip_peft_prefix(module_name)
+            for layer_name in ("lora_A", "lora_B", "lora_A2", "lora_B2"):
+                key = f"base_model.model.{clean_name}.{layer_name}.weight"
+                experts[key] = (
+                    getattr(module, layer_name)["default"].weight,
+                    module.base_layer.config.num_moe_experts,
+                )
+        return experts
+
+    def _stage_cpu_offload_tensor(self, tensor: Any) -> Any:
+        """Stage a CPU-resident DTensor shard onto its mesh's device."""
+        if not self._cpu_offload or not isinstance(tensor, DTensor):
+            return tensor
+        local = tensor.to_local()
+        compute_device = self._device_runtime.device
+        if local.device.type == compute_device.type:
+            return tensor
+        return DTensor.from_local(
+            local.to(compute_device),
+            tensor.device_mesh,
+            tensor.placements,
+            run_check=False,
+            shape=tensor.shape,
+            stride=tensor.stride(),
+        )
+
+    def _full_cpu_tensor(self, tensor: Any) -> Any:
+        """Detach a local or distributed tensor into a CPU safetensors value."""
+        if isinstance(tensor, DTensor):
+            tensor = self._stage_cpu_offload_tensor(tensor)
+            tensor = tensor.full_tensor()
+        return tensor.detach().to("cpu", copy=True).contiguous()
+
+    def _gather_expert_lora_tensor(
+        self, tensor: Any, num_global_experts: int
+    ) -> torch.Tensor:
+        """Concatenate GroupedMLPLoRA local expert tensors over the EP mesh."""
+        # A GroupedMLPLoRA DTensor is sharded over EDP. full_tensor() first
+        # reconstructs this rank's complete set of local experts (for example
+        # 32), after which the EP gather below obtains every peer's experts.
+        # In full CPU-offload mode the local shard is CPU-resident while its
+        # mesh still uses the NPU/HCCL backend, so stage it before gathering.
+        if isinstance(tensor, DTensor):
+            tensor = self._stage_cpu_offload_tensor(tensor)
+            local = tensor.full_tensor()
+        else:
+            local = tensor
+        local = local.detach().contiguous()
+        if local.device.type != self._device_runtime.device.type:
+            local = local.to(self._device_runtime.device)
+
+        ep_mesh = self._mesh["ep"]
+        ep_group = ep_mesh.get_group(0)
+        ep_size = dist.get_world_size(group=ep_group)
+        if ep_size == 1:
+            gathered = [local]
+        else:
+            gathered = [torch.empty_like(local) for _ in range(ep_size)]
+            dist.all_gather(gathered, local, group=ep_group)
+
+        # EP communication must stay on the process-group device; HCCL groups
+        # reject CPU inputs. Move only the final concatenated tensor to CPU.
+        full = torch.cat(gathered, dim=0).to("cpu", copy=True).contiguous()
+        if full.shape[0] != num_global_experts:
+            raise ValueError(
+                "GroupedMLPLoRA expert gather produced an incomplete adapter: "
+                f"expected {num_global_experts} experts, got {full.shape[0]} "
+                f"(local={tuple(local.shape)}, ep_size={ep_size}, "
+                f"tensor={type(tensor).__name__})"
+            )
+        return full
 
     def save_native(self, model: nn.Module, output_dir: str) -> None:
         self._dcp.save_model(model, output_dir)

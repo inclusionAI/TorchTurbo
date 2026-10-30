@@ -138,6 +138,7 @@ class RecordingCheckpointManager(RecordingLayout, BaseCheckpointManager):
         *,
         source_path,
         weight_converter,
+        hf_export_lora="merge",
     ):
         self.calls.append(("save_hf", output_dir, source_path, weight_converter))
 

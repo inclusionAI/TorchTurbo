@@ -99,6 +99,11 @@ class CheckpointCoordinator:
         final: bool = False,
     ) -> tuple[CheckpointFormat, ...]:
         """Save a training checkpoint or an explicit model export."""
+        lora_export_mode = self._config.checkpoint.hf_export_lora
+        if lora_export_mode == "adapter":
+            collective_check(
+                lambda: _validate_adapter_export(model)
+            )
         if format is not None:
             if not isinstance(format, CheckpointFormat):
                 raise TypeError(
@@ -140,6 +145,7 @@ class CheckpointCoordinator:
                     os.path.join(output_dir, layout.HF_MODEL_DIR),
                     source_path=source_path,
                     weight_converter=self._weight_converter(model, source_path),
+                    hf_export_lora=lora_export_mode,
                 )
                 self._export_plugin_consumer.notify_hf_export(
                     os.path.join(output_dir, layout.HF_MODEL_DIR)
@@ -316,3 +322,12 @@ class CheckpointCoordinator:
         if os.path.isfile(scheduler_path):
             os.remove(scheduler_path)
         os.makedirs(optimizer_dir)
+
+
+def _validate_adapter_export(model: nn.Module) -> None:
+    """Require adapters because an adapter export has no standalone weights."""
+    if not any(is_peft_adapter_param(name) for name, _ in model.named_parameters()):
+        raise ValueError(
+            "checkpoint.hf_export_lora='adapter' requires a LoRA model. "
+            "Use 'merge' or train with a PEFT config."
+        )
