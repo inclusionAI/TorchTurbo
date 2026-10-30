@@ -40,6 +40,13 @@ def _replace_moe_only(
         moe_z_loss_coeff=engine_config.moe.z_loss_coeff,
         moe_async_comm=engine_config.moe.async_comm,
         moe_inplace_perm=engine_config.moe.inplace_perm,
+        moe_expert_rebalance=engine_config.moe.expert_rebalance.enabled,
+        moe_expert_rebalance_interval_steps=(
+            engine_config.moe.expert_rebalance.interval_steps
+        ),
+        moe_expert_rebalance_ema_decay=(
+            engine_config.moe.expert_rebalance.ema_decay
+        ),
         moe_gmm_fold=engine_config.moe.gmm_fold,
         moe_permute_fusion=engine_config.moe.permute_fusion,
         moe_router_num_groups=hf_config.n_group,

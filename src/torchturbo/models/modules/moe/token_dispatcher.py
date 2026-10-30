@@ -16,6 +16,7 @@ from torchturbo.runtime import TurboDevice, get_device_runtime
 
 from .moe_config import MoEConfig
 from .inplace_perm import InplaceRowPermuteFn, sort_row_perm
+from .expert_placement import ExpertPlacementManager, activate_from_config
 
 # from torch_turbo.distributed.parallel_state import get_expert_model_parallel_group
 from ..comm.comm import all_to_all, gather_from_sequence_parallel_region
@@ -165,6 +166,11 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         self.dtoh_stream = self.device_runtime.new_stream()
         self._gf_Q = None
         self._gf_send_counts_dev = None
+
+        # Expert re-placement: the dispatcher works in slot space; the shared
+        # manager maps expert ids to slots and migrates weights between steps.
+        activate_from_config(config, ep_group)
+        self._placement = ExpertPlacementManager.active()
 
     @property
     def deferred_probs_to_unpermutation(self) -> bool:
@@ -402,6 +408,10 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
                 - Number of tokens per expert.
                 - Permuted probs of each token produced by the router.
         """
+        if self._placement is not None:
+            self._placement.accumulate(routing.routing_map)
+            routing = self._placement.remap_routing(routing)
+
         if self.deferred_probs_to_unpermutation:
             return self._token_permutation_with_deferred_probs(
                 hidden_states, routing
@@ -473,6 +483,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         return (
             self.config.moe_gmm_fold
             and self.deferred_probs_to_unpermutation
+            and (self._placement is None or self._placement.is_identity)
             and self.tp_size == 1
             and self.ep_size in (8, 16, 32, 64, 128)
             and self.num_experts % 2 == 0

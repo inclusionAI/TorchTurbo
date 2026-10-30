@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import heapq
 from dataclasses import dataclass
+from time import perf_counter
 from typing import Any
 
 import torch
@@ -364,6 +365,7 @@ class _VisionBalanceState:
         world = dist.get_world_size()
         device = batch.pixels.device
         output_names = tuple(batch.output_lengths)
+        plan_start = perf_counter()
         metadata = self._gather_metadata(batch)
         pool = _MediaPool.from_metadata(metadata, output_names, self.mode)
         pool.assign_owners(world)
@@ -382,12 +384,27 @@ class _VisionBalanceState:
                 restore_index=self._ranges_index(fanout.restore_ranges, device),
                 fanout=fanout,
             )
-        logger.debug(
-            "[rank %d] vision balance mode=%s pooled_media=%d assigned_media=%d",
+        # Balance telemetry: assigned_share is this rank's share of the pooled
+        # LPT weight relative to the perfect share; local_share is what its SP
+        # group would carry without rebalancing. 1.0 is perfectly balanced.
+        total_weight = sum(media.weight for media in pool.media)
+        mean_weight = total_weight / world if world else 0
+        assigned_weight = sum(media.weight for media in mine)
+        local_weight = sum(
+            media.weight
+            for media in pool.media
+            if media.src // self.sp_size == rank // self.sp_size
+        )
+        logger.info(
+            "[vision-balance] rank=%d mode=%s media=%d mine=%d "
+            "assigned_share=%.3f local_share=%.3f plan_ms=%.1f",
             rank,
             self.mode.value,
             len(pool.media),
             len(mine),
+            assigned_weight / mean_weight if mean_weight else 0.0,
+            local_weight / mean_weight if mean_weight else 0.0,
+            (perf_counter() - plan_start) * 1000,
         )
         return _StepPlan(batch, assigned_batch, outputs)
 

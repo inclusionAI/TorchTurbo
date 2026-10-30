@@ -520,6 +520,43 @@ class DataCacheConfig:
 
 
 @dataclass
+class ExpertRebalanceConfig:
+    """Periodic FlexMoE-style expert re-placement across EP ranks.
+
+    Checkpoints do not record the active placement: resuming from a
+    checkpoint taken after a migration restores weights under the identity
+    layout. Only enable this for runs whose checkpoints are disposable.
+    """
+
+    enabled: bool = False
+    """Re-place experts by observed token load every interval_steps steps."""
+
+    interval_steps: int = 20
+    """Steps between re-placement decisions."""
+
+    ema_decay: float = 0.9
+    """EMA decay for the per-expert load estimate."""
+
+    def __post_init__(self) -> None:
+        if isinstance(self.enabled, str):
+            self.enabled = string_to_bool(self.enabled)
+        else:
+            self.enabled = bool(self.enabled)
+        self.interval_steps = int(self.interval_steps)
+        self.ema_decay = float(self.ema_decay)
+        if self.interval_steps < 1:
+            raise ValueError(
+                f"expert_rebalance.interval_steps must be >= 1, got "
+                f"{self.interval_steps}"
+            )
+        if not 0.0 <= self.ema_decay < 1.0:
+            raise ValueError(
+                f"expert_rebalance.ema_decay must be in [0, 1), got "
+                f"{self.ema_decay}"
+            )
+
+
+@dataclass
 class MoEConfig:
     """MoE training configuration."""
 
@@ -531,6 +568,13 @@ class MoEConfig:
     permute_fusion: bool = False
     router_bias_gamma: float = 0.0
     router_bias_clamp: float = 0.05
+    expert_rebalance: ExpertRebalanceConfig = field(
+        default_factory=ExpertRebalanceConfig
+    )
+
+    def __post_init__(self) -> None:
+        if isinstance(self.expert_rebalance, dict):
+            self.expert_rebalance = ExpertRebalanceConfig(**self.expert_rebalance)
 
 
 @dataclass
@@ -1254,7 +1298,13 @@ def _validate_config_file(data: Mapping[str, Any], parents: tuple[str, ...] = ()
             "moe.permute_fusion",
             "moe.router_bias_gamma",
             "moe.router_bias_clamp",
+            "moe.expert_rebalance",
         }
+    )
+    allowed.update(
+        _dataclass_config_paths(
+            ExpertRebalanceConfig, ("moe", "expert_rebalance")
+        )
     )
     allowed.update(_dataclass_config_paths(OptimizerConfig, ("optimizer",)))
     allowed.update(_dataclass_config_paths(RuntimeConfig, ("runtime",)))
@@ -1388,6 +1438,9 @@ def _build_moe_config(fields: Mapping[str, Any]) -> MoEConfig:
         permute_fusion=string_to_bool(moe_d.get("permute_fusion", False)),
         router_bias_gamma=float(moe_d.get("router_bias_gamma", 0.0)),
         router_bias_clamp=float(moe_d.get("router_bias_clamp", 0.05)),
+        expert_rebalance=ExpertRebalanceConfig(
+            **(moe_d.get("expert_rebalance") or {})
+        ),
     )
 
 

@@ -69,6 +69,12 @@ class MoEConfig:
     moe_async_comm: bool = False
     """Reorder dispatch and combine rows in place to avoid a second large buffer."""
     moe_inplace_perm: bool = False
+    """Periodically re-place experts across EP ranks by observed token load."""
+    moe_expert_rebalance: bool = False
+    """Steps between expert re-placement decisions."""
+    moe_expert_rebalance_interval_steps: int = 20
+    """EMA decay for the expert load estimate used by the placement solver."""
+    moe_expert_rebalance_ema_decay: float = 0.9
     """Fuse all-to-allv with grouped matmul for MoE dispatch and combine."""
     moe_gmm_fold: bool = False
     """Apply probs on input of experts instead of applying after activation and glu."""

@@ -202,6 +202,21 @@ def test_build_data_cache_from_yaml(tmp_path):
     assert cfg.data_cache.max_mb_per_rank == 2048.0
 
 
+def test_build_expert_rebalance_from_yaml(tmp_path):
+    content = _engine_config(
+        "moe:\n"
+        "  expert_rebalance:\n"
+        "    enabled: true\n"
+        "    interval_steps: 5\n"
+        "    ema_decay: 0.8\n"
+    )
+    cfg = _build_from_argv(["--tt_config", _write(tmp_path, "cfg.yaml", content)])
+
+    assert cfg.moe.expert_rebalance.enabled is True
+    assert cfg.moe.expert_rebalance.interval_steps == 5
+    assert cfg.moe.expert_rebalance.ema_decay == 0.8
+
+
 def test_data_cache_defaults_off():
     from torchturbo.engine.config import DataCacheConfig
 
