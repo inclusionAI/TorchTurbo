@@ -113,6 +113,11 @@ engine_config:
         # Size limit in MiB. Required for size and unused by other strategies.
         bucket_cap_mb: null
 
+  moe:
+    # Reorder dispatch/combine token chunks in place instead of split+cat,
+    # removing the temporary buffer spike on skewed EP routing.
+    inplace_perm: false
+
   mtp:
     enabled: false
     loss_scaling_factor: 0.1
