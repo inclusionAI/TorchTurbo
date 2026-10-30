@@ -53,6 +53,7 @@ class AscendCCausalConv1d(OpImpl):
         output_final_state: bool = False,
         cu_seqlens=None,
         packed_params=None,
+        head_num=None,
         **kwargs,
     ):
         from torchturbo.ops.providers.npu._fla_gdn import ascendc_causal_conv1d
@@ -66,4 +67,5 @@ class AscendCCausalConv1d(OpImpl):
             output_final_state=output_final_state,
             cu_seqlens=cu_seqlens,
             packed_params=packed_params,
+            head_num=head_num,
         )

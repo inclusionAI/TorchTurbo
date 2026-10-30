@@ -426,6 +426,9 @@ class OpDispatcher:
         use_gate_in_kernel: bool = False,
         safe_gate: bool = False,
         lower_bound: float | None = None,
+        use_beta_sigmoid_in_kernel: bool = False,
+        disable_recompute: bool = False,
+        head_major_qkv: bool = False,
         cu_seqlens: torch.Tensor | None = None,
         packed_params: PackedParams | None = None,
         impl: str | None = None,
@@ -450,6 +453,9 @@ class OpDispatcher:
             use_gate_in_kernel=use_gate_in_kernel,
             safe_gate=safe_gate,
             lower_bound=lower_bound,
+            use_beta_sigmoid_in_kernel=use_beta_sigmoid_in_kernel,
+            disable_recompute=disable_recompute,
+            head_major_qkv=head_major_qkv,
             packed_params=packed_params,
             impl=impl,
         )
@@ -465,6 +471,7 @@ class OpDispatcher:
         output_final_state: bool = False,
         cu_seqlens: torch.Tensor | None = None,
         packed_params=None,
+        head_num=None,
         impl: str | None = None,
     ):
         if cu_seqlens is not None:
@@ -480,6 +487,7 @@ class OpDispatcher:
             initial_state=initial_state,
             output_final_state=output_final_state,
             packed_params=packed_params,
+            head_num=head_num,
             impl=impl,
         )
 

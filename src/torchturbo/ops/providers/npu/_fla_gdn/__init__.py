@@ -85,6 +85,7 @@ def ascendc_causal_conv1d(
     output_final_state: bool = False,
     cu_seqlens: Optional[torch.Tensor] = None,
     packed_params: Optional[PackedParams] = None,
+    head_num: Optional[int] = None,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Drop-in AscendC replacement for ``fla.modules.convolution.causal_conv1d``.
 
@@ -94,15 +95,31 @@ def ascendc_causal_conv1d(
         bias: optional ``[D]``.
         activation: ``None`` or ``"silu"``/``"swish"``.
         initial_state / output_final_state / cu_seqlens: as in ``fla``.
+        head_num: when given, return the operator's native head-first output
+            ``[B, head_num, T, D // head_num]`` instead of flattening it back
+            to ``[B, T, D]``.  Pass the consumer's head count (e.g. the fused
+            KDA operator's) so it can consume the output with no layout
+            transpose; the convolution is depthwise, so ``head_num`` only
+            fixes the output spelling and never changes the per-channel
+            result.
 
     Returns:
-        ``(y, final_state)`` where ``y`` is ``[B, T, D]`` (same layout as the
-        input) and ``final_state`` is ``None`` unless ``output_final_state``.
+        ``(y, final_state)`` where ``y`` is ``[B, T, D]``, or
+        ``[B, head_num, T, D // head_num]`` when ``head_num`` is given, and
+        ``final_state`` is ``None`` unless ``output_final_state``.
     """
     if x.ndim != 3:
         raise ValueError(f"x must be [B, T, D], got shape={tuple(x.shape)}")
     batch, seq_len, dim = x.shape
-    head_num = _conv_head_num(dim)
+    head_first = head_num is not None
+    if head_first:
+        head_num = int(head_num)
+        if head_num <= 0 or dim % head_num:
+            raise ValueError(
+                f"head_num={head_num} must be a positive divisor of D={dim}."
+            )
+    else:
+        head_num = _conv_head_num(dim)
     cu_seqlens_list = None
     if packed_params is not None:
         if cu_seqlens is not None:
@@ -117,9 +134,11 @@ def ascendc_causal_conv1d(
     if cu_seqlens is not None and cu_seqlens.device != x.device:
         cu_seqlens = cu_seqlens.to(x.device)
 
-    # AscendC kernel returns head-first ``[B, H, T, Dh]``. Because the conv is
-    # depthwise with contiguous head grouping (``d = h * Dh + dh``), transposing
-    # back and flattening recovers the exact per-channel result in ``[B, T, D]``.
+    # The AscendC kernel always produces head-first ``[B, H, T, Dh]``. Because
+    # the conv is depthwise with contiguous head grouping (``d = h * Dh + dh``),
+    # transposing back and flattening recovers the exact per-channel result in
+    # ``[B, T, D]`` -- but that copy is pure overhead when the consumer (the
+    # fused KDA operator) wants head-first anyway, so ``head_num`` skips it.
     y_head, final_state = AscendCCausalConv1dFunction.apply(
         x,
         weight,
@@ -132,6 +151,8 @@ def ascendc_causal_conv1d(
         output_final_state,
         cu_seqlens_list,
     )
+    if head_first:
+        return y_head, final_state
     y = y_head.transpose(1, 2).reshape(batch, seq_len, dim).contiguous()
     return y, final_state
 

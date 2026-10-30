@@ -62,11 +62,23 @@ def test_kda_preserves_packed_boundaries_and_local_parameters(
 
     def conv(**kwargs):
         conv_calls.append(kwargs)
-        return kwargs["x"], None
+        x = kwargs["x"]
+        # Mirror the head-first [B, head_num, T, Dh] spelling the provider
+        # contract returns when head_num is given.
+        head_num = kwargs["head_num"]
+        batch, seq_len, dim = x.shape
+        heads_out = (
+            x.view(batch, seq_len, head_num, dim // head_num)
+            .transpose(1, 2)
+            .contiguous()
+        )
+        return heads_out, None
 
     def chunk_kda(**kwargs):
         kda_calls.append(kwargs)
-        return kwargs["v"], None
+        # o follows the time-first spelling the operator contract fixes.
+        q = kwargs["q"]
+        return q.transpose(1, 2).contiguous(), None
 
     def gated_norm(x, g, weight, bias, activation, **kwargs):
         assert bias is None
@@ -93,6 +105,11 @@ def test_kda_preserves_packed_boundaries_and_local_parameters(
     monkeypatch.setattr(
         turbo_ops, "ops", SimpleNamespace(causal_conv1d=conv, kda=chunk_kda)
     )
+    # Stub the full fla module chain: the patched forward imports
+    # ``fla.modules.fused_norm_gate`` at call time, and a real import would
+    # drag triton in (unavailable on mac dev hosts).
+    for name in ("fla", "fla.modules"):
+        monkeypatch.setitem(sys.modules, name, SimpleNamespace(__path__=[]))
     monkeypatch.setitem(
         sys.modules,
         "fla.modules.fused_norm_gate",
@@ -187,11 +204,24 @@ def test_kda_preserves_packed_boundaries_and_local_parameters(
     # final sequence); recurrent KDA shares the same boundaries.
     for call in conv_calls:
         assert call["packed_params"].cu_seqlens_list == expected
-    assert kda_calls[0]["packed_params"] is conv_calls[0]["packed_params"]
+    assert kda_calls[0]["cu_seqlens"] is conv_calls[0]["packed_params"].cu_seqlens
     for call in conv_calls:
         assert call["x"].shape == (1, 4, 4 // sp_size)
         expected_weight = module.q_conv1d.weight.chunk(sp_size, dim=0)[sp_rank]
         torch.testing.assert_close(call["weight"], expected_weight.squeeze(1))
+    # Convolutions are asked for their head-first spelling; KDA consumes it
+    # (and disables recompute so both backends share one memory regime).
+    # SP shards the heads before the convolution, so each rank asks for its
+    # local head count.
+    local_heads = 2 // sp_size
+    assert [call["head_num"] for call in conv_calls] == [
+        local_heads,
+        local_heads,
+        local_heads,
+    ]
+    assert kda_calls[0]["q"].shape == (1, local_heads, 4, 2)
+    assert kda_calls[0]["head_major_qkv"] is True
+    assert kda_calls[0]["disable_recompute"] is True
     torch.testing.assert_close(
         kda_calls[0]["A_log"], module.A_log.chunk(sp_size)[sp_rank]
     )

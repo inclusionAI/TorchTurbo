@@ -135,7 +135,9 @@ def patch_kda_forward(
             g = self.f_proj(hidden_states)
         else:
             g = self.f_b_proj(self.f_a_proj(hidden_states))
-        beta = self.b_proj(hidden_states).float().sigmoid()
+        # KDA owns the sigmoid (in-kernel on AscendC, in the native adapter
+        # for triton), so hand it raw logits.
+        beta = self.b_proj(hidden_states).float()
         if sp_size > 1:
             # Launched before the convolutions so these small exchanges
             # finish while the convolutions run; the wait at the chunk
@@ -150,6 +152,11 @@ def patch_kda_forward(
             )
 
         # Every convolution must reset at the same boundaries as recurrent KDA.
+        # ``head_num`` asks for the head-first [B, H, T, Dh] output the fused
+        # KDA operator consumes; the depthwise conv makes the regrouping exact.
+        q_heads = q.shape[-1] // self.head_k_dim
+        k_heads = k.shape[-1] // self.head_k_dim
+        v_heads = v.shape[-1] // self.head_dim
         if sp_size > 1:
             get_device_runtime().current_stream().wait_event(qkv_events[0])
         q, _ = ops.causal_conv1d(
@@ -162,6 +169,7 @@ def patch_kda_forward(
             initial_state=None,
             output_final_state=False,
             packed_params=packed_params,
+            head_num=q_heads,
         )
         if sp_size > 1:
             get_device_runtime().current_stream().wait_event(qkv_events[1])
@@ -175,6 +183,7 @@ def patch_kda_forward(
             initial_state=None,
             output_final_state=False,
             packed_params=packed_params,
+            head_num=k_heads,
         )
         if sp_size > 1:
             get_device_runtime().current_stream().wait_event(qkv_events[2])
@@ -188,11 +197,10 @@ def patch_kda_forward(
             initial_state=None,
             output_final_state=False,
             packed_params=packed_params,
+            head_num=v_heads,
         )
 
-        q = q.unflatten(-1, (-1, self.head_k_dim))
-        k = k.unflatten(-1, (-1, self.head_k_dim))
-        v = v.unflatten(-1, (-1, self.head_dim))
+        # q/k/v already come back head-first; only the gate needs the split.
         g = g.unflatten(-1, (-1, self.head_dim))
 
         if sp_size > 1:
@@ -210,6 +218,9 @@ def patch_kda_forward(
             A_log_local = self.A_log
             dt_bias_local = self.dt_bias
 
+        # ``disable_recompute=True`` is required by the fused AscendC
+        # backward (no recompute path on A2/A3); the native provider strips
+        # it, so both backends run in the same memory regime.
         o, _ = ops.kda(
             q=q,
             k=k,
@@ -221,10 +232,13 @@ def patch_kda_forward(
             initial_state=None,
             output_final_state=True,
             use_qk_l2norm_in_kernel=True,
+            use_beta_sigmoid_in_kernel=True,
             use_gate_in_kernel=True,
             safe_gate=self.safe_gate,
             lower_bound=self.lower_bound,
-            packed_params=packed_params,
+            cu_seqlens=cu_seqlens,
+            disable_recompute=True,
+            head_major_qkv=True,
         )
 
         if sp_size > 1:

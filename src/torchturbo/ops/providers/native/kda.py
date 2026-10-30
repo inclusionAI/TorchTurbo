@@ -5,7 +5,6 @@ from __future__ import annotations
 import torch
 
 from ...base import OpImpl, OpImplKind
-from ...packed_params import PackedParams
 from ...registry import register_op
 
 
@@ -31,19 +30,32 @@ class FlaKDA(OpImpl):
         v: torch.Tensor,
         g: torch.Tensor,
         beta: torch.Tensor,
-        *,
-        A_log: torch.Tensor | None = None,
-        dt_bias: torch.Tensor | None = None,
-        scale: float | None = None,
-        initial_state: torch.Tensor | None = None,
-        output_final_state: bool = False,
-        use_qk_l2norm_in_kernel: bool = False,
-        use_gate_in_kernel: bool = False,
-        safe_gate: bool = False,
-        lower_bound: float | None = None,
-        packed_params: PackedParams | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        **kwargs,
+    ):
+        # fla-org's chunk_kda is an autograd function returning (o, final_state).
         from fla.ops.kda import chunk_kda
+
+        # Convert the fused path's head-first Q/K/V and raw beta logits to
+        # fla's sequence-major, sigmoided spelling so the model code stays
+        # backend-agnostic.
+        head_major_qkv = bool(kwargs.pop("head_major_qkv", False))
+        if head_major_qkv:
+            q = q.transpose(1, 2).contiguous()
+            k = k.transpose(1, 2).contiguous()
+            v = v.transpose(1, 2).contiguous()
+
+        if kwargs.pop("use_beta_sigmoid_in_kernel", False):
+            beta = beta.sigmoid()
+
+        # Fused-only flags the triton path does not understand.
+        kwargs.pop("disable_recompute", None)
+        kwargs.pop("allow_neg_eigval", None)
+
+        # fla takes the raw cu_seqlens tensor; it would otherwise silently
+        # drop varlen boundaries through its **kwargs.
+        packed_params = kwargs.pop("packed_params", None)
+        if packed_params is not None and kwargs.get("cu_seqlens") is None:
+            kwargs["cu_seqlens"] = packed_params.cu_seqlens
 
         return chunk_kda(
             q=q,
@@ -51,14 +63,5 @@ class FlaKDA(OpImpl):
             v=v,
             g=g,
             beta=beta,
-            A_log=A_log,
-            dt_bias=dt_bias,
-            scale=scale,
-            initial_state=initial_state,
-            output_final_state=output_final_state,
-            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
-            use_gate_in_kernel=use_gate_in_kernel,
-            safe_gate=safe_gate,
-            lower_bound=lower_bound,
-            cu_seqlens=None if packed_params is None else packed_params.cu_seqlens,
+            **kwargs,
         )
