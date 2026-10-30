@@ -193,10 +193,24 @@ class ExpertPlacementManager:
             ],
         )
 
-    def accumulate(self, routing_map: torch.Tensor) -> None:
+    def accumulate_counts(self, counts: torch.Tensor) -> None:
         """Add one layer's per-expert token counts in expert-id space."""
-        self._ensure_device(routing_map.device)
-        self._step_counts += routing_map.sum(dim=0).to(torch.float32)
+        self._ensure_device(counts.device)
+        self._step_counts += counts.to(torch.float32)
+
+    def remap_indices(self, expert_indices: torch.Tensor) -> torch.Tensor:
+        """Map per-token expert ids to slot ids; identity placement is free."""
+        if self.is_identity:
+            return expert_indices
+        return self._slot_of_expert.to(expert_indices.device)[expert_indices]
+
+    def slot_counts(self, true_counts: torch.Tensor) -> torch.Tensor:
+        """Reorder true-id expert counts into slot order."""
+        if self.is_identity:
+            return true_counts
+        return true_counts.index_select(
+            0, self._placement.to(true_counts.device)
+        )
 
     # -------------------------------------------------------- decision + move
     def on_step_end(self, model: Any, optimizer: Any) -> None:

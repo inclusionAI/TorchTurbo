@@ -87,12 +87,24 @@ def test_remap_expresses_slot_space_after_migration():
 
 def test_accumulate_sums_true_expert_counts():
     manager = make_manager()
-    routing_map = torch.zeros(4, 8, dtype=torch.bool)
-    routing_map[:, 3] = True
-    manager.accumulate(routing_map)
-    manager.accumulate(routing_map)
+    counts = torch.zeros(8)
+    counts[3] = 4.0
+    manager.accumulate_counts(counts)
+    manager.accumulate_counts(counts)
     assert manager._step_counts[3].item() == 8.0
     assert manager._step_counts[0].item() == 0.0
+    ExpertPlacementManager._reset_for_testing()
+
+
+def test_lean_remap_helpers():
+    manager = make_manager()
+    manager._set_placement([4, 1, 2, 3, 0, 5, 6, 7])
+    counts = torch.arange(8, dtype=torch.long)
+    torch.testing.assert_close(
+        manager.slot_counts(counts), torch.tensor([4, 1, 2, 3, 0, 5, 6, 7])
+    )
+    idx = torch.tensor([[0], [4]])
+    assert manager.remap_indices(idx).tolist() == [[4], [0]]
     ExpertPlacementManager._reset_for_testing()
 
 

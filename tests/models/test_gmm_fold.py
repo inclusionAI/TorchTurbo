@@ -15,6 +15,7 @@ def make_dispatcher(enabled=True):
     dispatcher.ep_size = 128
     dispatcher.device_runtime = SimpleNamespace(turbo_device=TurboDevice.NPU)
     dispatcher._gf_Q = None
+    dispatcher._placement = None
     return dispatcher
 
 
