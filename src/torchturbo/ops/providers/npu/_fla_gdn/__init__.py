@@ -33,6 +33,7 @@ verified reference and satisfies the alignment constraint.
 
 from __future__ import annotations
 
+import os
 from typing import Optional
 
 import torch
@@ -41,14 +42,38 @@ from torchturbo.ops.packed_params import PackedParams
 
 from .ascendc_causal_conv1d_function import AscendCCausalConv1dFunction
 from .chunk_gated_delta_rule_function import ChunkGatedDeltaRuleFunction
+from .chunk_gated_delta_rule_fused_function import (
+    ChunkGatedDeltaRuleAdaptiveFunction,
+    fused_bwd_usable,
+    fused_envelope_supported,
+    fused_fwd_usable,
+)
 
 __all__ = [
     "AscendCCausalConv1dFunction",
+    "ChunkGatedDeltaRuleAdaptiveFunction",
     "ChunkGatedDeltaRuleFunction",
     "PackedParams",
     "ascendc_causal_conv1d",
     "ascendc_chunk_gated_delta_rule",
 ]
+
+# Escape hatch for the large-fusion path: set to 0 to always use the composed
+# six-operator chain even inside the fused envelope (K=V=128, chunk=64).
+_USE_FUSED_GDN = bool(int(os.environ.get("TORCHTURBO_GDN_USE_FUSED", "1")))
+
+# The dispatch path is decided once per process (lru_cached probes), so the
+# path warnings must fire once per process too -- not once per GDN call
+# (observed 18480 lines in a real SFT run otherwise).
+_warned: set[str] = set()
+
+
+def _warn_once(key: str) -> bool:
+    """True the first time ``key`` is seen in this process; False after."""
+    if key in _warned:
+        return False
+    _warned.add(key)
+    return True
 
 
 # Preferred depthwise-conv head dimension. Equals the model's
@@ -189,6 +214,53 @@ def ascendc_chunk_gated_delta_rule(
             cu_seqlens_list = [
                 int(item) for item in cu_seqlens.detach().cpu().tolist()
             ]
+
+    if _USE_FUSED_GDN and fused_envelope_supported(
+        k.shape[-1], v.shape[-1], chunk_size
+    ):
+        fwd_fused = fused_fwd_usable()
+        bwd_fused = fwd_fused and fused_bwd_usable()
+        if fwd_fused:
+            # Adaptive large-fusion dispatch: the forward is one fused aclnn
+            # call (exports the g_cumsum/A the backward consumes); the
+            # backward is fused too when its kernel is usable, otherwise the
+            # composed four-operator chain runs over the fused forward's
+            # exports (it recomputes w/u/h/v_new itself). Falls through to
+            # the composed chain entirely when the fused forward is missing.
+            if not bwd_fused and _warn_once("mixed"):
+                from torchturbo.logging import get_logger
+
+                get_logger(__name__).warning(
+                    "fused GDN forward usable but the fused backward is not "
+                    "on this install/device; using fused forward + composed "
+                    "backward.",
+                )
+            o, final_state = ChunkGatedDeltaRuleAdaptiveFunction.apply(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                scale,
+                initial_state,
+                output_final_state,
+                cu_seqlens,
+                cu_seqlens_list,
+                chunk_indices,
+                chunk_indices_list,
+                use_qk_l2norm_in_kernel,
+                chunk_size,
+                bwd_fused,
+            )
+            return o, final_state
+        if _warn_once("fwd_unusable"):
+            from torchturbo.logging import get_logger
+
+            get_logger(__name__).warning(
+                "fused GDN forward unusable on this install/device (probe "
+                "failed); falling back to the composed AscendC chain. "
+                "Set TORCHTURBO_GDN_USE_FUSED=0 to silence this check."
+            )
 
     o, final_state = ChunkGatedDeltaRuleFunction.apply(
         q,

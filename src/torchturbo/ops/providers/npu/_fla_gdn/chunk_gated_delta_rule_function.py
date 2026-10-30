@@ -28,6 +28,7 @@ combinations are rejected before the first compute kernel is launched.
 
 from __future__ import annotations
 
+import inspect
 import math
 from typing import Dict, Optional
 
@@ -47,6 +48,49 @@ from fla_npu.ops.ascendc import (
     solve_tri as ascendc_solve_tri,
 )
 from fla_npu.ops.triton import chunk_local_cumsum
+
+
+def _fwd_h_kwargs() -> dict:
+    """Version-adaptive kwargs for npu_chunk_gated_delta_rule_fwd_h.
+
+    The three supported fla_npu generations expose the same underlying op
+    through very different call faces, so probing one fixed surface breaks
+    another release (the first fix probed ``torch.ops.npu`` -- the only face
+    that exists on 26.6.0 -- and crashed 26.9.1, where ops live under
+    ``torch.ops.fla_npu_stable`` instead):
+
+    * 26.6.0 registers the op into ``torch.ops.npu`` via a classic custom
+      extension; the Python wrapper here is an opaque ``(*args, **kwargs)``
+      pass-through, so the schema must be probed on the torch op itself. It
+      takes save_new_value/use_exp2/transpose_state_layout and returns v_new.
+    * 26.9.1+ ship a stable-ABI backend registering under
+      ``torch.ops.fla_npu_stable`` and a real-signature Python wrapper taking
+      ``state_v_first``.
+
+    The chain always needs v_new, so the 26.6.0 spelling maps to
+    save_new_value=True (its default), exactly the 26.9.1
+    state_v_first=False semantics.
+    """
+    import torch
+
+    wrapper = ascendc_chunk_gated_delta_rule_fwd_h
+    try:
+        params = frozenset(inspect.signature(wrapper).parameters)
+    except (TypeError, ValueError):
+        params = frozenset()
+    if "state_v_first" not in params:
+        # Opaque pass-through wrapper (26.6.0): fall back to the torch op
+        # schema, which only exists there because 26.6.0's extension is what
+        # registers the op under torch.ops.npu.
+        schema = torch.ops.npu.npu_chunk_gated_delta_rule_fwd_h.default._schema
+        params = {arg.name for arg in schema.arguments}
+    if "state_v_first" in params:
+        return {"state_v_first": False}
+    return {
+        "save_new_value": True,
+        "use_exp2": False,
+        "transpose_state_layout": False,
+    }
 
 from .kkt import chunk_scaled_dot_kkt_fwd
 from .l2norm import l2norm_bwd, l2norm_fwd
@@ -560,7 +604,7 @@ def _forward_chain(
         chunk_size=chunk_size,
         cu_seqlens=cu_seqlens_list,
         chunk_indices=chunk_list,
-        state_v_first=False,
+        **_fwd_h_kwargs(),
     )
     output_head = ascendc_chunk_fwd_o(
         q,
@@ -662,7 +706,7 @@ def _backward_chain(
             chunk_size=chunk_size,
             cu_seqlens=cu_seqlens_list,
             chunk_indices=chunk_list,
-            state_v_first=False,
+            **_fwd_h_kwargs(),
         )
     else:
         assert saved_u is not None and saved_h is not None and saved_v_new is not None
