@@ -491,6 +491,35 @@ class LossChunkConfig:
 
 
 @dataclass
+class DataCacheConfig:
+    """In-memory cache for lazily encoded dataset rows.
+
+    Some datasets encode rows on every fetch (tokenize + media preprocess);
+    when epochs revisit the same rows, that host work is identical each time.
+    The cache memoizes encoded rows per rank until ``max_mb_per_rank`` is
+    reached, after which new rows pass through uncached.
+    """
+
+    enabled: bool = False
+    """Enable the row cache around lazily encoded training datasets."""
+
+    max_mb_per_rank: float = 4096.0
+    """Approximate per-rank cache budget in MiB (tensor + list payloads)."""
+
+    def __post_init__(self) -> None:
+        if isinstance(self.enabled, str):
+            self.enabled = string_to_bool(self.enabled)
+        else:
+            self.enabled = bool(self.enabled)
+        self.max_mb_per_rank = float(self.max_mb_per_rank)
+        if self.max_mb_per_rank <= 0:
+            raise ValueError(
+                f"data_cache.max_mb_per_rank must be positive, got "
+                f"{self.max_mb_per_rank}"
+            )
+
+
+@dataclass
 class MoEConfig:
     """MoE training configuration."""
 
@@ -658,6 +687,9 @@ class EngineConfig:
 
     loss_chunk: LossChunkConfig = field(default_factory=LossChunkConfig)
     """Chunked fused ``lm_head`` + CE settings."""
+
+    data_cache: DataCacheConfig = field(default_factory=DataCacheConfig)
+    """Lazily encoded dataset row cache settings."""
 
     freeze_policy: FreezePolicy = field(default_factory=FreezePolicy)
     """Policy for freezing semantic model parameter groups."""
@@ -890,6 +922,7 @@ class EngineConfig:
             dspark=dspark_config,
             moe=moe_config,
             loss_chunk=loss_chunk_config,
+            data_cache=DataCacheConfig(**(d.get("data_cache") or {})),
             freeze_policy=freeze_policy,
             mfu=mfu_config,
             gbs=d.get("gbs"),
@@ -1138,6 +1171,7 @@ def build_from_args(
         dspark=_build_dspark_training_config(fields),
         moe=_build_moe_config(fields),
         loss_chunk=_build_loss_chunk_config(fields),
+        data_cache=DataCacheConfig(**(fields.get("data_cache") or {})),
         freeze_policy=_build_freeze_policy(fields),
         mfu=_build_mfu_config(fields),
         diffusion=_build_diffusion_config(fields),
@@ -1224,6 +1258,7 @@ def _validate_config_file(data: Mapping[str, Any], parents: tuple[str, ...] = ()
     )
     allowed.update(_dataclass_config_paths(OptimizerConfig, ("optimizer",)))
     allowed.update(_dataclass_config_paths(RuntimeConfig, ("runtime",)))
+    allowed.update(_dataclass_config_paths(DataCacheConfig, ("data_cache",)))
     allowed.update(
         _dataclass_config_paths(
             ActivationCheckpointingConfig, ("activation_checkpointing",)

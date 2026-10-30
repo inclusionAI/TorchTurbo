@@ -190,6 +190,26 @@ def test_build_runtime_and_checkpoint_stride_from_yaml(tmp_path):
     assert cfg.activation_checkpointing.layer_stride == 2
 
 
+def test_build_data_cache_from_yaml(tmp_path):
+    content = _engine_config(
+        "data_cache:\n"
+        "  enabled: true\n"
+        "  max_mb_per_rank: 2048\n"
+    )
+    cfg = _build_from_argv(["--tt_config", _write(tmp_path, "cfg.yaml", content)])
+
+    assert cfg.data_cache.enabled is True
+    assert cfg.data_cache.max_mb_per_rank == 2048.0
+
+
+def test_data_cache_defaults_off():
+    from torchturbo.engine.config import DataCacheConfig
+
+    cfg = DataCacheConfig()
+    assert cfg.enabled is False
+    assert cfg.max_mb_per_rank > 0
+
+
 def test_build_from_json_with_engineconfig_wrapper(tmp_path):
     data = {
         "engine_config": {

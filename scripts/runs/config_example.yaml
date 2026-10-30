@@ -123,6 +123,13 @@ engine_config:
     # Fuse token chunk rearrangement on device instead of host-side split/cat.
     permute_fusion: false
 
+  data_cache:
+    # Memoize lazily encoded dataset rows in memory across epochs; only pays
+    # off when training revisits the same rows many times.
+    enabled: false
+    # Per-rank cache budget in MiB.
+    max_mb_per_rank: 4096
+
   mtp:
     enabled: false
     loss_scaling_factor: 0.1

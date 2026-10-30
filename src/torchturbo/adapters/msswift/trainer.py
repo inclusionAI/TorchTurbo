@@ -450,9 +450,18 @@ class TurboTrainerMixin:
         if engine is None or self.train_dataset is None:
             return super().get_train_dataloader(skip_batches=skip_batches)
 
+        dataset = self.train_dataset
+        cache_config = engine.config.data_cache
+        if cache_config.enabled:
+            from .row_cache import wrap_lazy_rows
+
+            dataset = wrap_lazy_rows(
+                dataset, max_bytes=int(cache_config.max_mb_per_rank * 2**20)
+            )
+
         # GA was already resolved in __init__; just build the dataloader.
         return engine.create_dataloader(
-            self.train_dataset,
+            dataset,
             batch_size=self._train_batch_size,
             shuffle=self.args.train_dataloader_shuffle,
             seed=self.args.data_seed,
