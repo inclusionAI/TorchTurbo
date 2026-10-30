@@ -1,0 +1,29 @@
+{
+  "scope": "Only MegaMoE + MoonEP sources and TorchTurbo integration.",
+  "derived_sources": {
+    "ops_nn": {
+      "repository": "https://gitcode.com/cann/ops-nn.git",
+      "version": "v9.1.0.pre",
+      "commit": "39e54ece7ee5ff64c8015d3ba418f891e640f242"
+    },
+    "ops_transformer": {
+      "repository": "https://gitcode.com/cann/ops-transformer.git",
+      "version": "v9.1.0.pre",
+      "commit": "121f37def44062491173b5ccf34bddb500b95e47"
+    }
+  },
+  "shmem": {
+    "package": "cann-shmem==1.6.0",
+    "index": "https://ascend.devcloud.huaweicloud.com/cann/pypi/simple/",
+    "repository": "https://gitcode.com/cann/shmem.git",
+    "commit": "aee374a396b389626f68fab74ec8c555e18978a7",
+    "cp311_aarch64_wheel_sha256": "308a1c5a3dfe039d77d1159e27f3b1c16f38f4990a19c1fc68c7c052dee2b3f5",
+    "policy": "Official unmodified runtime wheel; matching upstream headers fetched into build directory only."
+  },
+  "moonep": {
+    "repository": "https://github.com/MoonshotAI/MoonEP",
+    "license": "MIT",
+    "implementation": "Ascend expert placement, prefetch and gradient-return kernels included here."
+  },
+  "toolchain": "Linux aarch64, Python 3.11, Torch 2.10, torch_npu 2.10.0.post2, CANN 9.0.0, Ascend 910_93"
+}
