@@ -11,7 +11,7 @@ from ..integration import RoutedExpertsBackend
 
 
 class MoonEPMegaMoeBackend(RoutedExpertsBackend):
-    """Share execution scratch across reentrantly checkpointed MoE layers."""
+    """Share execution scratch across MoE layers independently of checkpoint mode."""
 
     def __init__(
         self,

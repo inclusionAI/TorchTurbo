@@ -1,6 +1,7 @@
 """Reuse native plans and a single data workspace for dynamic expert counts."""
 
 import time
+import weakref
 from dataclasses import replace
 from typing import Any
 
@@ -59,6 +60,60 @@ class SharedPlanWorkspace(MegaMoeWorkspace):
         self.parent.wait_for_reuse()
 
 
+class _TransferContext:
+    """Save home weights and acquire borrowed slots only during execution."""
+
+    def __init__(
+        self, ctx: Any, weights: tuple[torch.Tensor, ...], copies: torch.Tensor,
+        resources: Any, extra: int,
+    ) -> None:
+        self.context = weakref.ref(ctx)
+        self.needs_input_grad = ctx.needs_input_grad
+        self.home_weights = weights
+        self.copies = copies
+        self.resources = resources
+        self.extra = extra
+        self.token = object()
+        self.leased = False
+
+    def save_for_backward(self, *tensors: torch.Tensor) -> None:
+        # Borrowed views share mutable staging storage across all MoE layers.
+        # Saving home parameters lets checkpoint and FSDP restore their lifetime.
+        self.weights = tensors[3:5]
+        # Checkpoint restores the recomputed generation even if hooks clone tensors.
+        # This CPU tag avoids a device synchronization or rank-local identity test.
+        generation = torch.tensor(
+            self.resources.cache_generation, dtype=torch.int64, device="cpu"
+        )
+        self.context().save_for_backward(
+            *tensors[:3], *self.home_weights, *tensors[5:], self.copies, generation
+        )
+        self.home_weights = ()
+
+    @property
+    def saved_tensors(self) -> tuple:
+        # Unpacking may run non-reentrant recomputation. Do not hold slots here.
+        tensors = self.context().saved_tensors
+        self.copies = tensors[-2]
+        self.resources.claim()
+        self.leased = True
+        if (
+            self.resources.cache_token is self.token
+            or tensors[-1].item() == self.resources.cache_generation
+        ):
+            self.resources.statistics["backward_cache_hits"] += 1
+        else:
+            self.workspace.wait_for_reuse()
+            self.weights = self.resources.prefetch(
+                tensors[3:5], self.copies, self.extra, token=self.token
+            )
+            self.resources.statistics["backward_prefetches"] += 1
+        return (*tensors[:3], *self.weights, *tensors[5:-2])
+
+    def maybe_clear_saved_tensors(self) -> None:
+        self.context().maybe_clear_saved_tensors()
+
+
 class _FusedTransferFunction(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -77,14 +132,15 @@ class _FusedTransferFunction(torch.autograd.Function):
         extra: int,
     ) -> torch.Tensor:
         ctx.transfer_resources = resources
-        ctx.transfer_copies = copies
         ctx.original_shapes = weight1.shape, weight2.shape
         ctx.original_dtypes = weight1.dtype, weight2.dtype
+        transfer = _TransferContext(ctx, (weight1, weight2), copies, resources, extra)
+        ctx.transfer = transfer
         resources.claim()
         try:
-            weights = resources.prefetch((weight1, weight2), copies, extra)
+            weights = resources.prefetch((weight1, weight2), copies, extra, token=transfer.token)
             return native._MegaMoeFunction.forward(
-                ctx,
+                transfer,
                 hidden,
                 *weights,
                 route,
@@ -94,25 +150,31 @@ class _FusedTransferFunction(torch.autograd.Function):
                 topk_weights,
                 workspace_claimed,
             )
-        except Exception:
+        finally:
             resources.in_use = False
-            raise
 
     @staticmethod
     def backward(ctx: Any, output_gradient: torch.Tensor) -> tuple:
-        gradients = native._MegaMoeFunction.backward(ctx, output_gradient)
-        # These expert gradients were allocated by the native backward above.
-        # They are owned intermediates, not arguments received from autograd.
-        owners = ctx.transfer_resources.return_generated_gradients(
-            gradients[1:3], ctx.transfer_copies
-        )
-        owners = tuple(
-            gradient.to(dtype).reshape(shape)
-            for gradient, dtype, shape in zip(
-                owners, ctx.original_dtypes, ctx.original_shapes
+        transfer = ctx.transfer
+        try:
+            gradients = native._MegaMoeFunction.backward(transfer, output_gradient)
+            # Native backward owns these gradients; accumulate without cloning.
+            owners = ctx.transfer_resources.return_generated_gradients(
+                gradients[1:3], transfer.copies
             )
-        )
-        return (gradients[0], *owners, *gradients[3:], None, None, None)
+            owners = tuple(
+                gradient.to(dtype).reshape(shape)
+                for gradient, dtype, shape in zip(
+                    owners, ctx.original_dtypes, ctx.original_shapes
+                )
+            )
+            return (gradients[0], *owners, *gradients[3:], None, None, None)
+        finally:
+            if transfer.leased:
+                transfer.resources.cache_token = None
+                transfer.resources.cache_generation = None
+                transfer.resources.in_use = False
+                transfer.leased = False
 
 
 class SharedMegaMoePlanPool:

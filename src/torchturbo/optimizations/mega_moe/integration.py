@@ -69,11 +69,6 @@ def install(model: nn.Module, config: Any, ep_group: dist.ProcessGroup) -> None:
             raise ValueError("mega_moe requires SwiGLU experts.")
         if layer.config.moe_apply_probs_on_input:
             raise ValueError("mega_moe requires routing weights on expert outputs.")
-    if not (
-        config.activation_checkpointing.enabled
-        and config.activation_checkpointing.use_reentrant
-    ):
-        raise ValueError("mega_moe requires enabled reentrant activation checkpointing.")
 
     geometries = {
         (
