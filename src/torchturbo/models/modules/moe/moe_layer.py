@@ -107,6 +107,7 @@ class MoELayer(BaseMoELayer):
     ) -> None:
         self.use_te = use_te
         self.submodules = submodules
+        self._routed_experts_backend = None
         super(MoELayer, self).__init__(
             config=config, ep_group=ep_group, layer_number=layer_number
         )
@@ -156,18 +157,25 @@ class MoELayer(BaseMoELayer):
         )
         logits = logits.view(-1, logits.shape[-1])
 
-        dispatcher = self.token_dispatcher
-        # Reuse stage variables so completed layouts are not kept alive here.
-        expert_tokens, expert_probs = dispatcher.dispatch_preprocess(hidden_states, routing)
-        expert_tokens, expert_probs = dispatcher.token_dispatch(expert_tokens, expert_probs)
-        expert_tokens, tokens_per_expert, expert_probs = dispatcher.dispatch_postprocess(
-            expert_tokens, expert_probs,
-        )
-        expert_tokens, bias = self.experts(expert_tokens, tokens_per_expert, expert_probs)
-        assert bias is None, "Bias is not supported in MoEAlltoAllTokenDispatcher"
-        expert_tokens = dispatcher.combine_preprocess(expert_tokens)
-        expert_tokens = dispatcher.token_combine(expert_tokens)
-        expert_tokens = dispatcher.combine_postprocess(expert_tokens)
+        routed_output = None
+        if self._routed_experts_backend is not None:
+            routed_output = self._routed_experts_backend.route(
+                self.experts, hidden_states, routing.probs, routing.routing_map)
+        if routed_output is not None:
+            expert_tokens, bias = routed_output
+        else:
+            dispatcher = self.token_dispatcher
+            # Reuse stage variables so completed layouts are not kept alive here.
+            expert_tokens, expert_probs = dispatcher.dispatch_preprocess(hidden_states, routing)
+            expert_tokens, expert_probs = dispatcher.token_dispatch(expert_tokens, expert_probs)
+            expert_tokens, tokens_per_expert, expert_probs = dispatcher.dispatch_postprocess(
+                expert_tokens, expert_probs,
+            )
+            expert_tokens, bias = self.experts(expert_tokens, tokens_per_expert, expert_probs)
+            assert bias is None, "Bias is not supported in MoEAlltoAllTokenDispatcher"
+            expert_tokens = dispatcher.combine_preprocess(expert_tokens)
+            expert_tokens = dispatcher.token_combine(expert_tokens)
+            expert_tokens = dispatcher.combine_postprocess(expert_tokens)
         output = expert_tokens.to(hidden_states.dtype)
 
         if self.shared_expert is not None:
