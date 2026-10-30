@@ -1,4 +1,4 @@
-"""Ascend fused MegaMoE provider with model-owned execution state."""
+"""Ascend fused MoonEP and MegaMoE provider with model-owned execution state."""
 from __future__ import annotations
 
 import importlib.util
@@ -15,9 +15,9 @@ from ...base import OpImpl, OpImplKind
 from ...registry import register_op
 
 
-@register_op(op_name="mega_moe", impl_name="ascendc_mega_moe", kind=OpImplKind.CUSTOM,
+@register_op(op_name="mega_moe", impl_name="moonep_mega_moe", kind=OpImplKind.CUSTOM,
              priority=100, devices=(TurboDevice.NPU,))
-class AscendCMegaMoe(OpImpl):
+class MoonEPMegaMoe(OpImpl):
     def available(self) -> bool:
         try:
             from torchturbo.optimizations.mega_moe.runtime import bootstrap

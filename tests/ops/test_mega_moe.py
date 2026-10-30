@@ -116,8 +116,8 @@ def test_native_contract_rejects_unsupported_expert_semantics(changes):
 
 
 def test_explicit_npu_implementation_rejects_cpu_runtime():
-    from torchturbo.ops.providers.npu.mega_moe import AscendCMegaMoe  # noqa: F401
+    from torchturbo.ops.providers.npu.mega_moe import MoonEPMegaMoe  # noqa: F401
 
     dispatcher = OpDispatcher(device_runtime=CpuRuntime(), registry=registry)
     with pytest.raises(RuntimeError, match="does not support device=cpu"):
-        dispatcher.mega_moe(None, None, None, experts=None, backend=None, impl="ascendc_mega_moe")
+        dispatcher.mega_moe(None, None, None, experts=None, backend=None, impl="moonep_mega_moe")

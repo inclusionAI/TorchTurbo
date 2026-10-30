@@ -16,6 +16,13 @@ def _extract_stage(argv):
 
 
 if __name__ == '__main__':
+    import runpy
+    from pathlib import Path
+
+    bootstrap = Path(__file__).resolve().parents[2] / (
+        "src/torchturbo/optimizations/mega_moe/bootstrap.py"
+    )
+    runpy.run_path(str(bootstrap))["activate"](sys.argv[1:])
     # Match swift's cli worker preamble for device/dist-init parity.
     from swift.cli.utils import try_use_single_device_mode
     try_use_single_device_mode()
