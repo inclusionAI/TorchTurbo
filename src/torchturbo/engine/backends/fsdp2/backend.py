@@ -454,6 +454,13 @@ class FSDP2Backend(BaseBackend):
         else:
             plan = parallel_plan
 
+        if self.config.mega_moe and peft_config is not None:
+            logger.warning_rank0(
+                "MegaMoE + MoonEP does not support LoRA. Disabling mega_moe "
+                "and using the native MoE modules; LoRA remains enabled."
+            )
+            self.config.mega_moe = False
+
         self.parallel_plan = plan
 
         # Initialize DeviceMesh and SP groups

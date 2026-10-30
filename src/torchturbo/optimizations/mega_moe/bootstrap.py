@@ -12,6 +12,7 @@ def activate(argv: list[str]) -> bool:
     """Prepare native paths when the requested YAML explicitly enables MegaMoE."""
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--tt_config")
+    parser.add_argument("--tuner_type", "--train_type")
     args, _ = parser.parse_known_args(argv)
     if args.tt_config is None:
         return False
@@ -22,7 +23,7 @@ def activate(argv: list[str]) -> bool:
     enabled = (config.get("engine_config") or {}).get("mega_moe", False)
     if not isinstance(enabled, bool):
         raise TypeError("engine_config.mega_moe must be a YAML boolean.")
-    if not enabled:
+    if not enabled or args.tuner_type == "lora":
         return False
     entry = Path(__file__).resolve().parent / "runtime/bootstrap.py"
     return runpy.run_path(str(entry))["activate"]()
