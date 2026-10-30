@@ -62,14 +62,12 @@ try:
 except ImportError:
     fused_recurrent_kda = None
 
-# The training chunk path goes through the ops-registry entry
-# (``torchturbo.ops.kda.chunk_kda``): auto dispatch prefers fla's Triton
-# kernel and falls back to the pure-PyTorch naive implementation when fla
-# cannot be imported; config ``kda_implementation: naive`` forces the
-# naive impl. Stacks where the kernel imports but deadlocks at runtime
-# (old triton-ascend aicore timeout) must set ``kda_implementation: naive``
-# in the model config (see README).
-from torchturbo.ops.kda import chunk_kda
+# The training chunk path goes through the shared ops.kda facade
+# (fla_kda on GPU, ascendc_kda on NPU). The naive impl is private per
+# model. Config ``kda_implementation: naive`` forces the private naive
+# impl (for stacks where the kernel imports but deadlocks at runtime,
+# e.g. old triton-ascend aicore timeout).
+from torchturbo import ops
 
 from .configuration_kimi_k3 import KimiLinearConfig
 
@@ -674,19 +672,18 @@ class KimiDeltaAttention(nn.Module):
         )
         g = self.f_b_proj(self.f_a_proj(hidden_states))
         g = rearrange(g, '... (h d) -> ... h d', d=self.head_dim)
-        beta = self.b_proj(hidden_states).float()
+        beta = self.b_proj(hidden_states).float().sigmoid()
 
         q, k = map(lambda x: rearrange(
             x, '... (h d) -> ... h d', d=self.head_k_dim), (q, k))
         v = rearrange(v, '... (h d) -> ... h d', d=self.head_dim)
 
         if mode == 'chunk':
-            # Routed through the ops registry (torchturbo.ops.kda.chunk_kda):
-            # auto prefers fla's Triton kernel and falls back to the
-            # pure-PyTorch naive impl when fla is not importable;
-            # kda_implementation='naive' forces the naive impl (for stacks
-            # where the kernel imports but deadlocks at runtime).
-            o, recurrent_state = chunk_kda(
+            # Routed through the shared ops.kda facade (fla_kda on GPU,
+            # ascendc_kda on NPU; naive impl is private per model).
+            # kda_implementation='naive' forces the private naive impl
+            # (for stacks where the kernel imports but deadlocks at runtime).
+            o, recurrent_state = ops.kda(
                 q=q,
                 k=k,
                 v=v,
@@ -698,7 +695,6 @@ class KimiDeltaAttention(nn.Module):
                 output_final_state=True,
                 use_qk_l2norm_in_kernel=True,
                 use_gate_in_kernel=True,
-                use_beta_sigmoid_in_kernel=True,
                 safe_gate=self.gate_lower_bound is not None,
                 lower_bound=self.gate_lower_bound,
                 cu_seqlens=cu_seqlens,
@@ -721,7 +717,6 @@ class KimiDeltaAttention(nn.Module):
                 output_final_state=True,
                 use_qk_l2norm_in_kernel=True,
                 use_gate_in_kernel=True,
-                use_beta_sigmoid_in_kernel=True,
                 lower_bound=self.gate_lower_bound,
                 transpose_state_layout=True,
                 cu_seqlens=cu_seqlens,

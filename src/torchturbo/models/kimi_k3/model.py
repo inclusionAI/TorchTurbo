@@ -423,15 +423,15 @@ class TurboKimiK3ForConditionalGeneration(
             v = _split_last_dim_heads(v, self.head_dim)
             g = _split_last_dim_heads(g, self.head_dim)
 
-            # Same routing as the official forward: the ops-registry entry
-            # (auto fla -> naive fallback; kda_implementation='naive' forces
-            # the pure-PyTorch impl).
-            from torchturbo.ops.kda import chunk_kda as chunk_kda_op
+            # Same routing as the official forward: shared ops.kda facade
+            # (fla_kda on GPU, ascendc_kda on NPU; kda_implementation='naive'
+            # forces the private naive impl).
+            from torchturbo import ops
 
             kda_impl = getattr(self.config, "kda_implementation", "naive")
             impl = None if kda_impl == "fused" else "naive_chunk_kda"
 
-            o, _ = chunk_kda_op(
+            o, _ = ops.kda(
                 q=q, k=k, v=v, g=g, beta=beta,
                 A_log=A_log_local, dt_bias=dt_bias_local,
                 initial_state=None, output_final_state=True,
