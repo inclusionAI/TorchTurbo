@@ -20,7 +20,7 @@ from ..logging import get_logger
 from .backend_registry import get_available_backends, get_backend
 from .backends.base import BaseBackend
 from .checkpoint import CheckpointFormat
-from .checkpoint.coordinator import CheckpointCoordinator
+from .checkpoint.coordinator import CheckpointCoordinator, CheckpointExportPluginConsumer
 from .config import EngineConfig, FreezePolicy
 from .metrics import MetricTracker
 from .optimizers import MuonPlan, OptimizerClassPlan
@@ -347,9 +347,12 @@ class TorchTurboEngine:
                 model.on_parallelized(parallel_context)
 
         if self._checkpoint is None:
+            export_plugin_consumer = CheckpointExportPluginConsumer()
+            self.plugin_manager.try_consume(export_plugin_consumer)
             self._checkpoint = CheckpointCoordinator(
                 self.config, self.backend.create_checkpoint_manager(),
                 parallel_context=parallel_context,
+                export_plugin_consumer=export_plugin_consumer,
             )
 
         logger.info_rank0(

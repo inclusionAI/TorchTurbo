@@ -206,13 +206,15 @@ def test_swiglu_custom_policy_errors_when_no_cpu_custom_impl_exists():
         custom_ops.swiglu(x)
 
 
-def test_cross_entropy_loss_uses_reference_fallback_on_cpu():
-    logits = torch.randn(4, 6, dtype=torch.float32)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_cross_entropy_loss_uses_reference_fallback_on_cpu(dtype):
+    logits = torch.randn(4, 6, dtype=dtype)
     labels = torch.tensor([1, 4, 0, 3], dtype=torch.long)
 
     actual = get_ops().cross_entropy_loss(logits, labels, reduction="sum")
-    expected = F.cross_entropy(logits, labels, reduction="sum")
+    expected = F.cross_entropy(logits.float(), labels, reduction="sum")
 
+    assert actual.dtype == torch.float32
     assert torch.allclose(actual, expected)
 
 

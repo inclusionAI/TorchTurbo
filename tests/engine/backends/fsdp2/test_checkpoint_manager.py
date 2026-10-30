@@ -11,7 +11,7 @@ from torch import nn
 
 from torchturbo.engine.checkpoint import ComponentStatus
 from torchturbo.engine.checkpoint import CheckpointFormat
-from torchturbo.engine.checkpoint.coordinator import CheckpointCoordinator
+from torchturbo.engine.checkpoint.coordinator import CheckpointCoordinator, CheckpointExportPluginConsumer
 from torchturbo.engine.checkpoint import coordinator as coordinator_module
 from torchturbo.engine.backends.fsdp2.checkpoint import layout as fsdp_layout
 from torchturbo.engine.checkpoint import layout
@@ -59,7 +59,12 @@ class ConvertibleModel(nn.Module):
 
 
 @pytest.fixture
-def manager():
+def export_plugin_consumer():
+    return CheckpointExportPluginConsumer()
+
+
+@pytest.fixture
+def manager(export_plugin_consumer):
     parallel_context = {
         "ep": {"ep_rank": 0, "ep_size": 1},
         "sp": {"sp_rank": 0, "sp_size": 1},
@@ -76,7 +81,8 @@ def manager():
     )
     config = EngineConfig.from_dict({"checkpoint": {"hf_export": "final"}})
     return CheckpointCoordinator(
-        config, checkpoint_manager, parallel_context=parallel_context
+        config, checkpoint_manager, parallel_context=parallel_context,
+        export_plugin_consumer=export_plugin_consumer,
     )
 
 
@@ -188,6 +194,70 @@ def test_resume_matches_uninterrupted_training(manager, tmp_path, accelerated):
         assert resumed_scheduler.get_last_lr() == pytest.approx(scheduler.get_last_lr())
     torch.testing.assert_close(
         resumed_model.state_dict(), model.state_dict(), rtol=0, atol=0
+    )
+
+
+@pytest.mark.parametrize("saved_ep_size,current_ep_size", [(1, 2), (2, 1)])
+def test_optimizer_restore_rejects_ep_changes_before_mutation(
+    manager, tmp_path, saved_ep_size, current_ep_size
+):
+    manager._config.parallel_plan.ep_size = saved_ep_size
+    model = ConvertibleModel()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.02)
+    model.layer(torch.ones(1, 2)).sum().backward()
+    optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
+    manager.save_model(model, str(tmp_path), source_path="unused")
+    manager.save_optimizer_and_scheduler(model, optimizer, None, str(tmp_path))
+
+    manager._parallel_context["ep"]["ep_size"] = current_ep_size
+    resumed = ConvertibleModel()
+    resumed_optimizer = torch.optim.AdamW(resumed.parameters(), lr=0.07)
+    with pytest.raises(
+        ValueError, match=f"saved EP size {saved_ep_size}.*{current_ep_size}"
+    ):
+        manager.load_optimizer_and_scheduler(
+            resumed, resumed_optimizer, None, str(tmp_path)
+        )
+    assert not resumed_optimizer.state
+    assert resumed_optimizer.param_groups[0]["lr"] == 0.07
+
+
+@pytest.mark.parametrize("ep_size", [1, 2])
+@pytest.mark.parametrize("frozen", [False, True])
+def test_optimizer_restore_keeps_unused_parameters_without_state(
+    manager, tmp_path, ep_size, frozen
+):
+    manager._config.parallel_plan.ep_size = ep_size
+    manager._parallel_context["ep"]["ep_size"] = ep_size
+
+    def build():
+        model = ConvertibleModel()
+        model.unused = nn.Linear(2, 2)
+        model.unused.requires_grad_(not frozen)
+        optimizer = torch.optim.AdamW(
+            (parameter for parameter in model.parameters() if parameter.requires_grad),
+            lr=0.02,
+        )
+        return model, optimizer
+
+    model, optimizer = build()
+    model.layer(torch.ones(1, 2)).sum().backward()
+    optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
+    manager.save_model(model, str(tmp_path), source_path="unused")
+    manager.save_optimizer_and_scheduler(model, optimizer, None, str(tmp_path))
+
+    resumed, resumed_optimizer = build()
+    manager.load_optimizer_and_scheduler(
+        resumed, resumed_optimizer, None, str(tmp_path)
+    )
+    assert all(
+        parameter not in resumed_optimizer.state
+        for parameter in resumed.unused.parameters()
+    )
+    torch.testing.assert_close(
+        resumed_optimizer.state_dict(), optimizer.state_dict(), rtol=0, atol=0
     )
 
 
@@ -553,3 +623,75 @@ def test_native_load_keeps_new_training_settings_and_rejects_scaling_changes(
     changed_scaling = build(lora_alpha=16)
     with pytest.raises(ValueError, match=r"'lora_alpha': \(32, 16\)"):
         manager.load_model(changed_scaling, str(tmp_path), source_path="/source")
+
+
+@pytest.mark.parametrize("export_fails", [False, True])
+def test_export_plugins_run_only_after_successful_hf_save(
+    manager, export_plugin_consumer, tmp_path, monkeypatch, export_fails
+):
+    from torchturbo.engine.plugins import CheckpointExportPlugin, PluginManager
+
+    events = []
+
+    class ExportPlugin(CheckpointExportPlugin):
+        def on_hf_export(self, export_dir: str) -> None:
+            assert os.path.isfile(os.path.join(export_dir, "complete"))
+            events.append("upload")
+
+    plugins = PluginManager()
+    plugins.plugins.append(ExportPlugin())
+    plugins.try_consume(export_plugin_consumer)
+
+    def save_hf(model, export_dir, **kwargs):
+        events.append("save")
+        if export_fails:
+            raise RuntimeError("export failed")
+        with open(os.path.join(export_dir, "complete"), "w") as marker:
+            marker.write("saved")
+
+    monkeypatch.setattr(manager._manager, "save_hf", save_hf)
+    if export_fails:
+        with pytest.raises(RuntimeError, match="export failed"):
+            manager.save_model(
+                ConvertibleModel(), str(tmp_path), source_path="/source",
+                format=CheckpointFormat.HF,
+            )
+        assert events == ["save"]
+    else:
+        manager.save_model(
+            ConvertibleModel(), str(tmp_path), source_path="/source",
+            format=CheckpointFormat.HF,
+        )
+        assert events == ["save", "upload"]
+
+
+def test_export_plugin_failure_does_not_fail_save(
+    manager, export_plugin_consumer, tmp_path, monkeypatch, recorder
+):
+    from torchturbo.engine.plugins import CheckpointExportPlugin
+
+    class FailingPlugin(CheckpointExportPlugin):
+        def on_hf_export(self, export_dir: str) -> None:
+            raise RuntimeError("upload failed")
+
+    export_plugin_consumer.consume(FailingPlugin())
+    monkeypatch.setattr(manager._manager, "save_hf", lambda *a, **kw: None)
+    manager.save_model(
+        ConvertibleModel(), str(tmp_path), source_path="/source",
+        format=CheckpointFormat.HF,
+    )
+    assert any("FailingPlugin failed" in message for message in recorder.warnings)
+
+
+def test_native_only_save_does_not_notify_export_plugin(
+    manager, export_plugin_consumer, tmp_path, monkeypatch
+):
+    from torchturbo.engine.plugins import CheckpointExportPlugin
+
+    class ExportPlugin(CheckpointExportPlugin):
+        def on_hf_export(self, export_dir: str) -> None:
+            pytest.fail("Native-only saves must not trigger export plugins.")
+
+    export_plugin_consumer.consume(ExportPlugin())
+    monkeypatch.setattr(manager._manager, "save_native", lambda *a, **kw: None)
+    manager.save_model(ConvertibleModel(), str(tmp_path), source_path="/source")

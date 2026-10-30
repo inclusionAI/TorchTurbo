@@ -48,9 +48,14 @@ def test_adapter_detection():
 
 def test_native_registration_populates_swift_registries():
     from swift.model import MODEL_MAPPING
+    from swift.model.model_meta import MODEL_MAPPING as SWIFT_MODEL_MAPPING
     from swift.trainers import TrainerFactory
 
     from torchturbo.adapters.msswift import MSSwiftAdapter
+    from torchturbo.models.qwen4_exp.swift_template import (
+        NATIVE_MODEL_TYPE,
+        TEMPLATE_TYPE,
+    )
 
     adapter = MSSwiftAdapter()
     adapter.activate()
@@ -63,7 +68,7 @@ def test_native_registration_populates_swift_registries():
     # native one (with its media-cap env side effects). Base TurboModelLoader is
     # the text-only fallback when swift has no native meta for the model.
     from torchturbo.adapters.msswift.loader import TurboModelMixin
-    from swift.model.model_meta import MODEL_MAPPING as SWIFT_MODEL_MAPPING
+
     turbo_loader = turbo_entries["turbo_qwen3_5_moe"].loader
     assert issubclass(turbo_loader, TurboModelMixin)
     native_loader = SWIFT_MODEL_MAPPING["qwen3_5_moe"].loader
@@ -75,6 +80,21 @@ def test_native_registration_populates_swift_registries():
     assert turbo_loader.get_processor is native_loader.get_processor
     # Meta carries the native loader chain's conventions, e.g. multimodal flag.
     assert turbo_entries["turbo_qwen3_5_moe"].is_multimodal is True
+
+    # qwen4_exp is vendored against the pinned Transformers version and borrows
+    # only Swift's compatible Qwen3.5 processor/template metadata.
+    qwen4_meta = turbo_entries["turbo_qwen4_exp"]
+    assert NATIVE_MODEL_TYPE == "qwen3_5_moe"
+    assert TEMPLATE_TYPE == "qwen3_5"
+    assert qwen4_meta.loader is turbo_loader
+    assert native_loader in qwen4_meta.loader.__mro__
+    assert qwen4_meta.template == "qwen3_5"
+    assert qwen4_meta.model_groups[0].template == "qwen3_5"
+    assert qwen4_meta.candidate_templates == ["qwen3_5"]
+    assert qwen4_meta.requires == SWIFT_MODEL_MAPPING[NATIVE_MODEL_TYPE].requires
+    assert qwen4_meta.tags == SWIFT_MODEL_MAPPING[NATIVE_MODEL_TYPE].tags
+    assert qwen4_meta.task_type == "causal_lm"
+    assert qwen4_meta.is_multimodal is True
 
     # turbo trainer registered for causal_lm (and dpo if available).
     assert TrainerFactory.TRAINER_MAPPING["causal_lm"].endswith("TurboSeq2SeqTrainer")

@@ -16,22 +16,11 @@ try:
 except ImportError:  # pragma: no cover - torch<2.9 compatibility
     from torch.nn.utils.clip_grad import (  # type: ignore[attr-defined]
         _clip_grads_with_norm_ as clip_grads_with_norm_,
+    )
+    from torch.nn.utils.clip_grad import (
         _get_total_norm as get_total_norm,
     )
 
-from torchturbo.models.modules.attention.ulysses import (
-    patch_forward_for_sp_input_slicing,
-    slice_input_tensor,
-    ulysses_pad_inputs,
-)
-from torchturbo.models.modules.comm import all_gather_tensor
-from torchturbo.models.modules.loss import chunk_loss, logits_loss
-from torchturbo.models.modules.vision import register_vision_balance
-from torchturbo.parallel import (
-    FSDPPlanSpec,
-    FSDPParallelPlan,
-)
-from torchturbo.runtime import DeviceRuntime
 from torchturbo.engine.model_fqn import ModelFQNMap, build_model_fqn_map
 from torchturbo.engine.optimizers import (
     MuonPlan,
@@ -40,12 +29,28 @@ from torchturbo.engine.optimizers import (
     OptimizersContainer,
 )
 from torchturbo.engine.utils import match_fqn
+from torchturbo.models.modules.attention.ulysses import (
+    patch_forward_for_sp_input_slicing,
+    slice_input_tensor,
+    ulysses_pad_inputs,
+)
+from torchturbo.models.modules.comm import all_gather_tensor
+from torchturbo.models.modules.cpu_resident import (
+    CPUResidentParameter,
+)
+from torchturbo.models.modules.loss import chunk_loss, logits_loss
+from torchturbo.models.modules.vision import register_vision_balance
+from torchturbo.parallel import (
+    FSDPParallelPlan,
+    FSDPPlanSpec,
+)
+from torchturbo.runtime import DeviceRuntime
 from torchturbo.utils.torch_utils import torch_version
 
+from ....logging import get_logger
 from ...backend_registry import register_backend
 from ...config import EngineConfig
 from ...distributed import assert_finite, init_process_group_if_needed
-from ....logging import get_logger
 from ..base import BaseBackend
 from .checkpoint import FSDP2CheckpointManager
 from .config import CPUOffloadMode, FSDPConfig
@@ -537,7 +542,18 @@ class FSDP2Backend(BaseBackend):
         offload = self.fsdp_config.cpu_offload
         cpu_offload = offload.enabled and offload.mode is CPUOffloadMode.FULL
         device = torch.device("cpu") if cpu_offload else self.device
-        model.to_empty(device=device)
+        if any(isinstance(param, CPUResidentParameter) for param in model.parameters()):
+
+            def allocate(tensor: torch.Tensor) -> torch.Tensor:
+                # materialize_ rebinds storage in place and returns the same
+                # parameter, so _apply keeps its identity instead of replacing it.
+                if isinstance(tensor, CPUResidentParameter):
+                    return tensor.materialize_()
+                return torch.empty_like(tensor, device=device)
+
+            model._apply(allocate)
+        else:
+            model.to_empty(device=device)
         if cpu_offload:
             self._keep_non_offloaded_on_device(model)
         return model
@@ -546,8 +562,8 @@ class FSDP2Backend(BaseBackend):
         """Keep FSDP-unmanaged tensors on the compute device under CPU offload.
 
         CPUOffloadPolicy offloads only sharded DTensor parameters. Buffers and
-        ignored no_shard parameters are plain tensors, so they must stay on the
-        compute device for forward and backward.
+        ordinary ignored no_shard parameters are plain tensors, so they stay on
+        the compute device. CPU-resident parameters retain their storage.
         """
         target = self._device_runtime.device
         for _, submodule in model.named_modules():
@@ -561,7 +577,7 @@ class FSDP2Backend(BaseBackend):
             for param in submodule.parameters(recurse=False):
                 if (
                     param is None
-                    or isinstance(param, DTensor)
+                    or isinstance(param, (DTensor, CPUResidentParameter))
                     or param.device.type == target.type
                 ):
                     continue
@@ -799,6 +815,7 @@ class FSDP2Backend(BaseBackend):
         self, model: nn.Module, plan: _ResolvedFSDPPlan
     ) -> nn.Module:
         from contextlib import nullcontext
+
         from torch.utils.checkpoint import checkpoint
 
         target_modules: list[tuple[str, nn.Module]] = []
@@ -887,6 +904,38 @@ class FSDP2Backend(BaseBackend):
                             return base_fn(*a, **kw)
                     return base_fn(*a, **kw)
 
+                if torch.is_grad_enabled() and not any(
+                    isinstance(arg, torch.Tensor) and arg.requires_grad for arg in args
+                ):
+                    trainable_parameter = next(
+                        (
+                            parameter
+                            for parameter in module.parameters()
+                            if parameter.requires_grad
+                        ),
+                        None,
+                    )
+                    if trainable_parameter is not None:
+                        # Reentrant checkpointing needs a grad-bearing input to run
+                        # backward. Keep frozen activations unchanged and use a scalar
+                        # only to connect the recomputation to autograd.
+                        grad_anchor = torch.zeros(
+                            (), device=trainable_parameter.device, requires_grad=True
+                        )
+
+                        def run_with_grad_anchor(_grad_anchor, *a):
+                            result = run_fn(*a)
+                            is_tuple = isinstance(result, tuple)
+                            outputs = result if is_tuple else (result,)
+                            # Keep a differentiable output even when this call
+                            # skips every trainable parameter (disabled LoRA).
+                            return (*outputs, _grad_anchor, is_tuple)
+
+                        *outputs, _, is_tuple = checkpoint(
+                            run_with_grad_anchor, grad_anchor, *args, use_reentrant=True
+                        )
+                        return tuple(outputs) if is_tuple else outputs[0]
+
                 return checkpoint(
                     run_fn,
                     *args,
@@ -919,7 +968,7 @@ class FSDP2Backend(BaseBackend):
     def _collect_no_shard(
         self, model: nn.Module, plan: _ResolvedFSDPPlan
     ) -> tuple[set[nn.Parameter], list[nn.Module]]:
-        """Identify ``no_shard`` params and module-level subtrees from *plan*.
+        """Identify frozen CPU params and ``no_shard`` targets from *plan*.
 
         Two resolved target kinds, both driven by ``FSDPPlanSpec.no_shard``:
 
@@ -938,8 +987,14 @@ class FSDP2Backend(BaseBackend):
 
         Returns ``(no_shard_params, no_shard_modules)``.
         """
-        no_shard_params: set[nn.Parameter] = set()
         no_shard_modules: list[nn.Module] = []
+        no_shard_params: set[nn.Parameter] = set()
+        for name, param in model.named_parameters():
+            if isinstance(param, CPUResidentParameter):
+                assert not param.requires_grad, (
+                    f"CPU resident parameters must be frozen in FSDP2: {name}"
+                )
+                no_shard_params.add(param)
 
         inactive_roots = self._get_inactive_modules_to_save(model)
         inactive_params = {
@@ -1430,9 +1485,7 @@ class FSDP2Backend(BaseBackend):
     def _clip_grad_norm_cpu_offload(
         self, moe_params, params, ignored_params, max_norm, norm_type
     ):
-        """Grad-norm + clip for the FSDP2 CPU-offload path — fully chunked on the
-        compute device (peak GPU mem = one chunk, ``CLIP_CHUNK_BYTES``).
-        """
+        """Scale and clip CPU-offloaded gradients in device-sized chunks."""
         all_params = list(moe_params) + list(params) + list(ignored_params)
         reduce_device = self.device if not isinstance(self.device, str) else torch.device(self.device)
         world_group = dist.group.WORLD
@@ -1440,15 +1493,8 @@ class FSDP2Backend(BaseBackend):
         offloaded = [p for p in all_params if hasattr(p.grad, "_local_tensor")]
         plain_grads = [p.grad for p in all_params if not hasattr(p.grad, "_local_tensor")]
 
-        # --- Pass 1: moe gradient scaling (1/ep), chunked on the device, before
-        # the norm so the norm sees the ep-corrected moe grads.
-        if moe_params:
-            for chunk in self._iter_offloaded_chunks(moe_params):
-                self._scale_offloaded_chunk_on_device(
-                    chunk, reduce_device, self.gradient_scaling_factor
-                )
-
-        # --- Pass 2: global norm, chunked on the device.
+        # Scale expert gradients and accumulate their norm in the same device
+        # chunk, avoiding another H2D transfer of the scaled CPU gradients.
         def _accumulate(t, acc):
             if t.numel() == 0:
                 return acc
@@ -1458,11 +1504,24 @@ class FSDP2Backend(BaseBackend):
             return acc + (t.detach().float().abs() ** norm_type).sum()
 
         acc = torch.zeros((), device=reduce_device, dtype=torch.float32)
-        for chunk in self._iter_offloaded_chunks(offloaded):
-            chunk_dev = [l.to(reduce_device, non_blocking=True) for l in chunk]
-            self.device_runtime.synchronize()  # H2D complete before reading chunk_dev
-            for t in chunk_dev:
-                acc = _accumulate(t, acc)
+        for grad_params, scale_moe in (
+            (moe_params, True),
+            (params + ignored_params, False),
+        ):
+            for chunk in self._iter_offloaded_chunks(grad_params):
+                chunk_dev = [
+                    local.to(reduce_device, non_blocking=True) for local in chunk
+                ]
+                self.device_runtime.synchronize()
+                if scale_moe:
+                    torch._foreach_mul_(chunk_dev, self.gradient_scaling_factor)
+                    self.device_runtime.synchronize()
+                for tensor in chunk_dev:
+                    acc = _accumulate(tensor, acc)
+                if scale_moe:
+                    torch._foreach_copy_(chunk, chunk_dev)
+                    self.device_runtime.synchronize()
+                del tensor, chunk_dev
         # MAX reduction can hide a rank-local NaN.
         local_norm = acc.clone()
         reduce_op = dist.ReduceOp.MAX if norm_type == float("inf") else dist.ReduceOp.SUM
@@ -1473,7 +1532,7 @@ class FSDP2Backend(BaseBackend):
         total_norm = acc if norm_type == float("inf") else acc ** (1.0 / norm_type)
         assert_finite(torch.stack((local_norm, total_norm)), "gradient norm")
 
-        # --- Pass 3: clip scaling, chunked on the device.
+        # Clip the scaled CPU gradients, chunked on the device.
         clip_coef = float(max_norm) / (float(total_norm) + 1e-6)
         if clip_coef < 1.0:
             coef = min(clip_coef, 1.0)
@@ -1507,19 +1566,24 @@ class FSDP2Backend(BaseBackend):
             yield chunk
 
     def _scale_offloaded_chunk_on_device(self, cpu_locals, reduce_device, factor):
-        """Move one chunk of CPU-local grad shards to the compute device, scale by
-        ``factor`` (one batched ``_foreach_mul_``), and copy the result back into
-        the CPU local objects in place (persists to ``p.grad`` — the offloaded
-        param is on CPU, so ``p.grad`` cannot be reassigned).
+        """Scale one chunk of CPU-local grad shards on the compute device.
 
-        non_blocking H2D enqueues the chunk's copies concurrently, but the mul is
-        not guaranteed to share the H2D stream, so synchronize before reading
-        ``chunk_dev``; another sync after the D2H frees the device chunk so peak
-        stays at one chunk.
+        The chunk is moved to ``reduce_device``, scaled by ``factor`` with one
+        batched ``_foreach_mul_``, and copied back into the CPU local objects
+        in place. The in-place copy persists to ``p.grad``: the offloaded
+        param is on CPU, so ``p.grad`` cannot be reassigned.
+
+        non_blocking H2D enqueues the chunk's copies concurrently, but the mul
+        is not guaranteed to share the H2D stream, so synchronize before
+        reading ``chunk_dev``. Synchronize again after the mul so the CPU-side
+        copy reads the scaled values on every device. The final sync completes
+        the D2H and frees the device chunk, so peak stays at one chunk and the
+        scaled CPU gradients are visible to norm reduction and the optimizer.
         """
         chunk_dev = [l.to(reduce_device, non_blocking=True) for l in cpu_locals]
         self.device_runtime.synchronize()  # H2D complete before mul reads chunk_dev
         torch._foreach_mul_(chunk_dev, factor)
+        self.device_runtime.synchronize()  # mul complete before CPU copy reads chunk_dev
         torch._foreach_copy_(cpu_locals, chunk_dev)
         self.device_runtime.synchronize()  # D2H complete; chunk_dev freed on return
 

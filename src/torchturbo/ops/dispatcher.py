@@ -12,7 +12,7 @@ from torchturbo.logging import get_logger
 from torchturbo.runtime import DeviceRuntime, TurboDevice
 
 from .base import OpImpl, OpImplKind, OpPolicy, OpSpec
-from .packed_params import get_packed_params
+from .packed_params import PackedParams, get_packed_params
 from .providers import iter_provider_modules
 from .registry import OpRegistry
 
@@ -405,6 +405,51 @@ class OpDispatcher:
             use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
             packed_params=packed_params,
             save_backward_intermediates=save_backward_intermediates,
+            impl=impl,
+        )
+
+    def kda(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        *,
+        A_log: torch.Tensor | None = None,
+        dt_bias: torch.Tensor | None = None,
+        scale: float | None = None,
+        initial_state: torch.Tensor | None = None,
+        output_final_state: bool = False,
+        use_qk_l2norm_in_kernel: bool = False,
+        use_gate_in_kernel: bool = False,
+        safe_gate: bool = False,
+        lower_bound: float | None = None,
+        cu_seqlens: torch.Tensor | None = None,
+        packed_params: PackedParams | None = None,
+        impl: str | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if cu_seqlens is not None:
+            if packed_params is not None:
+                raise ValueError("pass either cu_seqlens or packed_params, not both")
+            packed_params = get_packed_params(cu_seqlens, q.size(1), device=q.device)
+        return self._dispatch(
+            "kda",
+            q,
+            k,
+            v,
+            g,
+            beta,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            scale=scale,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            use_gate_in_kernel=use_gate_in_kernel,
+            safe_gate=safe_gate,
+            lower_bound=lower_bound,
+            packed_params=packed_params,
             impl=impl,
         )
 

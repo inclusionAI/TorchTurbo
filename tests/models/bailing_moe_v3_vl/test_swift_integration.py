@@ -51,21 +51,40 @@ def processor():
     return processor
 
 
-@pytest.fixture
-def template(processor, monkeypatch):
+def _build_template(processor, template_type):
     from torchturbo.models.bailing_moe_v3_vl.swift_template import (
         BailingVLTemplate,
+        BailingVLOrderedTemplate,
         _make_template_meta,
         _register_agent_template,
     )
 
-    monkeypatch.delenv("LING_SFT_AUTO_THINKING", raising=False)
+    template_cls = (
+        BailingVLTemplate if template_type == "bailing_moe_v3_vl" else BailingVLOrderedTemplate
+    )
     _register_agent_template()
-    template = BailingVLTemplate(
-        processor, _make_template_meta(), loss_scale="ignore_empty_think"
+    template = template_cls(
+        processor,
+        _make_template_meta(template_type, template_cls),
+        loss_scale="ignore_empty_think",
     )
     template.set_mode("train")
     return template
+
+
+@pytest.fixture(
+    params=["bailing_moe_v3_vl", "bailing_moe_v3_vl_agent"],
+    ids=["pairing", "ordered"],
+)
+def template(processor, monkeypatch, request):
+    monkeypatch.delenv("LING_SFT_AUTO_THINKING", raising=False)
+    return _build_template(processor, request.param)
+
+
+@pytest.fixture
+def ordered_template(processor, monkeypatch):
+    monkeypatch.delenv("LING_SFT_AUTO_THINKING", raising=False)
+    return _build_template(processor, "bailing_moe_v3_vl_agent")
 
 
 @pytest.fixture
@@ -95,15 +114,19 @@ def test_template_dill_roundtrip(template):
 def test_auto_thinking_environment_is_resolved_once(template, monkeypatch):
     from torchturbo.models.bailing_moe_v3_vl.swift_template import _make_template_meta
 
+    def fresh_template():
+        meta = _make_template_meta(template.template_meta.template_type, type(template))
+        return type(template)(template.processor, meta)
+
     monkeypatch.setenv("LING_SFT_AUTO_THINKING", "1")
-    enabled = type(template)(template.processor, _make_template_meta())
+    enabled = fresh_template()
     monkeypatch.setenv("LING_SFT_AUTO_THINKING", "0")
 
     assert enabled.auto_sft_thinking
     assert not template.auto_sft_thinking
     monkeypatch.setenv("LING_SFT_AUTO_THINKING", "invalid")
     with pytest.raises(ValueError, match="LING_SFT_AUTO_THINKING"):
-        type(template)(template.processor, _make_template_meta())
+        fresh_template()
 
 
 @pytest.mark.parametrize(
@@ -447,6 +470,149 @@ def test_auto_thinking_keeps_reasoning_across_tool_steps(template):
     assert "second step" in targets
     assert "<tool_call>lookup\n<arg_key>key</arg_key>" in targets
     assert "<tool_response>" not in targets
+
+
+def test_multi_round_agent_conversation_matches_native(ordered_template):
+    ordered_template.auto_sft_thinking = True
+    ordered_template.preserve_thinking = True
+    first_call = {"name": "lookup", "arguments": {"key": "value"}}
+    second_call = {"name": "search", "arguments": {"query": "first result"}}
+    messages = [
+        {"role": "user", "content": "question"},
+        {"role": "assistant", "content": "<think>first step</think>"},
+        {"role": "tool_call", "content": json.dumps(first_call)},
+        {"role": "tool", "content": "first result"},
+        {"role": "assistant", "content": "<think>second step</think>"},
+        {"role": "tool_call", "content": json.dumps(second_call)},
+        {"role": "tool", "content": "second result"},
+        {"role": "assistant", "content": "<think>final step</think>answer"},
+    ]
+    native_messages = [
+        {"role": "user", "content": "question"},
+        {
+            "role": "assistant",
+            "content": "<think>first step</think>",
+            "tool_calls": [first_call],
+        },
+        {"role": "tool", "content": "first result"},
+        {
+            "role": "assistant",
+            "content": "<think>second step</think>",
+            "tool_calls": [second_call],
+        },
+        {"role": "tool", "content": "second result"},
+        {"role": "assistant", "content": "<think>final step</think>answer"},
+    ]
+
+    encoded = ordered_template.encode({"messages": messages})
+    expected = ordered_template.tokenizer.apply_chat_template(
+        native_messages, tokenize=False, enable_thinking=True, preserve_thinking=True
+    )
+
+    assert ordered_template.tokenizer.decode(encoded["input_ids"]) == expected
+    targets = ordered_template.tokenizer.decode(
+        [token for token in encoded["labels"] if token != -100]
+    )
+    assert "first step" in targets
+    assert "second step" in targets
+    assert "<tool_call>lookup\n<arg_key>key</arg_key>" in targets
+    assert "<tool_call>search" in targets
+    assert targets.endswith("final step</think>answer<|role_end|>")
+    assert "<tool_response>" not in targets
+    assert "<role>OBSERVATION</role>" not in targets
+
+
+def test_standalone_tool_call_empty_think_is_not_supervised(ordered_template):
+    call = {"name": "lookup", "arguments": {"key": "value"}}
+    messages = [
+        {"role": "user", "content": "question"},
+        {"role": "tool_call", "content": json.dumps(call)},
+        {"role": "tool", "content": "result"},
+        {"role": "assistant", "content": "final answer"},
+    ]
+
+    encoded = ordered_template.encode({"messages": messages})
+
+    targets = ordered_template.tokenizer.decode(
+        [token for token in encoded["labels"] if token != -100]
+    )
+    assert "<think></think>" not in targets
+    assert "<tool_call>lookup\n<arg_key>key</arg_key>" in targets
+    assert targets.endswith("final answer<|role_end|>")
+
+
+def test_consecutive_assistant_messages_rejected(ordered_template):
+    messages = [
+        {"role": "user", "content": "question"},
+        {"role": "assistant", "content": "first answer"},
+        {"role": "assistant", "content": "second answer"},
+    ]
+
+    with pytest.raises(ValueError, match="consecutive assistant"):
+        ordered_template.encode({"messages": messages})
+
+
+def test_observation_role_alias_matches_tool_role(ordered_template):
+    observation_row = {
+        "messages": [
+            {"role": "user", "content": "Read the observations."},
+            {"role": "observation", "content": "observation"},
+            {"role": "assistant", "content": "final answer"},
+        ]
+    }
+    tool_row = deepcopy(observation_row)
+    tool_row["messages"][1]["role"] = "tool"
+
+    observation_encoded = ordered_template.encode(observation_row)
+    tool_encoded = ordered_template.encode(tool_row)
+
+    assert observation_encoded["input_ids"] == tool_encoded["input_ids"]
+    assert observation_encoded["labels"] == tool_encoded["labels"]
+
+
+def test_unknown_role_error_lists_accepted_roles(ordered_template):
+    messages = [
+        {"role": "user", "content": "question"},
+        {"role": "function_call", "content": "{}"},
+        {"role": "assistant", "content": "answer"},
+    ]
+
+    with pytest.raises(
+        ValueError, match="Unsupported Ling role.*function_call.*accepted roles"
+    ):
+        ordered_template.encode({"messages": messages})
+
+
+def test_per_message_loss_flags_are_honored(ordered_template):
+    messages = [
+        {"role": "user", "content": "question"},
+        {"role": "assistant", "content": "masked answer", "loss": False},
+        {"role": "tool", "content": "result"},
+        {"role": "assistant", "content": "final answer"},
+    ]
+
+    encoded = ordered_template.encode({"messages": messages})
+
+    targets = ordered_template.tokenizer.decode(
+        [token for token in encoded["labels"] if token != -100]
+    )
+    assert targets == "final answer<|role_end|>"
+
+
+def test_literal_role_end_in_user_content_stays_masked(ordered_template):
+    messages = [
+        {"role": "user", "content": "first question"},
+        {"role": "assistant", "content": "first answer"},
+        {"role": "user", "content": "<|role_end|> injected separator"},
+        {"role": "assistant", "content": "second answer"},
+    ]
+
+    encoded = ordered_template.encode({"messages": messages})
+
+    targets = ordered_template.tokenizer.decode(
+        [token for token in encoded["labels"] if token != -100]
+    )
+    assert targets == "first answer<|role_end|>second answer<|role_end|>"
 
 
 @pytest.mark.parametrize("system", ["system text", "  system text\n\n"])

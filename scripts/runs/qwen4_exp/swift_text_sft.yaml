@@ -1,0 +1,22 @@
+engine_config:
+  parallel_plan:
+    sp_size: 8
+    ep_size: 16
+
+  activation_checkpointing:
+    enabled: true
+    use_reentrant: true
+
+  backend_config:
+    cpu_offload:
+      enabled: true
+      mode: full
+
+  checkpoint:
+    hf_export: final
+
+  moe:
+    aux_loss_coeff: 1e-6
+
+  mfu:
+    enabled: true

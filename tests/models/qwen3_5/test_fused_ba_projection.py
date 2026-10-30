@@ -1,6 +1,8 @@
 import torch
 
-from torchturbo.models.qwen3_5.model import _interleave_qkv_conv_parameter
+from torchturbo.models.modules.attention.gdn.forward import (
+    _interleave_qkv_conv_parameter,
+)
 
 
 def test_interleave_qkv_conv_parameter_matches_per_head_channel_order():
