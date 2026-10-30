@@ -8,7 +8,7 @@ from .plans import SharedMegaMoePlanPool
 
 
 class SharedExpertTransfer:
-    """Lease process-shared weight slots until their backward has consumed them."""
+    """Lease process-shared weight slots for each forward or backward call."""
 
     def __init__(
         self,
@@ -27,12 +27,17 @@ class SharedExpertTransfer:
         self.rank = dist.get_rank(group)
         self.root_size = dist.get_world_size(group)
         self.in_use = False
+        self.cache_token = None
+        self.generation = 0
+        self.cache_generation = None
         self.reuse_weight_slots = reuse_weight_slots
         self.execution_pools: list[SharedMegaMoePlanPool] = []
         self.statistics = {
             "prefetches": 0,
             "gradient_returns": 0,
             "host_plan_readbacks": 0,
+            "backward_prefetches": 0,
+            "backward_cache_hits": 0,
         }
         shmem.acquire(root_group=group)
         bridge = load_bridge()
@@ -64,15 +69,18 @@ class SharedExpertTransfer:
     def claim(self) -> None:
         if self.in_use:
             raise RuntimeError(
-                "Shared MoonEP weights require each layer backward before another retained forward; use reentrant activation checkpointing"
+                "Shared MoonEP weight slots do not support concurrent execution"
             )
         self.in_use = True
 
     def prefetch(
-        self, weights: tuple[torch.Tensor, ...], copies: torch.Tensor, extra: int
+        self, weights: tuple[torch.Tensor, ...], copies: torch.Tensor, extra: int,
+        *, token: object | None = None,
     ) -> tuple[torch.Tensor, ...]:
         bridge = load_bridge()
         assert self.in_use
+        self.cache_token = None
+        self.cache_generation = None
         for pool, weight in zip(self.weights, weights):
             pool[: self.local_experts].copy_(
                 weight.reshape_as(pool[: self.local_experts])
@@ -86,6 +94,9 @@ class SharedExpertTransfer:
                 self.root_size,
             )
         self.statistics["prefetches"] += 1
+        self.cache_token = token
+        self.generation += 1
+        self.cache_generation = self.generation
         # Every call gets distinct autograd metadata while sharing the leased storage.
         return tuple(
             weight[: self.local_experts + extra].detach() for weight in self.weights
@@ -104,6 +115,8 @@ class SharedExpertTransfer:
             bridge.reduce(owner, owner, slots, copies, self.rank)
             home.append(owner)
         self.statistics["gradient_returns"] += 1
+        self.cache_token = None
+        self.cache_generation = None
         self.in_use = False
         return tuple(home)
 
