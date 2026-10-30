@@ -8,7 +8,11 @@ import sys
 NATIVE_LIBRARIES: tuple[str, ...] = (
     "lib/vendors/mega_moe/op_api/lib/libcust_opapi.so",
     "lib/framework/torch/libmega_moe_torch.so",
+    "moonep/libmoonep_shared_kernels.so",
+    "moonep/_moonep_shared_bridge.so",
+    "moonep/_a3_allocator.so",
 )
+
 
 def activate() -> bool:
     package = Path(__file__).resolve().parent

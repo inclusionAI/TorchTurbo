@@ -109,6 +109,38 @@ def main() -> None:
     cmake(native / "torch", "torch-bindings", f"-DMEGA_MOE_VENDOR_ROOT={vendor}",
           f"-DPython3_EXECUTABLE={sys.executable}", prefix=package / "lib/framework/torch")
 
+    print("BUILD_PHASE moonep", flush=True)
+    sources = native / "operators/moonep"
+    target = package / "moonep"
+    includes = [torch_root / "include", torch_root / "include/torch/csrc/api/include",
+                npu_root / "include", Path(sysconfig.get_path("include")), sources / "include",
+                headers / "include", headers / "include/device", headers / "src", headers / "src/device",
+                cann / "include", cann / "include/runtime", cann / "pkg_inc",
+                cann / "pkg_inc/runtime", cann / f"{platform.machine()}-linux/include",
+                cann / f"{platform.machine()}-linux/pkg_inc",
+                cann / f"{platform.machine()}-linux/pkg_inc/runtime"]
+    opdev = sorted(p for p in cann.rglob("bfloat16.h") if p.parent.name == "opdev")
+    if not opdev:
+        raise RuntimeError("The selected CANN installation has no opdev/bfloat16.h")
+    includes.append(opdev[0].parent.parent)
+    incflags = [f"-I{p}" for p in includes if p.is_dir()]
+    libflags = [f"-L{p}" for p in (torch_root / "lib", npu_root / "lib", sdk_lib, cann / "lib64")]
+    common = ["-shared", "-fPIC", "-O2", "-std=c++17", f"-D_GLIBCXX_USE_CXX11_ABI={abi}"]
+    runtime = ["-lshmem", "-lshmem_utils", "-lascendcl", "-lruntime", "-ldl"]
+    rpath = f"-Wl,-rpath,$ORIGIN:{sdk_lib}"
+    run("bisheng", "-x", "asc", "--npu-arch=dav-2201", "--cce-auto-sync=off", "--cce-fatobj-link",
+        *common, sources / "moonep_expert_prefetch.cpp", sources / "moonep_expert_grad_reduce_bf16.cpp",
+        "-o", target / "libmoonep_shared_kernels.so", *incflags, *libflags, *runtime, rpath)
+    # Compile the host binding with g++: AscendC also defines device macros in its host pass.
+    run("g++", *common, "-DTORCH_EXTENSION_NAME=_moonep_shared_bridge",
+        sources / "moonep_shared_bridge.cpp", "-o", target / "_moonep_shared_bridge.so",
+        *incflags, f"-L{target}", *libflags, "-lmoonep_shared_kernels",
+        "-ltorch_npu", "-ltorch", "-lc10", "-ltorch_python", *runtime, rpath)
+    run("bisheng", "-x", "asc", "--npu-arch=dav-2201", "--cce-auto-sync=off", *common, "-O3",
+        "-DTORCH_EXTENSION_NAME=_a3_allocator", sources / "a3_allocator.asc",
+        "-o", target / "_a3_allocator.so", *incflags, *libflags,
+        "-ltorch_npu", "-ltorch", "-lc10", "-ltorch_python")
+
     print("BUILD_COMPLETE " + str(package), flush=True)
 
 

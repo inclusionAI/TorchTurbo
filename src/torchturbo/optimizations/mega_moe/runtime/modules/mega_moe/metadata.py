@@ -4,6 +4,7 @@ import torch
 
 from .route import RouteMetadata
 from .spec import MegaMoeSpec
+from ...moonep import _device_ub_bytes, load_allocator
 
 
 def _native_metadata(
@@ -35,11 +36,30 @@ def _native_metadata(
 
 
 def compute_metadata(
-    counts: torch.Tensor, counts_by_source: torch.Tensor,
-    received_counts: torch.Tensor, spec: MegaMoeSpec, expert_capacity: int,
+    counts: torch.Tensor,
+    counts_by_source: torch.Tensor,
+    received_counts: torch.Tensor,
+    spec: MegaMoeSpec,
+    expert_capacity: int,
 ) -> RouteMetadata:
-    """Build the standalone operator offsets using PyTorch tensor operations."""
-    return _native_metadata(counts, counts_by_source, received_counts, spec, expert_capacity)
+    """Fuse offsets when they fit UB; use tiled CANN operators for larger tables."""
+    experts, ranks, local = spec.num_experts, spec.ep_size, spec.local_experts
+    stride = (experts + 31) // 32 * 32
+    aligned = lambda n: (n + 7) // 8 * 8
+    scratch_bytes = (aligned(ranks * experts) + 3 * stride + 2 * aligned(local)) * 4
+    if scratch_bytes > _device_ub_bytes(counts.device.index) * 3 // 4:
+        return _native_metadata(counts, counts_by_source, received_counts, spec, expert_capacity)
+    offsets, sizes = load_allocator().metadata(counts_by_source.contiguous(), spec.rank_id, spec.hidden_size)
+    combine_src = offsets[2 * stride:2 * stride + experts]
+    combine_target = offsets[3 * stride:3 * stride + experts]
+    combine_size = sizes[stride:stride + experts]
+    return RouteMetadata(
+        dispatch_src_off=combine_target if spec.dispatch_mode == "pull" else offsets[:experts],
+        dispatch_target_off=combine_src if spec.dispatch_mode == "pull" else offsets[stride:stride + experts],
+        dispatch_size=combine_size if spec.dispatch_mode == "pull" else sizes[:experts],
+        combine_src_off=combine_src, combine_target_off=combine_target,
+        combine_size=combine_size, group_list=offsets[4 * stride:], expert_capacity=expert_capacity,
+    )
 
 
 def route_summary(counts: torch.Tensor) -> list[int]:
