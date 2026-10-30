@@ -67,7 +67,7 @@ except ImportError:
 # model. Config ``kda_implementation: naive`` forces the private naive
 # impl (for stacks where the kernel imports but deadlocks at runtime,
 # e.g. old triton-ascend aicore timeout).
-from torchturbo import ops
+from torchturbo.ops import ops
 
 from .chunk_kda_naive import chunk_kda_naive
 from .configuration_kimi_k3 import KimiLinearConfig

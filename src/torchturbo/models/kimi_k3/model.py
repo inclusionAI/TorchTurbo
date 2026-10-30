@@ -426,7 +426,7 @@ class TurboKimiK3ForConditionalGeneration(
             # Same routing as the official forward: shared ops.kda facade
             # (fla_kda on GPU, ascendc_kda on NPU; kda_implementation='naive'
             # calls the model-private pure-PyTorch impl directly).
-            from torchturbo import ops
+            from torchturbo.ops import ops
 
             kda_impl = getattr(self.config, "kda_implementation", "naive")
 
