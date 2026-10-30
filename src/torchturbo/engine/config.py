@@ -476,6 +476,7 @@ class MoEConfig:
 
     aux_loss_coeff: float = 0.0
     z_loss_coeff: float = 0.0
+    inplace_perm: bool = False
 
 
 @dataclass
@@ -1180,6 +1181,7 @@ def _validate_config_file(data: Mapping[str, Any], parents: tuple[str, ...] = ()
             "backend_config.cpu_offload.enabled",
             "backend_config.cpu_offload.mode",
             "backend_config.cpu_offload.optimizer_memory_fraction",
+            "moe.inplace_perm",
         }
     )
     allowed.update(_dataclass_config_paths(OptimizerConfig, ("optimizer",)))
@@ -1301,6 +1303,7 @@ def _build_moe_config(fields: Mapping[str, Any]) -> MoEConfig:
     return MoEConfig(
         aux_loss_coeff=float(moe_d.get("aux_loss_coeff", 0.0)),
         z_loss_coeff=float(moe_d.get("z_loss_coeff", 0.0)),
+        inplace_perm=string_to_bool(moe_d.get("inplace_perm", False)),
     )
 
 
