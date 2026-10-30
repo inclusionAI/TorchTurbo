@@ -51,3 +51,7 @@ logs/
 # OS generated files
 **/.DS_Store
 Thumbs.db
+
+# MegaMoE native build outputs
+src/torchturbo/optimizations/mega_moe/runtime/lib/
+src/torchturbo/optimizations/mega_moe/runtime/moonep/*.so

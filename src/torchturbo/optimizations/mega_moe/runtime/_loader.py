@@ -1,0 +1,113 @@
+# Copyright 2026 Huawei Technologies Co., Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ============================================================================
+"""Locate and load the component-owned multicore payload."""
+
+from __future__ import annotations
+
+import ctypes
+import os
+from pathlib import Path
+import sys
+
+_VENDOR_NAME = "mega_moe"
+
+
+class NativeComponentUnavailableError(RuntimeError):
+    """Report an unavailable or incorrectly activated multicore component."""
+
+
+def require_multicore_environment() -> Path:
+    """Require native paths prepared by the feature bootstrap."""
+    component_root = _component_root()
+    vendor_root = component_root / "vendors" / _VENDOR_NAME
+    if not vendor_root.is_dir():
+        raise NativeComponentUnavailableError(
+            f"[NATIVE-PAYLOAD-MISSING] component=multicore vendor={vendor_root}. "
+            "Inspect the current build log; for source/PYTHONPATH development, run "
+            "bash scripts/runs/deps/mega_moe.sh ."
+        )
+    vendor_root = vendor_root.resolve()
+    op_api_root = (vendor_root / "op_api" / "lib").resolve()
+    required_library_roots = (op_api_root,)
+    missing_variables = []
+    if not _environment_contains_path("ASCEND_CUSTOM_OPP_PATH", vendor_root):
+        missing_variables.append("ASCEND_CUSTOM_OPP_PATH")
+    if not all(_environment_contains_path("LD_LIBRARY_PATH", path) for path in required_library_roots):
+        missing_variables.append("LD_LIBRARY_PATH")
+    if missing_variables:
+        bootstrap = component_root.parent / "bootstrap.py"
+        missing_text = ",".join(missing_variables)
+        if any(module in sys.modules for module in ("torch", "torch_npu")):
+            raise NativeComponentUnavailableError(
+                "[NATIVE-OPP-ACTIVATION-TOO-LATE] component=multicore "
+                f"missing={missing_text}. Torch/torch_npu has already been imported; "
+                f"exit the current Python process, activate {bootstrap} before importing Torch."
+            )
+        raise NativeComponentUnavailableError(
+            "[NATIVE-OPP-NOT-ACTIVATED] component=multicore "
+            f"missing={missing_text}. Activate {bootstrap} before importing Torch."
+        )
+    return vendor_root.resolve()
+
+
+def get_multicore_adapter_path(adapter_name: str) -> tuple[Path, Path]:
+    """Return the unified vendor root and one named Torch adapter.
+
+    Args:
+        adapter_name: Component-owned adapter basename without ``lib`` or ``.so``.
+
+    Returns:
+        Unified vendor root and resolved adapter path.
+    """
+    vendor_root = require_multicore_environment()
+    adapter = _component_root() / "framework" / "torch" / f"lib{adapter_name}.so"
+    vendor_library = vendor_root / "op_api" / "lib" / "libcust_opapi.so"
+    if not vendor_library.is_file() or not adapter.is_file():
+        raise NativeComponentUnavailableError(
+            "[NATIVE-FRAMEWORK-TARGET-UNAVAILABLE] component=multicore framework=torch "
+            f"root={_component_root()}. The current source build does not include an adapter for this "
+            "framework; rebuild with scripts/runs/deps/mega_moe.sh  and inspect the build log."
+        )
+    return vendor_root, adapter.resolve()
+
+
+def get_multicore_paths() -> tuple[Path, Path]:
+    """Return the unified vendor root and legacy MegaMoe Torch adapter."""
+    return get_multicore_adapter_path("mega_moe_torch")
+
+
+def preload_vendor_library(vendor_root: Path) -> None:
+    """Load the exact ACLNN library without exposing its dependency symbols globally."""
+    library_path = vendor_root / "op_api" / "lib" / "libcust_opapi.so"
+    try:
+        # CANN libraries can export identically named globals. Global promotion
+        # can bind their independent destructors to the same object at exit.
+        # ACLNN entry points are resolved through the vendor library handle.
+        ctypes.CDLL(str(library_path), mode=ctypes.RTLD_LOCAL)
+    except OSError as error:
+        raise NativeComponentUnavailableError(
+            f"[NATIVE-VENDOR-LOAD-FAILED] library={library_path} error={error}."
+        ) from error
+
+
+def _component_root() -> Path:
+    """Return the installed or source-build multicore payload root."""
+    return Path(__file__).resolve().parent / "lib"
+
+
+def _environment_contains_path(variable: str, expected: Path) -> bool:
+    """Return whether an environment path list contains ``expected``."""
+    configured = [value for value in os.environ.get(variable, "").split(os.pathsep) if value]
+    return str(expected.resolve()) in {str(Path(value).resolve()) for value in configured}
