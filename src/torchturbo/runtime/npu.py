@@ -37,38 +37,61 @@ class _NpuProfiler(BaseProfiler):
         output_dir: str,
         worker_name: str,
         profiling_enabled: bool,
+        record_shapes: bool,
+        aic_metrics: bool,
+        with_stack: bool,
+        profiling_step: int | None,
         memory_snapshot_steps: int | None,
     ) -> None:
         self._profiler = None
         if profiling_enabled:
             import torch_npu
 
+            # Level0 omits input shapes from kernel_details.csv and drops the
+            # AiCore utilization columns; Level1 emits both. aic_metrics needs
+            # a non-None value for the utilization counters to be collected.
+            detailed_kernel_info = record_shapes or aic_metrics
+            profiler_level = (
+                torch_npu.profiler.ProfilerLevel.Level1
+                if detailed_kernel_info
+                else torch_npu.profiler.ProfilerLevel.Level0
+            )
             experimental_config = torch_npu.profiler._ExperimentalConfig(
                 export_type=[torch_npu.profiler.ExportType.Text],
-                profiler_level=torch_npu.profiler.ProfilerLevel.Level0,
+                profiler_level=profiler_level,
                 mstx=False,
-                aic_metrics=torch_npu.profiler.AiCMetrics.AiCoreNone,
+                aic_metrics=(
+                    torch_npu.profiler.AiCMetrics.PipeUtilization
+                    if aic_metrics
+                    else torch_npu.profiler.AiCMetrics.AiCoreNone
+                ),
                 l2_cache=False,
                 op_attr=False,
-                data_simplification=False,
+                data_simplification=True,
                 record_op_args=False,
                 gc_detect_threshold=None,
             )
 
+            # Training step N (1-based) runs inside the ProfilerStep#(N-1)
+            # record_function window, so profiling_step=N maps to
+            # skip_first=N-1. With no profiling_step, default to step 1.
+            skip_first = (
+                profiling_step - 1 if profiling_step is not None else 0
+            )
             self._profiler = torch_npu.profiler.profile(
                 activities=[
                     torch_npu.profiler.ProfilerActivity.CPU,
                     torch_npu.profiler.ProfilerActivity.NPU,
                 ],
                 schedule=torch_npu.profiler.schedule(
-                    wait=0, warmup=10, active=1, repeat=1, skip_first=1
+                    wait=0, warmup=0, active=1, repeat=1, skip_first=skip_first
                 ),
                 on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(
                     output_dir, worker_name=worker_name
                 ),
-                record_shapes=False,
+                record_shapes=record_shapes,
                 profile_memory=False,
-                with_stack=False,
+                with_stack=with_stack,
                 with_modules=False,
                 with_flops=False,
                 experimental_config=experimental_config,
@@ -200,11 +223,19 @@ class NpuRuntime(DeviceRuntime):
         output_dir: str,
         worker_name: str,
         profiling_enabled: bool,
+        record_shapes: bool,
+        aic_metrics: bool,
+        with_stack: bool,
+        profiling_step: int | None,
         memory_snapshot_steps: int | None,
     ) -> BaseProfiler:
         return _NpuProfiler(
             output_dir,
             worker_name,
             profiling_enabled,
+            record_shapes,
+            aic_metrics,
+            with_stack,
+            profiling_step,
             memory_snapshot_steps,
         )

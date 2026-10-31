@@ -355,7 +355,17 @@ Most environment variables have corresponding higher-priority `--tt_*` CLI argum
 | VLM freezing | `--tt_freeze_vision_tower` / `--tt_freeze_multi_modal_projector` / `--tt_freeze_language_model` |
 | Diffusion models (LLaDA2) | `--tt_cap_lambda` / `--tt_bd_mask_low` / `--tt_bd_mask_high` / `--tt_bd_block_size` |
 | Checkpointing | `--tt_hf_export` |
-| Profiling, metrics, and logging | `--tt_profiling` / `--tt_memory_snapshot_steps` / `--tt_log_mfu` / `--tt_card_name` / `--tt_log_level` |
+| Profiling, metrics, and logging | `--tt_profiling` / `--tt_profiling_config` / `--tt_memory_snapshot_steps` / `--tt_log_mfu` / `--tt_card_name` / `--tt_log_level` |
+
+`--tt_profiling` profiles the first training step into `{output_dir}/profiling/`.
+Add `--tt_profiling_config` to collect extra details (a JSON dict; quote it in
+the shell so it survives as one token): `{"detailed_kernel_info": true}` records
+kernel-level input shapes and AiCore utilization metrics in
+`kernel_details.csv` (raises the NPU profiler level to Level1),
+`{"with_stack": true}` records the Python call stack, and
+`{"profiling_step": 20}` profiles a later 1-based training step instead. The
+bool knobs default to false and all knobs only take effect together with
+`--tt_profiling`.
 
 DeepSeek-V4 MTP and DSpark jointly train the backbone and draft modules, including
 the shared embedding and output head. DSpark stops gradients through its reference

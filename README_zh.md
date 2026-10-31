@@ -311,7 +311,9 @@ docs/runs/
 | VLM 冻结 | `--tt_freeze_vision_tower` / `--tt_freeze_multi_modal_projector` / `--tt_freeze_language_model` |
 | 扩散模型（LLaDA2） | `--tt_cap_lambda` / `--tt_bd_mask_low` / `--tt_bd_mask_high` / `--tt_bd_block_size` |
 | Checkpoint | `--tt_hf_export` |
-| 性能分析、指标与日志 | `--tt_profiling` / `--tt_memory_snapshot_steps` / `--tt_log_mfu` / `--tt_card_name` / `--tt_log_level` |
+| 性能分析、指标与日志 | `--tt_profiling` / `--tt_profiling_config` / `--tt_memory_snapshot_steps` / `--tt_log_mfu` / `--tt_card_name` / `--tt_log_level` |
+
+`--tt_profiling` 将第一个训练 step 的 profile 数据采集到 `{output_dir}/profiling/`。加 `--tt_profiling_config` 可额外采集细节（JSON dict，shell 中需用单引号包裹避免被拆分）：`{"detailed_kernel_info": true}` 采集 kernel 级输入形状与 AiCore 利用率指标（写入 `kernel_details.csv`；NPU profiler 级别升到 Level1），`{"with_stack": true}` 采集 Python 调用栈，`{"profiling_step": 20}` 改为采集第 20 个训练 step（1 起算）。bool 开关默认 false，所有键仅与 `--tt_profiling` 同用时生效。
 
 DeepSeek-V4 MTP 和 DSpark 联合训练主干与 draft 模块，包括共享 embedding 和输出 head。
 DSpark 的参考分布保持停止梯度，主干上下文特征允许梯度回传。

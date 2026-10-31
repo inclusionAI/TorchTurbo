@@ -238,3 +238,38 @@ def test_parse_torchturbo_args_mtp_log_loss():
 
     assert args.mtp_log_loss is True
     assert remaining == ["--other"]
+
+
+def test_parse_torchturbo_args_profiling():
+    from torchturbo.engine.args import parse_torchturbo_args
+
+    args, remaining = parse_torchturbo_args(
+        [
+            "--tt_profiling",
+            "--tt_profiling_config",
+            '{"detailed_kernel_info": true, "profiling_step": 20}',
+            "--other",
+        ]
+    )
+    assert args.profiling is True
+    assert args.profiling_config == {
+        "detailed_kernel_info": True,
+        "profiling_step": 20,
+    }
+    # Non-tt args stay in remaining for the training framework parser.
+    assert remaining == ["--other"]
+
+    # The config dict parses on its own but does not enable profiling.
+    args, _ = parse_torchturbo_args(["--tt_profiling_config", '{"with_stack": true}'])
+    assert args.profiling is False
+    assert args.profiling_config == {"with_stack": True}
+
+    for invalid in (
+        "bogus",
+        '{"bad": true}',
+        '{"detailed_kernel_info": "yes"}',
+        '{"profiling_step": 0}',
+        '{"profiling_step": "2"}',
+    ):
+        with pytest.raises(SystemExit, match="2"):
+            parse_torchturbo_args(["--tt_profiling_config", invalid])

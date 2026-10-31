@@ -992,10 +992,19 @@ class TestEngineSetup:
             output_dir: str,
             worker_name: str,
             profiling_enabled: bool,
+            record_shapes: bool,
+            aic_metrics: bool,
+            with_stack: bool,
+            profiling_step: int | None,
             memory_snapshot_steps: int | None,
         ):
             profiler_kwargs["output_dir"] = output_dir
             profiler_kwargs["worker_name"] = worker_name
+            profiler_kwargs["profiling_enabled"] = profiling_enabled
+            profiler_kwargs["record_shapes"] = record_shapes
+            profiler_kwargs["aic_metrics"] = aic_metrics
+            profiler_kwargs["with_stack"] = with_stack
+            profiler_kwargs["profiling_step"] = profiling_step
             return profiler
 
         monkeypatch.setattr(runtime, "profiler", fake_profiler)
@@ -1014,7 +1023,73 @@ class TestEngineSetup:
         assert profiler.calls == ["start", "step", "stop"]
         assert profiler_kwargs["output_dir"] == str(tmp_path / "profiling")
         assert profiler_kwargs["worker_name"].startswith("rank")
+        assert profiler_kwargs["profiling_enabled"] is True
+        assert profiler_kwargs["record_shapes"] is False
+        assert profiler_kwargs["aic_metrics"] is False
+        assert profiler_kwargs["with_stack"] is False
+        assert profiler_kwargs["profiling_step"] is None
         assert (tmp_path / "profiling").is_dir()
+
+    def test_profiling_config_knobs_reach_runtime_profiler(
+        self, monkeypatch, tmp_path
+    ):
+        runtime = CpuRuntime()
+        recorder = RecordingProfiler()
+        profiler_kwargs = {}
+
+        def fake_profiler(
+            *,
+            output_dir: str,
+            worker_name: str,
+            profiling_enabled: bool,
+            record_shapes: bool,
+            aic_metrics: bool,
+            with_stack: bool,
+            profiling_step: int | None,
+            memory_snapshot_steps: int | None,
+        ):
+            profiler_kwargs["profiling_enabled"] = profiling_enabled
+            profiler_kwargs["record_shapes"] = record_shapes
+            profiler_kwargs["aic_metrics"] = aic_metrics
+            profiler_kwargs["with_stack"] = with_stack
+            profiler_kwargs["profiling_step"] = profiling_step
+            return recorder
+
+        monkeypatch.setattr(runtime, "profiler", fake_profiler)
+        monkeypatch.setattr(engine_core, "get_device_runtime", lambda: runtime)
+        monkeypatch.setattr(
+            engine_core,
+            "get_backend",
+            lambda backend_name: DummyBackend if backend_name == "fsdp2" else None,
+        )
+
+        engine = TorchTurboEngine(EngineConfig())
+
+        # detailed_kernel_info fans out to both shape and utilization knobs.
+        engine.start_profiling(
+            str(tmp_path), True, None, {"detailed_kernel_info": True}
+        )
+        assert profiler_kwargs["record_shapes"] is True
+        assert profiler_kwargs["aic_metrics"] is True
+        assert profiler_kwargs["with_stack"] is False
+        assert profiler_kwargs["profiling_step"] is None
+
+        engine.start_profiling(
+            str(tmp_path), True, None, {"profiling_step": 20}
+        )
+        assert profiler_kwargs["profiling_step"] == 20
+
+        engine.start_profiling(str(tmp_path), True, None, {"with_stack": True})
+        assert profiler_kwargs["record_shapes"] is False
+        assert profiler_kwargs["aic_metrics"] is False
+        assert profiler_kwargs["with_stack"] is True
+
+        # Knobs are ignored when profiling is disabled (snapshot-only mode).
+        engine.start_profiling(str(tmp_path), False, 3, {"detailed_kernel_info": True})
+        assert profiler_kwargs["record_shapes"] is False
+        assert profiler_kwargs["aic_metrics"] is False
+        assert profiler_kwargs["with_stack"] is False
+        assert profiler_kwargs["profiling_step"] is None
 
     def test_profiling_start_failure_clears_previous_profiler(
         self, monkeypatch, tmp_path
@@ -1035,8 +1110,23 @@ class TestEngineSetup:
             output_dir: str,
             worker_name: str,
             profiling_enabled: bool,
+            record_shapes: bool,
+            aic_metrics: bool,
+            with_stack: bool,
+            profiling_step: int | None,
             memory_snapshot_steps: int | None,
         ):
+            # Failure-path test: kwargs are irrelevant.
+            del (
+                output_dir,
+                worker_name,
+                profiling_enabled,
+                record_shapes,
+                aic_metrics,
+                with_stack,
+                profiling_step,
+                memory_snapshot_steps,
+            )
             return next(profilers)
 
         monkeypatch.setattr(runtime, "profiler", fake_profiler)

@@ -232,12 +232,18 @@ class TurboTrainerMixin:
             if engine is not None and tt_args is not None
             else None
         )
+        profiling_config = (
+            tt_args.profiling_config
+            if engine is not None and tt_args is not None
+            else None
+        )
         if profiling_enabled or memory_snapshot_steps is not None:
             self.add_callback(self._make_torchturbo_profiling_callback())
             engine.start_profiling(
                 self.args.output_dir,
                 profiling_enabled,
                 memory_snapshot_steps,
+                profiling_config,
             )
         try:
             return super().train(*args, **kwargs)

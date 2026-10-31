@@ -378,6 +378,9 @@ class TorchTurboTrainerBase:
         memory_snapshot_steps = (
             tt_args.memory_snapshot_steps if tt_args is not None else None
         )
+        profiling_config = (
+            tt_args.profiling_config if tt_args is not None else None
+        )
         if profiling_enabled or memory_snapshot_steps is not None:
             profiling_callback = self._make_torchturbo_profiling_callback()
             self.add_callback(profiling_callback)
@@ -385,6 +388,7 @@ class TorchTurboTrainerBase:
                 self.args.output_dir,
                 profiling_enabled,
                 memory_snapshot_steps,
+                profiling_config,
             )
 
         try:
