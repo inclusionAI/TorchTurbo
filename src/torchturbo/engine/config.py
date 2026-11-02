@@ -527,38 +527,61 @@ class MfuConfig:
 
 @dataclass(frozen=True)
 class FreezePolicy:
-    """Engine config for freezing semantic model parameter groups."""
+    """Freeze parameters by semantic group and/or FQN wildcard pattern
+    ('*' within one segment, '**' across segments; matched on base-model
+    FQNs, so LoRA adapters stay trainable unless a pattern selects them)."""
 
     parameter_groups: tuple[ParameterGroup, ...] = ()
+    patterns: tuple[str, ...] = ()
 
     @property
     def enabled(self) -> bool:
-        return bool(self.parameter_groups)
+        return bool(self.parameter_groups or self.patterns)
 
     @classmethod
     def from_list(
         cls,
-        groups: Iterable[ParameterGroup | str] | ParameterGroup | str | None,
+        entries: Iterable[ParameterGroup | str] | ParameterGroup | str | None,
     ) -> FreezePolicy:
-        if groups is None:
+        """Build a policy from mixed group names and FQN patterns."""
+        if entries is None:
             return cls()
-        if isinstance(groups, (ParameterGroup, str)):
-            groups = (groups,)
-        normalized = []
-        seen = set()
-        for group in groups:
-            parameter_group = cls._coerce_group(group)
-            if parameter_group in seen:
+        if isinstance(entries, (ParameterGroup, str)):
+            entries = (entries,)
+        groups: list[ParameterGroup] = []
+        patterns: list[str] = []
+        for entry in entries:
+            group = cls._try_coerce_group(entry)
+            if group is not None:
+                if group not in groups:
+                    groups.append(group)
                 continue
-            normalized.append(parameter_group)
-            seen.add(parameter_group)
-        return cls(tuple(normalized))
+            pattern = cls._coerce_pattern(entry)
+            if pattern not in patterns:
+                patterns.append(pattern)
+        return cls(tuple(groups), tuple(patterns))
 
     @staticmethod
-    def _coerce_group(group: ParameterGroup | str) -> ParameterGroup:
-        if isinstance(group, ParameterGroup):
-            return group
-        return ParameterGroup(group)
+    def _try_coerce_group(entry: Any) -> ParameterGroup | None:
+        if isinstance(entry, ParameterGroup):
+            return entry
+        if isinstance(entry, str):
+            try:
+                return ParameterGroup(entry)
+            except ValueError:
+                return None
+        raise TypeError(
+            "FreezePolicy entries must be ParameterGroup members or strings, "
+            f"got {type(entry).__name__}."
+        )
+
+    @staticmethod
+    def _coerce_pattern(entry: Any) -> str:
+        if not isinstance(entry, str) or not entry.strip():
+            raise ValueError(
+                f"FreezePolicy patterns must be non-empty strings, got {entry!r}."
+            )
+        return entry.strip()
 
 
 # ---------------------------------------------------------------------------
@@ -949,18 +972,22 @@ class EngineConfig:
             return value
         if value is None or value == {}:
             return FreezePolicy()
+        if isinstance(value, (list, tuple)):
+            return FreezePolicy.from_list(value)
         if not isinstance(value, dict):
-            raise TypeError("freeze_policy must be a dict or FreezePolicy.")
+            raise TypeError(
+                "freeze_policy must be a dict, a list, or a FreezePolicy."
+            )
 
-        allowed_keys = {"parameter_groups"}
+        allowed_keys = {"parameter_groups", "patterns"}
         unknown_keys = set(value) - allowed_keys
         if unknown_keys:
             keys = ", ".join(sorted(unknown_keys))
             raise ValueError(f"Unknown freeze_policy field(s): {keys}.")
-        if "parameter_groups" not in value:
-            raise ValueError("freeze_policy requires 'parameter_groups'.")
 
-        return FreezePolicy.from_list(value["parameter_groups"])
+        entries = [*_as_entry_list(value.get("parameter_groups"))]
+        entries.extend(_as_entry_list(value.get("patterns")))
+        return FreezePolicy.from_list(entries)
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize configuration fields for logging or reconstruction."""
@@ -1166,6 +1193,7 @@ def _validate_config_file(data: Mapping[str, Any], parents: tuple[str, ...] = ()
             "backend_config.cpu_offload.enabled",
             "backend_config.cpu_offload.mode",
             "backend_config.cpu_offload.optimizer_memory_fraction",
+            "freeze_policy.patterns",
         }
     )
     allowed.update(_dataclass_config_paths(OptimizerConfig, ("optimizer",)))
@@ -1291,6 +1319,15 @@ def _build_moe_config(fields: Mapping[str, Any]) -> MoEConfig:
     )
 
 
+def _as_entry_list(value: Any) -> list[Any]:
+    """Normalize an absent/scalar/list config value into an entry list."""
+    if value is None:
+        return []
+    if isinstance(value, (str, ParameterGroup)):
+        return [value]
+    return list(value)
+
+
 def _build_freeze_policy(fields: Mapping[str, Any]) -> FreezePolicy:
     """FreezePolicy from the merged config dict."""
     freeze_d = fields.get("freeze_policy") or {}
@@ -1306,7 +1343,8 @@ def _build_freeze_policy(fields: Mapping[str, Any]) -> FreezePolicy:
         )
         if enabled
     ]
-    return FreezePolicy.from_list(groups)
+    patterns = _as_entry_list(freeze_d.get("patterns"))
+    return FreezePolicy.from_list([*groups, *patterns])
 
 
 def _build_mfu_config(fields: Mapping[str, Any]) -> MfuConfig:

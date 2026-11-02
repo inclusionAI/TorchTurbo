@@ -25,7 +25,7 @@ from .config import EngineConfig, FreezePolicy
 from .metrics import MetricTracker
 from .optimizers import MuonPlan, OptimizerClassPlan
 from .optimizers.lr_scheduler import create_lr_scheduler
-from .utils import has_meta_tensor
+from .utils import has_meta_tensor, match_fqn, strip_peft_prefix
 from torchturbo.adapters.rl.packed import (
     gather_logprobs_entropy,
     get_packed_mb_orig,
@@ -394,11 +394,19 @@ class TorchTurboEngine:
         if not policy.enabled:
             return
 
+        if policy.parameter_groups:
+            self._freeze_parameter_groups(model, policy)
+        if policy.patterns:
+            self._freeze_patterns(model, policy)
+
+    def _freeze_parameter_groups(
+        self, model: nn.Module, policy: FreezePolicy
+    ) -> None:
         get_parameter_groups = getattr(model, "get_parameter_groups", None)
         if not callable(get_parameter_groups):
             raise TypeError(
-                "FreezePolicy requires models to expose get_parameter_groups(). "
-                f"Got {type(model).__name__}."
+                "FreezePolicy parameter groups require models to expose "
+                f"get_parameter_groups(). Got {type(model).__name__}."
             )
 
         parameter_groups = get_parameter_groups()
@@ -431,6 +439,31 @@ class TorchTurboEngine:
                 tensor_count,
                 element_count,
                 group.value,
+            )
+
+    def _freeze_patterns(self, model: nn.Module, policy: FreezePolicy) -> None:
+        # A parameter matched by several patterns is frozen once, counted per pattern.
+        matched: dict[str, int] = {pattern: 0 for pattern in policy.patterns}
+        element_counts: dict[str, int] = {pattern: 0 for pattern in policy.patterns}
+        for name, param in model.named_parameters():
+            fqn = strip_peft_prefix(name)
+            for pattern in policy.patterns:
+                if match_fqn(pattern, fqn):
+                    param.requires_grad_(False)
+                    matched[pattern] += 1
+                    element_counts[pattern] += param.numel()
+
+        for pattern in policy.patterns:
+            if matched[pattern] == 0:
+                raise ValueError(
+                    f"FreezePolicy pattern {pattern!r} matched no parameters "
+                    f"in {type(model).__name__}."
+                )
+            logger.info_rank0(
+                "Froze %d parameter tensors (%d elements) matching pattern %r",
+                matched[pattern],
+                element_counts[pattern],
+                pattern,
             )
 
     def prepare_model(
