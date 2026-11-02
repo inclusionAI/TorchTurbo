@@ -910,6 +910,45 @@ def test_explicit_false_freeze_clears_all_groups(tmp_path):
     assert cfg.freeze_policy.parameter_groups == ()
 
 
+def test_file_freeze_patterns_parsed(tmp_path):
+    path = _write(
+        tmp_path,
+        "cfg.yaml",
+        _engine_config(
+            "freeze_policy:\n"
+            "  vision_tower: true\n"
+            "  patterns:\n"
+            "    - model.layers.*.mlp.**\n"
+            "    - lm_head.weight\n"
+        ),
+    )
+
+    cfg = build_from_args(
+        TorchTurboArgs(config_path=path)
+    )
+
+    assert cfg.freeze_policy.parameter_groups == (ParameterGroup.VISION_TOWER,)
+    assert cfg.freeze_policy.patterns == (
+        "model.layers.*.mlp.**",
+        "lm_head.weight",
+    )
+
+
+def test_file_freeze_patterns_accept_single_string(tmp_path):
+    path = _write(
+        tmp_path,
+        "cfg.yaml",
+        _engine_config(
+            "freeze_policy:\n"
+            '  patterns: "model.layers.*.mlp.**"\n'
+        ),
+    )
+
+    cfg = build_from_args(TorchTurboArgs(config_path=path))
+
+    assert cfg.freeze_policy.patterns == ("model.layers.*.mlp.**",)
+
+
 # ---------------------------------------------------------------------------
 # parallel_plan.plan parsing from files
 # ---------------------------------------------------------------------------
