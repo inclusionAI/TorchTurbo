@@ -5,11 +5,12 @@ from typing import Any
 import torch
 from torch import nn
 
-from ..modules.vision.io import PackedPatchVisionBalanceIO, VisionBatch
+from ..modules.vision.io import VisionBatch
+from ..qwen3_5.vision_balance import Qwen3_5VisionBalanceIO
 
 
-class BailingVisionBalanceIO(PackedPatchVisionBalanceIO):
-    """Balance packed pixels and the tower's merged feature tensor."""
+class BailingVisionBalanceIO(Qwen3_5VisionBalanceIO):
+    """Reuse Qwen vision inputs and restore Bailing's merged feature tensor."""
 
     def output_lengths(
         self, tower: nn.Module, grid_thw: torch.Tensor
