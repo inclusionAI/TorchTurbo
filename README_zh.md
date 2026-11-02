@@ -81,6 +81,12 @@ engine_config:
 Python 调用使用 `VisionBalanceMode.PATCH` 或 `VisionBalanceMode.PATCH_SQ`；
 文件中的文本在解析时转换成 enum。
 
+当全局媒体池（按 SP 组去重）的媒体数少于 WORLD 卡数时，所有 rank 一致保留原始本地
+输入和输出，跳过像素、特征及对应反向传播的 all-to-all；元数据汇总和本地视觉塔计算
+仍然执行。例如 `sp_size > 1` 时，每个 SP 组只有一张 dummy 的纯文本 batch 会走此路径。
+这里判断的是全局数量，不是识别 dummy 图片：媒体数等于或多于卡数时仍执行均衡，
+少量真实媒体也会回退。该回退不需要修改 HCCL 环境变量。
+
 模型继承 `BaseVisionBalanceIO`，实现调用参数的提取和替换、所有输出特征的提取和恢复，
 以及合法 dummy 输入的构造。`VisionBatch` 描述按媒体拼接的 patch、网格和各输出字段中
 每个媒体对应的行数。`register_vision_balance` 通过这个实例，在交换媒体、恢复顺序后

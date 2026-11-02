@@ -95,6 +95,16 @@ its default `mode=None` leaves balancing disabled. A mode-only file override
 preserves that I/O instance. Python callers use `VisionBalanceMode.PATCH` or
 `VisionBalanceMode.PATCH_SQ`; file values are converted to the enum when parsed.
 
+If the globally pooled media count (after SP deduplication) is smaller than
+the WORLD size, all ranks keep their original local inputs and outputs.
+This skips pixel/feature all-to-all exchanges, including their backward
+exchanges, while retaining the metadata gathers and the local tower call.
+For example, one text dummy per SP group takes this path when `sp_size > 1`.
+The condition is a global count check, not dummy-image detection: an equal
+or larger pool still uses balancing, and real-media batches can also fall
+back when the pool is small. No HCCL environment override is needed for
+this fallback.
+
 Models implement `BaseVisionBalanceIO` to read and replace call inputs, extract
 and restore all output streams, and build valid dummy media. `VisionBatch`
 declares packed patch rows, media grids, and per-medium lengths for each output
