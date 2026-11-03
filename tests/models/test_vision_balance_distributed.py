@@ -161,11 +161,11 @@ def _distributed_round_trip(rank: int, init_file: str, sp_size: int) -> None:
                 expected = reference(pixels, **kwargs)
                 if case == "one":
                     actual = tower(patches=pixels, **kwargs)
-                    assert tower.observed_rows == (4 if rank == 0 else 2)
+                    assert tower.observed_rows == pixels.size(0)
                 else:
                     actual = tower(pixels, **kwargs)
                     if case == "empty":
-                        assert tower.observed_rows == 2
+                        assert tower.observed_rows == 0
                 assert isinstance(actual, _VisionOutput)
                 assert actual.marker == expected.marker
                 assert actual.raw.requires_grad == expected.raw.requires_grad
