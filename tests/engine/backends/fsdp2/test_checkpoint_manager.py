@@ -187,6 +187,106 @@ def test_save_hf_adapter_exports_a_peft_adapter_directory(tmp_path):
     assert config["peft_type"] == "LORA"
 
 
+def test_save_hf_adapter_splits_grouped_experts_into_hf_lora_format(
+    tmp_path, monkeypatch
+):
+    import peft
+    from safetensors.torch import load_file
+    from transformers import PretrainedConfig
+
+    from torchturbo.engine.peft import apply_peft
+    from torchturbo.models.modules.moe.experts import GroupedMLP
+    from torchturbo.models.modules.moe.moe_config import MoEConfig
+
+    parallel_context = {
+        "ep": {"ep_rank": 0, "ep_size": 1},
+        "sp": {"sp_rank": 0, "sp_size": 1},
+    }
+    checkpoint_manager = FSDP2CheckpointManager(
+        rank=0,
+        mesh={"edp": object()},
+        world_mesh=None,
+        parallel_context=parallel_context,
+        device_runtime=CpuRuntime(),
+        cpu_offload=False,
+        require_optimizer_not_suspended=lambda: None,
+    )
+
+    class GroupedModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = PretrainedConfig()
+            self.model = nn.Module()
+            self.model.mlp = nn.Module()
+            self.model.mlp.experts = GroupedMLP(
+                num_local_experts=2,
+                use_te=False,
+                config=MoEConfig(
+                    hidden_size=4,
+                    moe_ffn_hidden_size=3,
+                    gated_linear_unit=True,
+                    num_moe_experts=2,
+                ),
+            )
+
+    model = apply_peft(
+        GroupedModel(),
+        peft.LoraConfig(r=2, lora_alpha=4, target_modules=["experts"]),
+    )
+    monkeypatch.setattr(
+        checkpoint_manager,
+        "_gather_expert_lora_tensor",
+        lambda tensor, num_global_experts: tensor.detach().to("cpu"),
+    )
+    checkpoint_manager.save_hf(
+        model,
+        str(tmp_path),
+        source_path="unused",
+        weight_converter=object(),
+        hf_export_lora="adapter",
+    )
+
+    saved = load_file(str(tmp_path / "adapter_model.safetensors"))
+    grouped = model.base_model.model.model.mlp.experts
+    prefix = "base_model.model.model.mlp.experts"
+    assert not any(name.startswith(f"{prefix}.lora_") for name in saved)
+    assert len(saved) == 12
+    for expert in range(2):
+        assert torch.equal(
+            saved[f"{prefix}.{expert}.gate_proj.lora_A.weight"],
+            grouped.lora_A["default"].weight[expert].T,
+        )
+        assert torch.equal(
+            saved[f"{prefix}.{expert}.up_proj.lora_A.weight"],
+            grouped.lora_A["default"].weight[expert].T,
+        )
+        assert torch.equal(
+            saved[f"{prefix}.{expert}.gate_proj.lora_B.weight"],
+            grouped.lora_B["default"].weight[expert][:, :3].T,
+        )
+        assert torch.equal(
+            saved[f"{prefix}.{expert}.up_proj.lora_B.weight"],
+            grouped.lora_B["default"].weight[expert][:, 3:].T,
+        )
+        assert torch.equal(
+            saved[f"{prefix}.{expert}.down_proj.lora_A.weight"],
+            grouped.lora_A2["default"].weight[expert].T,
+        )
+        assert torch.equal(
+            saved[f"{prefix}.{expert}.down_proj.lora_B.weight"],
+            grouped.lora_B2["default"].weight[expert].T,
+        )
+
+    config = json.loads((tmp_path / "adapter_config.json").read_text())
+    targets = set(config["target_modules"])
+    assert "experts" not in targets
+    assert targets == {
+        f"model.mlp.experts.{expert}.{projection}"
+        for expert in range(2)
+        for projection in ("gate_proj", "up_proj", "down_proj")
+    }
+
+
 def test_adapter_export_requires_lora(manager, tmp_path):
     config = EngineConfig.from_dict(
         {"checkpoint": {"hf_export": "final", "hf_export_lora": "adapter"}}
