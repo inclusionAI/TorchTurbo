@@ -36,6 +36,7 @@ from .ple import (
     install_ple_prefetch,
     ple_forward,
 )
+from .npu import has_cann_liv2
 from .qsa import qsa_forward
 
 
@@ -263,6 +264,13 @@ class TurboQwen4ExpForConditionalGeneration(
         self._ple_prefetch_hook = install_ple_prefetch(
             language_model, sp_size=sp_size, sp_rank=sp_rank
         )
+
+        if has_cann_liv2() and sp_size == 1:
+            from torchturbo.logging import get_logger
+
+            get_logger(__name__).info(
+                "QSA indexer: CANN LightningIndexerV2 enabled"
+            )
 
         gdn_forward = build_gdn_sp_forward(
             sp_group, sp_size, sp_rank

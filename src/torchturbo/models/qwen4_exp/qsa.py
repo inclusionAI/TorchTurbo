@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import itertools
 import math
+import os
 from typing import Any
 
 import torch
@@ -25,6 +26,9 @@ _QSA_INDEXER_QUERY_CHUNK_SIZE = 256
 # peak memory rather than saved activations. Real head sizes need about 4 MiB
 # per query, and small chunks make the varlen kernels launch-bound.
 _QSA_ATTENTION_MAX_KV_BYTES = 1 << 30
+
+# Set TORCHTURBO_ENABLE_NPU_LI=0 to force the torch small-op indexer path.
+_ENABLE_NPU_LI = os.environ.get("TORCHTURBO_ENABLE_NPU_LI", "1") == "1"
 
 
 def qsa_indexer_forward(
@@ -48,6 +52,14 @@ def qsa_indexer_forward(
         Heads share one selection per query. Unused slots and padding queries
         contain -1.
     """
+    if _ENABLE_NPU_LI and sp_size == 1:
+        from .npu import has_cann_liv2, qsa_indexer_forward_cann
+
+        if has_cann_liv2():
+            return qsa_indexer_forward_cann(
+                indexer, hidden_states, position_embeddings
+            )
+
     batch_size, local_length, _ = hidden_states.shape
     if batch_size != 1:
         raise ValueError("Packed QSA expects a single flattened batch row.")
