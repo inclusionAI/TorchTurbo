@@ -52,7 +52,7 @@ def _make_kwarg_preserving_template_cls():
 
 
 def register() -> None:
-    """Wrap native ``qwen3_5`` so ``--template qwen3_5`` keeps MTP inputs."""
+    """Wrap native ``qwen3_5`` for MTP inputs; also register ``qwen3_8``."""
     from swift.template.register import TEMPLATE_MAPPING, register_template
 
     native = TEMPLATE_MAPPING.get("qwen3_5")
@@ -70,6 +70,19 @@ def register() -> None:
     wrapped.template_cls = _make_kwarg_preserving_template_cls()
     register_template(wrapped, exist_ok=True)
     logger.debug_rank0("Wrapped ms-swift template 'qwen3_5' for turbo adapter kwargs")
+
+    from .swift_qwen3_8 import Qwen3_8Template, Qwen3_8TemplateMeta
+
+    register_template(Qwen3_8TemplateMeta(
+        "qwen3_8",
+        template_cls=Qwen3_8Template,
+        default_system=None,
+        thinking_prefix="<think>\n",
+        non_thinking_prefix="<think>\n\n</think>\n\n",
+        agent_template="qwen3_5",
+        is_thinking=True,
+    ), exist_ok=True)
+    logger.debug_rank0("Registered ms-swift template 'qwen3_8'")
 
 
 __all__ = ["register"]
