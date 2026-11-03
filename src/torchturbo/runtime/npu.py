@@ -189,7 +189,10 @@ class NpuRuntime(DeviceRuntime):
             return self._npu.Stream()
 
     def new_event(self):
-        return self._npu.Event()
+        # torch_npu defaults enable_timing=False (unlike torch.cuda.Event),
+        # which makes elapsed_time() return 0 / raise "event timestamp
+        # invalid". Keep parity with the CUDA runtime.
+        return self._npu.Event(enable_timing=True)
 
     def manual_seed_all(self, seed: int) -> None:
         self._npu.manual_seed_all(seed)

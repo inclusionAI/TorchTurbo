@@ -197,3 +197,147 @@ def test_npu_dispatch_handles_empty_sources_and_input_probs(
     expected_probs_grad = x.detach().float().sum(-1, keepdim=True).expand_as(probs) * routing_map
     torch.testing.assert_close(probs.grad, expected_probs_grad)
     assert bool(calls) == (policy == OpPolicy.AUTO and num_tokens > 0)
+
+
+class _ScaleExperts(torch.nn.Module):
+    """Row-wise per-expert scaling stand-in for GroupedMLP in chunked tests."""
+
+    def __init__(self, num_local_experts: int):
+        super().__init__()
+        self.scales = torch.nn.Parameter(
+            torch.arange(1, num_local_experts + 1, dtype=torch.float32)
+        )
+
+    def forward(self, tokens, tokens_per_expert, probs):
+        assert probs is None, "chunked dispatcher keeps weights for the merge"
+        if tokens.numel() == 0:
+            return tokens, None
+        counts = [int(count) for count in tokens_per_expert.tolist()]
+        parts = torch.split(tokens, counts)
+        weighted = [part * scale for part, scale in zip(parts, self.scales)]
+        return torch.cat(weighted, dim=0), None
+
+
+def _chunked_dispatcher(num_chunks: int, num_local_experts: int = 2, topk: int = 2):
+    from torchturbo.models.modules.moe import token_dispatcher_chunked as chunked_module
+
+    return chunked_module.MoEChunkedAlltoAllTokenDispatcher(
+        num_local_experts,
+        list(range(num_local_experts)),
+        MoEConfig(
+            num_moe_experts=num_local_experts,
+            moe_router_topk=topk,
+            moe_num_chunks=num_chunks,
+        ),
+        object(),
+    )
+
+
+def test_chunked_rejects_apply_probs_on_input():
+    from torchturbo.models.modules.moe import token_dispatcher_chunked as chunked_module
+
+    with pytest.raises(ValueError, match="alltoall_chunked"):
+        chunked_module.MoEChunkedAlltoAllTokenDispatcher(
+            2, [0, 1], MoEConfig(
+                num_moe_experts=2, moe_router_topk=1,
+                moe_apply_probs_on_input=True,
+            ), object(),
+        )
+
+
+def test_chunk_bounds_split_tokens():
+    dispatcher = _chunked_dispatcher(3)
+    assert dispatcher._chunk_bounds(7) == [(0, 3), (3, 5), (5, 7)]
+    assert dispatcher._chunk_bounds(3) == [(0, 1), (1, 2), (2, 3)]
+    assert dispatcher._chunk_bounds(2) == [(0, 1), (1, 2), (2, 2)]
+    assert dispatcher._chunk_bounds(1) == [(0, 1), (1, 1), (1, 1)]
+    assert dispatcher._chunk_bounds(0) == [(0, 0), (0, 0), (0, 0)]
+
+
+@pytest.mark.parametrize("num_chunks", [1, 2, 5])
+def test_chunked_execute_matches_manual_reference(num_chunks):
+    dispatcher = _chunked_dispatcher(num_chunks)
+    experts = _ScaleExperts(2)
+    x = torch.tensor(
+        [[10.0], [20.0], [30.0], [40.0], [50.0]], requires_grad=True,
+    )
+    probs = torch.tensor(
+        [
+            [0.25, 0.75], [0.5, 0.5], [0.2, 0.8], [1.0, 0.0], [0.4, 0.6],
+        ],
+        requires_grad=True,
+    )
+    routing_map = torch.ones(5, 2, dtype=torch.bool)
+    expert_indices = torch.tensor([[0, 1]] * 5)
+    routing = RoutingResult(probs, routing_map, expert_indices)
+
+    output = dispatcher.execute(x, routing, experts)
+
+    reference = x * (probs[:, :1] + 2.0 * probs[:, 1:])
+    torch.testing.assert_close(output, reference)
+    output.sum().backward()
+    torch.testing.assert_close(x.grad, probs[:, :1] + 2.0 * probs[:, 1:])
+    torch.testing.assert_close(probs.grad, torch.cat([x, 2.0 * x], dim=1))
+
+
+def test_chunked_execute_keeps_hidden_shape():
+    dispatcher = _chunked_dispatcher(2)
+    experts = _ScaleExperts(2)
+    x = torch.randn(2, 3, 8, requires_grad=True)
+    probs = torch.rand(6, 2)
+    probs = probs / probs.sum(dim=1, keepdim=True)
+    probs.requires_grad_(True)
+    routing_map = torch.ones(6, 2, dtype=torch.bool)
+    routing = RoutingResult(probs, routing_map, torch.tensor([[0, 1]] * 6))
+    output = dispatcher.execute(x, routing, experts)
+    assert output.shape == x.shape
+    output.sum().backward()
+    assert x.grad is not None and probs.grad is not None
+
+
+def test_chunked_two_rank_metadata_and_host_splits(monkeypatch):
+    # Rank 1 owns E2/E3; rank 0's chunk counts are injected through the gather.
+    rank0_counts = torch.tensor([[1, 2, 2, 0], [0, 1, 1, 3]])
+
+    def fake_all_gather_into_tensor(output, input, group=None, async_op=False):
+        output = output.view(2, 2, 4)
+        output[0].copy_(rank0_counts)
+        output[1].copy_(input.view(2, 4))
+
+    monkeypatch.setattr(
+        torch.distributed, "all_gather_into_tensor", fake_all_gather_into_tensor,
+    )
+    from torchturbo.models.modules.moe import token_dispatcher_chunked as chunked_module
+
+    dispatcher = chunked_module.MoEChunkedAlltoAllTokenDispatcher(
+        2, [2, 3], MoEConfig(
+            num_moe_experts=4, expert_model_parallel_size=2,
+            moe_router_topk=2, moe_num_chunks=2,
+        ), object(),
+    )
+    # Counts derive from the routing mask, matching these selected experts.
+    routing_map = torch.tensor([
+        [True, False, True, False],
+        [False, False, True, True],
+        [False, True, True, False],
+        [True, False, False, True],
+    ])
+    routing = RoutingResult(
+        routing_map.float(), routing_map,
+        torch.tensor([[0, 2], [2, 3], [1, 2], [0, 3]]),
+    )
+    bounds = [(0, 2), (2, 4)]
+
+    metadata = dispatcher._chunk_metadata(routing, bounds)
+    torch.testing.assert_close(
+        metadata.received_counts,
+        torch.tensor([[[2, 0], [2, 1]], [[1, 3], [1, 1]]]),
+    )
+    torch.testing.assert_close(metadata.receive_counts, torch.tensor([[2, 3], [4, 2]]))
+    torch.testing.assert_close(metadata.tokens_per_expert, torch.tensor([[4, 1], [2, 4]]))
+
+    host = dispatcher._host_metadata(metadata)
+    assert host.input_splits == [[1, 3], [2, 2]]
+    assert host.output_splits == [[2, 3], [4, 2]]
+    torch.testing.assert_close(host.tokens_per_expert[0], torch.tensor([4, 1]))
+    torch.testing.assert_close(host.tokens_per_expert[1], torch.tensor([2, 4]))

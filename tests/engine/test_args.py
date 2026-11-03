@@ -128,6 +128,33 @@ def test_moe_dispatcher_config():
         EngineConfig.from_dict({"moe": {"token_dispatcher": "invalid"}})
 
 
+def test_moe_chunked_dispatcher_config():
+    from torchturbo.engine.args import parse_torchturbo_args
+    from torchturbo.engine.config import EngineConfig, build_from_args
+
+    args, remaining = parse_torchturbo_args([])
+    assert remaining == []
+    assert args.moe_num_chunks is None
+    config = build_from_args(args)
+    assert config.moe.token_dispatcher == "alltoall"
+    assert config.moe.num_chunks == 2
+
+    args, remaining = parse_torchturbo_args(
+        ["--tt_moe_token_dispatcher", "alltoall_chunked", "--tt_moe_num_chunks", "4"]
+    )
+    assert remaining == []
+    assert args.moe_token_dispatcher == "alltoall_chunked"
+    assert args.moe_num_chunks == 4
+    config = build_from_args(args)
+    assert config.moe.token_dispatcher == "alltoall_chunked"
+    assert config.moe.num_chunks == 4
+    restored = EngineConfig.from_dict(config.to_dict())
+    assert restored.moe.token_dispatcher == "alltoall_chunked"
+    assert restored.moe.num_chunks == 4
+    with pytest.raises(ValueError, match="moe.num_chunks"):
+        EngineConfig.from_dict({"moe": {"num_chunks": 0}})
+
+
 def test_parse_torchturbo_args_moe_z_loss():
     from torchturbo.engine.args import parse_torchturbo_args
     from torchturbo.engine.config import build_from_args

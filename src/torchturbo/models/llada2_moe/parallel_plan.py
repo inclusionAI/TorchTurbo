@@ -28,6 +28,7 @@ def _replace_llada2_moe_only(
         num_moe_experts=hf_config.num_experts,
         params_dtype=hf_config.torch_dtype,
         moe_token_dispatcher_type=engine_config.moe.token_dispatcher,
+        moe_num_chunks=engine_config.moe.num_chunks,
         moe_router_score_function="sigmoid",
         # LLaDA2.1-mini uses topk=8 and group_topk=4, so the MoE layer's
         # topk // group_topk rule matches the native gate's top-2 group scores.

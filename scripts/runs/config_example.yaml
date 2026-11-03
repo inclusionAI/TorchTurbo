@@ -116,7 +116,11 @@ engine_config:
   moe:
     aux_loss_coeff: 0.0
     z_loss_coeff: 0.0
+    # alltoall or alltoall_chunked; chunked pipelines EP all-to-all against
+    # expert compute using moe.num_chunks token chunks.
     token_dispatcher: alltoall
+    # Token chunk count for the alltoall_chunked dispatcher; >= 1.
+    num_chunks: 2
 
   mtp:
     enabled: false

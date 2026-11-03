@@ -475,10 +475,17 @@ class MoEConfig:
     z_loss_coeff: float = 0.0
     token_dispatcher: str = "alltoall"
     """Expert token dispatcher type."""
+    num_chunks: int = 2
+    """Token chunk count for the alltoall_chunked dispatcher."""
 
     def __post_init__(self) -> None:
-        if self.token_dispatcher != "alltoall":
-            raise ValueError("moe.token_dispatcher must be 'alltoall'.")
+        if self.token_dispatcher not in ("alltoall", "alltoall_chunked"):
+            raise ValueError(
+                "moe.token_dispatcher must be 'alltoall' or 'alltoall_chunked'."
+            )
+        self.num_chunks = int(self.num_chunks)
+        if self.num_chunks < 1:
+            raise ValueError("moe.num_chunks must be a positive integer.")
 
 
 @dataclass
@@ -1316,6 +1323,7 @@ def _build_moe_config(fields: Mapping[str, Any]) -> MoEConfig:
         aux_loss_coeff=float(moe_d.get("aux_loss_coeff", 0.0)),
         z_loss_coeff=float(moe_d.get("z_loss_coeff", 0.0)),
         token_dispatcher=moe_d.get("token_dispatcher", "alltoall"),
+        num_chunks=moe_d.get("num_chunks", 2),
     )
 
 

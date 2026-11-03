@@ -126,6 +126,17 @@ class MoELayer(BaseMoELayer):
                 config=self.config,
                 ep_group=ep_group,
             )
+        elif config.moe_token_dispatcher_type == "alltoall_chunked":
+            # Lazy import: the chunked dispatcher lives in a dedicated
+            # module that must not affect the default alltoall path.
+            from .token_dispatcher_chunked import MoEChunkedAlltoAllTokenDispatcher
+
+            self.token_dispatcher = MoEChunkedAlltoAllTokenDispatcher(
+                self.num_local_experts,
+                self.local_expert_indices,
+                config=self.config,
+                ep_group=ep_group,
+            )
         else:
             raise ValueError(
                 f"Unsupported token dispatcher type: {config.moe_token_dispatcher_type}"
@@ -156,18 +167,25 @@ class MoELayer(BaseMoELayer):
         )
         logits = logits.view(-1, logits.shape[-1])
 
-        dispatcher = self.token_dispatcher
-        # Reuse stage variables so completed layouts are not kept alive here.
-        expert_tokens, expert_probs = dispatcher.dispatch_preprocess(hidden_states, routing)
-        expert_tokens, expert_probs = dispatcher.token_dispatch(expert_tokens, expert_probs)
-        expert_tokens, tokens_per_expert, expert_probs = dispatcher.dispatch_postprocess(
-            expert_tokens, expert_probs,
-        )
-        expert_tokens, bias = self.experts(expert_tokens, tokens_per_expert, expert_probs)
-        assert bias is None, "Bias is not supported in MoEAlltoAllTokenDispatcher"
-        expert_tokens = dispatcher.combine_preprocess(expert_tokens)
-        expert_tokens = dispatcher.token_combine(expert_tokens)
-        expert_tokens = dispatcher.combine_postprocess(expert_tokens)
+        if self.config.moe_token_dispatcher_type == "alltoall_chunked":
+            # The chunked dispatcher pipelines dispatch, expert compute, and
+            # combine across token chunks internally.
+            expert_tokens = self.token_dispatcher.execute(
+                hidden_states, routing, self.experts
+            )
+        else:
+            dispatcher = self.token_dispatcher
+            # Reuse stage variables so completed layouts are not kept alive here.
+            expert_tokens, expert_probs = dispatcher.dispatch_preprocess(hidden_states, routing)
+            expert_tokens, expert_probs = dispatcher.token_dispatch(expert_tokens, expert_probs)
+            expert_tokens, tokens_per_expert, expert_probs = dispatcher.dispatch_postprocess(
+                expert_tokens, expert_probs,
+            )
+            expert_tokens, bias = self.experts(expert_tokens, tokens_per_expert, expert_probs)
+            assert bias is None, "Bias is not supported in MoEAlltoAllTokenDispatcher"
+            expert_tokens = dispatcher.combine_preprocess(expert_tokens)
+            expert_tokens = dispatcher.token_combine(expert_tokens)
+            expert_tokens = dispatcher.combine_postprocess(expert_tokens)
         output = expert_tokens.to(hidden_states.dtype)
 
         if self.shared_expert is not None:

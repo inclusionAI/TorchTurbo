@@ -176,6 +176,7 @@ class TorchTurboArgs:
     moe_aux_loss_coeff: float = 0.0
     moe_z_loss_coeff: float = 0.0
     moe_token_dispatcher: str | None = None
+    moe_num_chunks: int | None = None
     mtp_log_loss: bool = False
     enable_dspark: bool = True
     dspark_loss_scaling_factor: float = 0.1
@@ -524,8 +525,19 @@ _TURBO_ARG_SPECS: tuple[TurboArgSpec, ...] = (
         env_name="TORCH_TURBO_MOE_TOKEN_DISPATCHER",
         config_path="moe.token_dispatcher",
         type=str,
-        choices=("alltoall",),
-        help="Expert token dispatcher type: alltoall.",
+        choices=("alltoall", "alltoall_chunked"),
+        help="Expert token dispatcher type: alltoall or alltoall_chunked.",
+    ),
+    TurboArgSpec(
+        name="moe_num_chunks",
+        args_name="moe_num_chunks",
+        cli_name="--tt_moe_num_chunks",
+        config_path="moe.num_chunks",
+        type=int,
+        metavar="INT",
+        help="Token chunk count for the alltoall_chunked MoE dispatcher. "
+        "Chunks pipeline EP all-to-all against expert compute. Ignored by "
+        "the alltoall dispatcher. Must be a positive integer.",
     ),
     TurboArgSpec(
         name="moe_aux_loss_coeff",
@@ -832,6 +844,7 @@ def parse_torchturbo_args(argv: list[str]) -> tuple[TorchTurboArgs, list[str]]:
             args.moe_aux_loss_coeff,
             args.moe_z_loss_coeff,
             args.moe_token_dispatcher,
+            args.moe_num_chunks,
             args.mtp_log_loss,
             args.enable_dspark,
             args.dspark_loss_scaling_factor,

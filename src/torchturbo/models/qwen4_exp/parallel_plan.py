@@ -37,6 +37,7 @@ def _replace_qwen4_moe(
         moe_aux_loss_coeff=engine_config.moe.aux_loss_coeff,
         moe_z_loss_coeff=engine_config.moe.z_loss_coeff,
         moe_token_dispatcher_type=engine_config.moe.token_dispatcher,
+        moe_num_chunks=engine_config.moe.num_chunks,
     )
     moe_layer = MoELayer(
         config=MoEConfig(**moe_config_kwargs),
