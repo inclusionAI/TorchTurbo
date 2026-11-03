@@ -15,6 +15,7 @@ from dataclasses import replace
 from contextlib import contextmanager
 from ...utils.flash_attn_utils import cu_seqlens_to_segment_ids
 from ...engine.args import get_torchturbo_args
+from ...engine.metrics.flops import BaseModelFlops
 from ...logging import get_logger
 from ..registry import register_model
 from ..weight_converter import BaseWeightConverter
@@ -97,6 +98,12 @@ class TurboDeepseekV41ForCausalLM(TurboVLMModel, DeepseekV41ForCausalLM):
 
     def get_norm(self):
         return self.norm
+
+    def get_flops_class(self) -> type[BaseModelFlops]:
+        """DeepSeek-V4.1 flops recipe (CSA2 sparse latent attention + MoE + HC)."""
+        from .mfu import DeepseekV41Flops
+
+        return DeepseekV41Flops
 
     def _compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # FSDP2Backend's chunked-loss path shadows this module's ``head``
