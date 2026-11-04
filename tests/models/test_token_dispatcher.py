@@ -2,6 +2,7 @@
 
 import importlib
 import sys
+import contextlib
 from types import ModuleType
 
 import numpy as np
@@ -218,17 +219,22 @@ class _ScaleExperts(torch.nn.Module):
         return torch.cat(weighted, dim=0), None
 
 
-def _chunked_dispatcher(num_chunks: int, num_local_experts: int = 2, topk: int = 2):
+def _chunked_dispatcher(
+    num_chunks: int,
+    num_local_experts: int = 2,
+    topk: int = 2,
+):
     from torchturbo.models.modules.moe import token_dispatcher_chunked as chunked_module
 
+    kwargs = dict(
+        num_moe_experts=num_local_experts,
+        moe_router_topk=topk,
+        moe_num_chunks=num_chunks,
+    )
     return chunked_module.MoEChunkedAlltoAllTokenDispatcher(
         num_local_experts,
         list(range(num_local_experts)),
-        MoEConfig(
-            num_moe_experts=num_local_experts,
-            moe_router_topk=topk,
-            moe_num_chunks=num_chunks,
-        ),
+        MoEConfig(**kwargs),
         object(),
     )
 
@@ -341,3 +347,222 @@ def test_chunked_two_rank_metadata_and_host_splits(monkeypatch):
     assert host.output_splits == [[2, 3], [4, 2]]
     torch.testing.assert_close(host.tokens_per_expert[0], torch.tensor([4, 1]))
     torch.testing.assert_close(host.tokens_per_expert[1], torch.tensor([2, 4]))
+
+
+def _imbalanced_routing(num_tokens: int, num_experts: int, topk: int):
+    """Skewed routing: half of the tokens target expert 0."""
+    gen = torch.Generator().manual_seed(7)
+    primary = torch.randint(0, num_experts, (num_tokens,), generator=gen)
+    primary[: num_tokens // 2] = 0
+    expert_indices = [primary]
+    for k in range(1, topk):
+        expert_indices.append((primary + k * 3) % num_experts)
+    expert_indices = torch.stack(expert_indices, dim=1)
+    routing_map = torch.zeros(num_tokens, num_experts, dtype=torch.bool)
+    routing_map.scatter_(1, expert_indices, True)
+    topk_probs = torch.rand(num_tokens, topk, generator=gen)
+    topk_probs = topk_probs / topk_probs.sum(dim=1, keepdim=True)
+    topk_probs.requires_grad_(True)
+    # Router probs are dense over experts with unselected entries zeroed.
+    probs = torch.zeros(num_tokens, num_experts).scatter(
+        1, expert_indices, topk_probs,
+    )
+    return RoutingResult(probs, routing_map, expert_indices)
+
+
+def test_chunked_execute_imbalanced_routing_matches_closed_form():
+    num_experts, num_chunks, num_tokens = 8, 3, 64
+    dispatcher = _chunked_dispatcher(
+        num_chunks, num_local_experts=num_experts,
+    )
+    experts = _ScaleExperts(num_experts)
+    x = torch.randn(num_tokens, 8, requires_grad=True)
+    routing = _imbalanced_routing(num_tokens, num_experts, topk=2)
+    routing.probs.retain_grad()
+
+    output = dispatcher.execute(x, routing, experts)
+
+    scales = torch.arange(1, num_experts + 1, dtype=torch.float32)
+    weighted = (routing.probs * scales).sum(dim=1, keepdim=True)
+    reference = x * weighted
+    torch.testing.assert_close(output, reference, atol=1e-5, rtol=1e-5)
+    output.sum().backward()
+    assert x.grad is not None and routing.probs.grad is not None
+    torch.testing.assert_close(
+        x.grad, weighted.expand_as(x.grad), atol=1e-5, rtol=1e-5,
+    )
+
+
+def test_chunked_execute_handles_empty_tokens():
+    dispatcher = _chunked_dispatcher(3, num_local_experts=4)
+    experts = _ScaleExperts(4)
+    x = torch.zeros(0, 4, requires_grad=True)
+    routing = RoutingResult(
+        torch.zeros(0, 2),
+        torch.zeros(0, 4, dtype=torch.bool),
+        torch.zeros(0, 2, dtype=torch.long),
+    )
+    output = dispatcher.execute(x, routing, experts)
+    assert output.shape == x.shape
+
+
+@pytest.mark.parametrize(
+    "num_tokens, topk",
+    [(1, 1), (2, 1), (3, 2), (5, 1)],
+)
+def test_chunked_execute_fewer_tokens_than_chunks(num_tokens, topk):
+    # More chunks than tokens: some chunks end up empty.
+    num_experts, num_chunks = 4, 4
+    dispatcher = _chunked_dispatcher(
+        num_chunks, num_local_experts=num_experts, topk=topk,
+    )
+    experts = _ScaleExperts(num_experts)
+    x = torch.randn(num_tokens, 4, requires_grad=True)
+    routing = _imbalanced_routing(num_tokens, num_experts, topk=topk)
+    routing.probs.retain_grad()
+
+    output = dispatcher.execute(x, routing, experts)
+
+    scales = torch.arange(1, num_experts + 1, dtype=torch.float32)
+    weighted = (routing.probs * scales).sum(dim=1, keepdim=True)
+    torch.testing.assert_close(output, x * weighted, atol=1e-5, rtol=1e-5)
+    output.sum().backward()
+    assert x.grad is not None and routing.probs.grad is not None
+
+
+def test_chunked_execute_topk1_single_expert_hotspot():
+    # Extreme imbalance: every token routes to expert 0 only.
+    num_experts, num_chunks, num_tokens = 4, 3, 48
+    dispatcher = _chunked_dispatcher(
+        num_chunks, num_local_experts=num_experts, topk=1,
+    )
+    experts = _ScaleExperts(num_experts)
+    x = torch.randn(num_tokens, 4, requires_grad=True)
+    expert_indices = torch.zeros(num_tokens, 1, dtype=torch.long)
+    routing_map = torch.zeros(num_tokens, num_experts, dtype=torch.bool)
+    routing_map[:, 0] = True
+    probs = torch.ones(num_tokens, num_experts, requires_grad=True)
+    probs = probs * routing_map  # dense, only expert 0 weighted
+    routing = RoutingResult(probs, routing_map, expert_indices)
+    routing.probs.retain_grad()
+
+    output = dispatcher.execute(x, routing, experts)
+    torch.testing.assert_close(output, x, atol=1e-5, rtol=1e-5)
+    output.sum().backward()
+    assert x.grad is not None
+
+
+def test_chunked_backward_autograd_guard_single_recompute():
+    """Checkpointed chunked MoE recomputes exactly once per backward.
+
+    Regression for the use_reentrant=False crash: the engine's AC wires
+    checkpoint with a ``context_fn`` whose recompute context is a
+    one-shot ``@contextmanager``. torch re-enters that context once per
+    *distinct* backward graph id a frame sees. Without a whole-backward
+    GraphExecGroup the frame sees two ids -- the outer backward id (a
+    node deeper than the dispatcher unpacks first) and the dispatcher's
+    own group id -- so the second recompute re-enters the one-shot
+    context and dies in contextlib. Constructing the chunked dispatcher
+    installs an autograd guard that runs every backward under one shared
+    group; assert a plain ``backward()`` recomputes once with reference
+    grads, and characterize the unguarded failure mode.
+    """
+    import torch.utils.checkpoint as checkpoint_module
+    from torch.utils.checkpoint import checkpoint
+
+    from torchturbo.models.modules.moe import (
+        token_dispatcher_chunked as chunked_module,
+    )
+    from torchturbo.models.modules.moe.token_dispatcher_chunked import (
+        shared_recompute_group,
+    )
+
+    if not hasattr(checkpoint_module, "GraphExecGroup"):
+        pytest.skip("torch build without GraphExecGroup")
+
+    dispatcher = _chunked_dispatcher(2)
+    experts = _ScaleExperts(2)
+    routing_map = torch.ones(5, 2, dtype=torch.bool)
+    expert_indices = torch.tensor([[0, 1]] * 5)
+    probs_data = torch.tensor(
+        [[0.25, 0.75], [0.5, 0.5], [0.2, 0.8], [1.0, 0.0], [0.4, 0.6]],
+    )
+
+    state = {"recomputes": 0}
+
+    @contextlib.contextmanager
+    def one_shot_recompute_context():
+        # One-shot, like ``fsdp_recompute_context``: a second __enter__
+        # raises inside contextlib.
+        state["recomputes"] += 1
+        yield
+
+    def context_fn():
+        return contextlib.nullcontext(), one_shot_recompute_context()
+
+    def block_forward(x, probs):
+        routing = RoutingResult(probs, routing_map, expert_indices)
+        merged = dispatcher.execute(x, routing, experts)
+        # Saving node *deeper* than the chunked dispatcher: its backward
+        # runs first and performs the frame's first unpack/recompute.
+        return torch.sigmoid(merged)
+
+    def clone_inputs():
+        x = torch.tensor(
+            [[10.0], [20.0], [30.0], [40.0], [50.0]], requires_grad=True,
+        )
+        return x, probs_data.clone().requires_grad_(True)
+
+    # Reference: same block without checkpointing.
+    x_ref, probs_ref = clone_inputs()
+    block_forward(x_ref, probs_ref).sum().backward()
+
+    # The guard is installed with the dispatcher: a plain backward() must
+    # run under one group and recompute exactly once.
+    assert chunked_module._ORIGINAL_AUTOGRAD
+    assert torch.autograd.backward is not chunked_module._ORIGINAL_AUTOGRAD["backward"]
+
+    x, probs = clone_inputs()
+    out = checkpoint(
+        block_forward, x, probs, use_reentrant=False, context_fn=context_fn,
+    )
+    before = state["recomputes"]
+    out.sum().backward()
+    assert state["recomputes"] - before == 1
+    torch.testing.assert_close(x.grad, x_ref.grad)
+    torch.testing.assert_close(probs.grad, probs_ref.grad)
+    assert experts.scales.grad is not None
+
+    # Explicit wrapping keeps working and stays at one recompute
+    # (ambient-group reuse, no nesting).
+    x, probs = clone_inputs()
+    out = checkpoint(
+        block_forward, x, probs, use_reentrant=False, context_fn=context_fn,
+    )
+    before = state["recomputes"]
+    with shared_recompute_group():
+        out.sum().backward()
+    assert state["recomputes"] - before == 1
+    torch.testing.assert_close(x.grad, x_ref.grad)
+    torch.testing.assert_close(probs.grad, probs_ref.grad)
+
+    # Characterize the unguarded shape: with the guard removed the frame
+    # sees two gid domains. Either torch crashes re-entering the one-shot
+    # recompute context (current contextlib behavior) or it tolerates it
+    # and pays one recompute per gid domain (>= 2).
+    chunked_module._uninstall_shared_backward_guard()
+    try:
+        x, probs = clone_inputs()
+        out = checkpoint(
+            block_forward, x, probs, use_reentrant=False, context_fn=context_fn,
+        )
+        before = state["recomputes"]
+        crashed = False
+        try:
+            out.sum().backward()
+        except Exception:
+            crashed = True
+        assert crashed or state["recomputes"] - before >= 2
+    finally:
+        chunked_module._install_shared_backward_guard()
+    assert torch.autograd.backward is not chunked_module._ORIGINAL_AUTOGRAD["backward"]

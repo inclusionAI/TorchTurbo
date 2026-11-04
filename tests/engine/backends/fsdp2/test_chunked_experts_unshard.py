@@ -36,15 +36,15 @@ def cpu_mesh(tmp_path, monkeypatch):
             dist.destroy_process_group()
 
 
-def test_hold_experts_unsharded_passthrough_plain_module():
+def test_fsdp_forward_hold_passthrough_plain_module():
     from torchturbo.models.modules.moe.token_dispatcher_chunked import (
-        _hold_experts_unsharded,
+        _fsdp_forward_hold,
     )
 
     module = nn.Linear(4, 4)
     x = torch.randn(2, 4)
     expected = module(x)
-    with _hold_experts_unsharded(module):
+    with _fsdp_forward_hold(module):
         torch.testing.assert_close(module(x), expected)
 
 
@@ -52,9 +52,9 @@ def _run_experts_unshard(rank: int, init_file: str) -> None:
     from torch.distributed.fsdp._fully_shard._fsdp_param_group import (
         FSDPParamGroup,
     )
-    from torchturbo.engine.backends.fsdp2 import activation_checkpointing
+    import torch.distributed.fsdp._fully_shard._fsdp_common as fsdp_common
     from torchturbo.models.modules.moe.token_dispatcher_chunked import (
-        _hold_experts_unsharded,
+        _fsdp_forward_hold,
         _fsdp_param_groups,
     )
 
@@ -94,16 +94,13 @@ def _run_experts_unshard(rank: int, init_file: str) -> None:
         calls.clear()
         state = experts._get_fsdp_state()
         auto_before = state._auto_reshard_after_forward
-        with _hold_experts_unsharded(experts):
-            outputs = [experts(x) for _ in range(3)]
+        with _fsdp_forward_hold(experts):
+            # The chunked dispatcher invokes FSDP-wrapped experts through
+            # ``forward`` directly (hooks bypassed), once per chunk.
+            outputs = [experts.forward(x) for _ in range(3)]
             state = experts._get_fsdp_state()
             assert all(
                 group.is_unsharded for group in _fsdp_param_groups(state)
-            )
-            # Post-forward resharding is disabled inside the chunk loop.
-            assert not any(
-                group._reshard_after_forward
-                for group in _fsdp_param_groups(state)
             )
         assert len(calls) == 1, (
             f"rank {rank}: chunk-loop unshards {len(calls)} != 1"
@@ -127,28 +124,29 @@ def _run_experts_unshard(rank: int, init_file: str) -> None:
         experts(x)
         assert len(calls) == 2
 
-        # Recompute-context hook paths (torch<2.11) must also not
-        # re-allgather per chunk call in either reentrant mode:
-        # _unshard_before_forward (non-reentrant) and
-        # _restart_reentrant_forward (reentrant) both run per call.
-        saved_version = activation_checkpointing.torch_version
-        activation_checkpointing.torch_version = lambda: (2, 10, 0)
-        try:
-            for use_reentrant in (False, True):
-                calls.clear()
-                parent = nn.Sequential(experts)
-                with activation_checkpointing.fsdp_recompute_context(
-                    parent, use_reentrant=use_reentrant,
-                ):
-                    with _hold_experts_unsharded(experts):
-                        for _ in range(3):
-                            experts(x)
-                assert len(calls) == 1, (
-                    f"rank {rank}: recompute (use_reentrant="
-                    f"{use_reentrant}) unshards {len(calls)} != 1"
+        # Under activation recomputation the hold must not reshard on
+        # exit: the chunked backward reuses the unsharded weights, and
+        # its single post_backward performs the one reshard.
+        if hasattr(fsdp_common, "is_bw"):
+            saved_is_bw = fsdp_common.is_bw
+            calls.clear()
+            fsdp_common.is_bw = lambda: True
+            try:
+                with _fsdp_forward_hold(experts):
+                    for _ in range(3):
+                        experts.forward(x)
+                state = experts._get_fsdp_state()
+                assert all(
+                    group.is_unsharded
+                    for group in _fsdp_param_groups(state)
                 )
-        finally:
-            activation_checkpointing.torch_version = saved_version
+            finally:
+                fsdp_common.is_bw = saved_is_bw
+            assert len(calls) == 1, (
+                f"rank {rank}: recomputed forward unshards "
+                f"{len(calls)} != 1"
+            )
+            experts.reshard()
         dist.barrier()
     finally:
         FSDPParamGroup.unshard = original_unshard
@@ -159,7 +157,7 @@ def _run_experts_unshard(rank: int, init_file: str) -> None:
     not (dist.is_available() and dist.is_gloo_available()),
     reason="requires torch.distributed with Gloo support",
 )
-def test_hold_experts_unsharded_world2(tmp_path):
+def test_fsdp_forward_hold_world2(tmp_path):
     if torch_version() < (2, 10, 0):
         pytest.skip("CPU FSDP requires torch >= 2.10")
     mp.spawn(
