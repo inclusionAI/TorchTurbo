@@ -1429,3 +1429,50 @@ def test_gbs_negative_raises():
 def test_gbs_zero_raises():
     with pytest.raises(ValueError):
         build_from_args(TorchTurboArgs(gbs=0))
+
+
+def test_sparse_logits_file_only_configuration(tmp_path):
+    path = _write(tmp_path, "sparse.yaml", _engine_config("""\
+sparse_logits:
+  enabled: true
+logprob_computation:
+  chunk_size: 8
+  checkpoint_chunks: true
+"""))
+    cfg = build_from_args(TorchTurboArgs(config_path=path))
+    assert cfg.sparse_logits.enabled is True
+    assert cfg.logprob_computation.chunk_size == 8
+    assert cfg.logprob_computation.checkpoint_chunks is True
+    assert "sparse_logits" not in cfg.extra
+    assert "logprob_computation" not in cfg.extra
+    assert not any(
+        spec.config_path and spec.config_path.split(".")[0]
+        in ("sparse_logits", "logprob_computation")
+        for spec in get_arg_specs()
+    )
+
+
+@pytest.mark.parametrize("section,values,key", [
+    ("sparse_logits", {"max_rows": 4096}, "max_rows"),
+    ("sparse_logits", {"enable": True}, "enable"),
+    ("logprob_computation", {"chunk_rows": 32}, "chunk_rows"),
+])
+def test_sparse_config_file_rejects_unknown_keys(tmp_path, section, values, key):
+    path = _write(tmp_path, "invalid.yaml", yaml.safe_dump({
+        "engine_config": {section: values},
+    }))
+    with pytest.raises(ValueError, match=f"Unknown key: {section}.{key}"):
+        build_from_args(TorchTurboArgs(config_path=path))
+
+
+@pytest.mark.parametrize("section,values,error", [
+    ("sparse_logits", {"enabled": "false"}, TypeError),
+    ("logprob_computation", {"chunk_size": 0}, ValueError),
+    ("logprob_computation", {"checkpoint_chunks": 1}, TypeError),
+])
+def test_sparse_config_file_rejects_invalid_values(tmp_path, section, values, error):
+    path = _write(tmp_path, "invalid.yaml", yaml.safe_dump({
+        "engine_config": {section: values},
+    }))
+    with pytest.raises(error):
+        build_from_args(TorchTurboArgs(config_path=path))

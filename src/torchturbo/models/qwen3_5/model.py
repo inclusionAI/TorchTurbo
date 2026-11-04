@@ -42,6 +42,13 @@ class TurboQwen3_5ForConditionalGeneration(
     multi_modal_projector_module_names = ("model.visual.merger",)
     language_model_module_names = ("model.language_model",)
 
+    def forward_sparse_logits(
+        self, inputs: dict[str, Any], logits_to_keep: torch.Tensor
+    ) -> Any:
+        """Project selected local rows without removing MTP checkpoint weights."""
+        # Call __call__, not forward, so FSDP and other module hooks still run.
+        return self(**inputs, logits_to_keep=logits_to_keep, compute_mtp=False)
+
     @property
     def visual(self):
         return self.model.visual

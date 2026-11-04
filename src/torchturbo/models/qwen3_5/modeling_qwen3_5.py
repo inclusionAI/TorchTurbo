@@ -1976,6 +1976,7 @@ class Qwen3_5ForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
         video_grid_thw: torch.LongTensor | None = None,
         cache_position: torch.LongTensor | None = None,
         logits_to_keep: int | torch.Tensor = 0,
+        compute_mtp: bool = True,
         **kwargs: Unpack[TransformersKwargs],
     ) -> tuple | Qwen3_5CausalLMOutputWithPast:
         r"""
@@ -1987,6 +1988,10 @@ class Qwen3_5ForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
             The temporal, height and width of feature shape of each image in LLM.
         video_grid_thw (`torch.LongTensor` of shape `(num_videos, 3)`, *optional*):
             The temporal, height and width of feature shape of each video in LLM.
+
+        compute_mtp (`bool`, *optional*, defaults to `True`):
+            Whether to execute the auxiliary MTP branch during training.
+            Disabling computation does not remove MTP modules or weights.
 
         Example:
 
@@ -2050,7 +2055,7 @@ class Qwen3_5ForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
 
         mtp_logits = None
         mtp_hidden_states = None
-        if self.mtp is not None and self.training and input_ids is not None:
+        if compute_mtp and self.mtp is not None and self.training and input_ids is not None:
             rope_position_ids = position_ids
             text_position_ids = position_ids
             if position_ids is not None and position_ids.ndim == 3:
