@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import torch
 
+from ..modules.comm.comm import gather_from_sequence_parallel_region
 from .modeling_qwen4_exp import apply_rotary_pos_emb
 
 
@@ -61,7 +62,6 @@ def _compressed_index_keys(
 
 def _blocks_to_token_ids(
     block_ids: torch.Tensor,
-    kv_length: int,
     ratio: int,
     budget: int,
 ) -> torch.Tensor:
@@ -70,7 +70,7 @@ def _blocks_to_token_ids(
     Mirrors the output contract of the torch ``qsa_indexer_forward``:
     shape ``[B, S, budget + ratio - 1]`` int32 with -1 padding.
     """
-    batch, seq_len, num_blocks = block_ids.shape
+    batch, seq_len, _ = block_ids.shape
     width = budget + ratio - 1
     token_ids = torch.full(
         (batch, seq_len, width), -1, dtype=torch.int32, device=block_ids.device
@@ -102,18 +102,22 @@ def qsa_indexer_forward_cann(
     indexer,
     hidden_states: torch.Tensor,
     position_embeddings: tuple[torch.Tensor, torch.Tensor],
+    *,
+    sp_group=None,
+    sp_size: int = 1,
+    sp_rank: int = 0,
 ) -> torch.Tensor:
     """LightningIndexerV2 drop-in replacement for ``qsa_indexer_forward``.
 
-    Only supports ``sp_size == 1`` (the packed single-rank case).  Returns the
-    same ``[1, S, budget + ratio - 1]`` int32 tensor as the torch path.
+    Supports both ``sp_size == 1`` and ``sp_size > 1``.  For SP>1 the raw
+    keys and rotary tables are all-gathered to reconstruct the full packed
+    sequence before block pooling, matching the torch path's semantics.
+    Returns the same ``[1, S_local, budget + ratio - 1]`` int32 tensor.
     """
     ops = _import_cann_ops()
 
     batch, seq_len, _ = hidden_states.shape
-    full_cos, full_sin = position_embeddings
-    current_cos = full_cos[:, -seq_len:]
-    current_sin = full_sin[:, -seq_len:]
+    cos, sin = position_embeddings
 
     head_dim = indexer.index_head_dim
     ratio = indexer.compress_ratio
@@ -124,19 +128,31 @@ def qsa_indexer_forward_cann(
         (indexer.index_n_heads * head_dim, head_dim), dim=-1
     )
     query = indexer.q_layernorm(query.unflatten(-1, (indexer.index_n_heads, head_dim)))
-    query = apply_rotary_pos_emb(
-        query, cos=current_cos, sin=current_sin, unsqueeze_dim=2
-    )
+    query = apply_rotary_pos_emb(query, cos=cos, sin=sin, unsqueeze_dim=2)
+
+    if sp_size > 1:
+        # SP: gather raw keys and rotary tables so block pooling sees the full
+        # packed sequence.  The indexer is no-grad; backward = split.
+        raw_key_dtype = raw_keys.dtype
+        widths = (head_dim, cos.shape[-1], sin.shape[-1])
+        selection_state = torch.cat((raw_keys, cos, sin), dim=-1)
+        selection_state = gather_from_sequence_parallel_region(
+            selection_state.movedim(1, 0).contiguous(),
+            tensor_parallel_output_grad=False,
+            group=sp_group,
+        ).movedim(0, 1)
+        raw_keys, cos, sin = selection_state.split(widths, dim=-1)
+        raw_keys = raw_keys.to(raw_key_dtype)
 
     # -- compressed block keys ----------------------------------------------
     kv_length = raw_keys.shape[1]
     compressed_keys = _compressed_index_keys(
-        raw_keys, full_cos, full_sin, indexer.k_layernorm, ratio
+        raw_keys, cos, sin, indexer.k_layernorm, ratio
     )
 
     # -- CANN LightningIndexerV2 --------------------------------------------
     weights = torch.full(
-        (batch, seq_len, indexer.index_n_heads),
+        (batch, kv_length, indexer.index_n_heads),
         head_dim ** -0.5,
         dtype=torch.float32,
         device=hidden_states.device,
@@ -159,8 +175,11 @@ def qsa_indexer_forward_cann(
         cmp_ratio=ratio,
         return_value=0,
     )
-    selected_blocks = selected_blocks.squeeze(2)  # [B, S, topk]
+    selected_blocks = selected_blocks.squeeze(2)  # [B, S_full, topk]
 
-    return _blocks_to_token_ids(
-        selected_blocks, kv_length, ratio, indexer.token_budget
-    )
+    # For SP>1, slice back to the local rank's queries.
+    if sp_size > 1:
+        start = sp_rank * seq_len
+        selected_blocks = selected_blocks[:, start : start + seq_len]
+
+    return _blocks_to_token_ids(selected_blocks, ratio, indexer.token_budget)

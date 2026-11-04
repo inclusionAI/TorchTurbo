@@ -52,12 +52,13 @@ def qsa_indexer_forward(
         Heads share one selection per query. Unused slots and padding queries
         contain -1.
     """
-    if _ENABLE_NPU_LI and sp_size == 1:
+    if _ENABLE_NPU_LI:
         from .npu import has_cann_liv2, qsa_indexer_forward_cann
 
         if has_cann_liv2():
             return qsa_indexer_forward_cann(
-                indexer, hidden_states, position_embeddings
+                indexer, hidden_states, position_embeddings,
+                sp_group=sp_group, sp_size=sp_size, sp_rank=sp_rank,
             )
 
     batch_size, local_length, _ = hidden_states.shape
