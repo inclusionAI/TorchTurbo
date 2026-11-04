@@ -5,7 +5,7 @@ from contextlib import nullcontext
 
 import torch
 
-from .base import BaseProfiler, DeviceRuntime, TurboDevice
+from .base import BaseProfiler, DeviceRuntime, ProfilingConfig, TurboDevice
 
 
 class _CudaProfiler(BaseProfiler):
@@ -14,19 +14,16 @@ class _CudaProfiler(BaseProfiler):
         output_dir: str,
         worker_name: str,
         profiling_enabled: bool,
-        record_shapes: bool,
-        aic_metrics: bool,
-        with_stack: bool,
-        profiling_step: int | None,
+        profiling_config: ProfilingConfig,
         memory_snapshot_steps: int | None,
     ) -> None:
-        # aic_metrics is NPU-only; CUDA has no equivalent knob.
-        del aic_metrics
+        # aic_metrics is NPU-only; the CUDA profiler ignores it.
         self._profiler = None
         if profiling_enabled:
             # Training step N (1-based) runs inside the ProfilerStep#(N-1)
             # record_function window, so profiling_step=N maps to
             # skip_first=N-1. With no profiling_step, default to step 1.
+            profiling_step = profiling_config.profiling_step
             skip_first = (
                 profiling_step - 1 if profiling_step is not None else 0
             )
@@ -41,9 +38,9 @@ class _CudaProfiler(BaseProfiler):
                 on_trace_ready=torch.profiler.tensorboard_trace_handler(
                     output_dir, worker_name=worker_name
                 ),
-                record_shapes=record_shapes,
+                record_shapes=profiling_config.record_shapes,
                 profile_memory=False,
-                with_stack=with_stack,
+                with_stack=profiling_config.with_stack,
                 with_modules=False,
                 with_flops=False,
             )
@@ -149,19 +146,13 @@ class CudaRuntime(DeviceRuntime):
         output_dir: str,
         worker_name: str,
         profiling_enabled: bool,
-        record_shapes: bool,
-        aic_metrics: bool,
-        with_stack: bool,
-        profiling_step: int | None,
+        profiling_config: ProfilingConfig,
         memory_snapshot_steps: int | None,
     ) -> BaseProfiler:
         return _CudaProfiler(
             output_dir,
             worker_name,
             profiling_enabled,
-            record_shapes,
-            aic_metrics,
-            with_stack,
-            profiling_step,
+            profiling_config,
             memory_snapshot_steps,
         )

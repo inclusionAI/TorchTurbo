@@ -39,6 +39,7 @@ from torchturbo.engine.optimizers import (
 from torchturbo.models.base import TurboModel
 from torchturbo.models.modules.moe.moe_layer import BaseMoELayer, MoERuntimeInputs
 from torchturbo.models.modules.moe.moe_utils import MoEAuxLossAutoScaler
+from torchturbo.runtime import ProfilingConfig
 from torchturbo.runtime.cpu import CpuRuntime
 
 
@@ -992,19 +993,16 @@ class TestEngineSetup:
             output_dir: str,
             worker_name: str,
             profiling_enabled: bool,
-            record_shapes: bool,
-            aic_metrics: bool,
-            with_stack: bool,
-            profiling_step: int | None,
+            profiling_config: ProfilingConfig,
             memory_snapshot_steps: int | None,
         ):
             profiler_kwargs["output_dir"] = output_dir
             profiler_kwargs["worker_name"] = worker_name
             profiler_kwargs["profiling_enabled"] = profiling_enabled
-            profiler_kwargs["record_shapes"] = record_shapes
-            profiler_kwargs["aic_metrics"] = aic_metrics
-            profiler_kwargs["with_stack"] = with_stack
-            profiler_kwargs["profiling_step"] = profiling_step
+            profiler_kwargs["record_shapes"] = profiling_config.record_shapes
+            profiler_kwargs["aic_metrics"] = profiling_config.aic_metrics
+            profiler_kwargs["with_stack"] = profiling_config.with_stack
+            profiler_kwargs["profiling_step"] = profiling_config.profiling_step
             return profiler
 
         monkeypatch.setattr(runtime, "profiler", fake_profiler)
@@ -1042,17 +1040,14 @@ class TestEngineSetup:
             output_dir: str,
             worker_name: str,
             profiling_enabled: bool,
-            record_shapes: bool,
-            aic_metrics: bool,
-            with_stack: bool,
-            profiling_step: int | None,
+            profiling_config: ProfilingConfig,
             memory_snapshot_steps: int | None,
         ):
             profiler_kwargs["profiling_enabled"] = profiling_enabled
-            profiler_kwargs["record_shapes"] = record_shapes
-            profiler_kwargs["aic_metrics"] = aic_metrics
-            profiler_kwargs["with_stack"] = with_stack
-            profiler_kwargs["profiling_step"] = profiling_step
+            profiler_kwargs["record_shapes"] = profiling_config.record_shapes
+            profiler_kwargs["aic_metrics"] = profiling_config.aic_metrics
+            profiler_kwargs["with_stack"] = profiling_config.with_stack
+            profiler_kwargs["profiling_step"] = profiling_config.profiling_step
             return recorder
 
         monkeypatch.setattr(runtime, "profiler", fake_profiler)
@@ -1110,10 +1105,7 @@ class TestEngineSetup:
             output_dir: str,
             worker_name: str,
             profiling_enabled: bool,
-            record_shapes: bool,
-            aic_metrics: bool,
-            with_stack: bool,
-            profiling_step: int | None,
+            profiling_config: ProfilingConfig,
             memory_snapshot_steps: int | None,
         ):
             # Failure-path test: kwargs are irrelevant.
@@ -1121,10 +1113,7 @@ class TestEngineSetup:
                 output_dir,
                 worker_name,
                 profiling_enabled,
-                record_shapes,
-                aic_metrics,
-                with_stack,
-                profiling_step,
+                profiling_config,
                 memory_snapshot_steps,
             )
             return next(profilers)

@@ -8,6 +8,7 @@ import torch
 
 from torchturbo.runtime import (
     DeviceRuntime,
+    ProfilingConfig,
     TurboDevice,
     get_device_name,
     get_device_runtime,
@@ -79,10 +80,7 @@ class FakeRuntime(DeviceRuntime):
         output_dir: str,
         worker_name: str,
         profiling_enabled: bool,
-        record_shapes: bool,
-        aic_metrics: bool,
-        with_stack: bool,
-        profiling_step: int | None,
+        profiling_config: ProfilingConfig,
         memory_snapshot_steps: int | None,
     ):
         self.profiler_calls.append((output_dir, worker_name))
@@ -131,10 +129,7 @@ def test_cpu_runtime_contract():
             output_dir="/tmp",
             worker_name="worker",
             profiling_enabled=True,
-            record_shapes=False,
-            aic_metrics=False,
-            with_stack=False,
-            profiling_step=None,
+            profiling_config=ProfilingConfig(),
             memory_snapshot_steps=None,
         )
 
@@ -343,10 +338,11 @@ def test_npu_profiler_level_and_aic_metrics(
         "/tmp/profiling",
         "rank0",
         profiling_enabled=True,
-        record_shapes=record_shapes,
-        aic_metrics=record_shapes,
-        with_stack=with_stack,
-        profiling_step=None,
+        profiling_config=ProfilingConfig(
+            record_shapes=record_shapes,
+            aic_metrics=record_shapes,
+            with_stack=with_stack,
+        ),
         memory_snapshot_steps=None,
     )
     # Constructing records torch_npu calls; start() is never called so this
@@ -372,10 +368,7 @@ def test_npu_profiler_schedule_from_profiling_step(monkeypatch):
             "/tmp/profiling",
             "rank0",
             profiling_enabled=True,
-            record_shapes=False,
-            aic_metrics=False,
-            with_stack=False,
-            profiling_step=profiling_step,
+            profiling_config=ProfilingConfig(profiling_step=profiling_step),
             memory_snapshot_steps=None,
         )
         last = schedule_calls[-1]

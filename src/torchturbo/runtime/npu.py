@@ -5,7 +5,7 @@ from contextlib import nullcontext
 
 import torch
 
-from .base import BaseProfiler, DeviceRuntime, TurboDevice
+from .base import BaseProfiler, DeviceRuntime, ProfilingConfig, TurboDevice
 
 
 # Ascend environment variable reference:
@@ -37,15 +37,17 @@ class _NpuProfiler(BaseProfiler):
         output_dir: str,
         worker_name: str,
         profiling_enabled: bool,
-        record_shapes: bool,
-        aic_metrics: bool,
-        with_stack: bool,
-        profiling_step: int | None,
+        profiling_config: ProfilingConfig,
         memory_snapshot_steps: int | None,
     ) -> None:
         self._profiler = None
         if profiling_enabled:
             import torch_npu
+
+            record_shapes = profiling_config.record_shapes
+            aic_metrics = profiling_config.aic_metrics
+            with_stack = profiling_config.with_stack
+            profiling_step = profiling_config.profiling_step
 
             # Level0 omits input shapes from kernel_details.csv and drops the
             # AiCore utilization columns; Level1 emits both. aic_metrics needs
@@ -223,19 +225,13 @@ class NpuRuntime(DeviceRuntime):
         output_dir: str,
         worker_name: str,
         profiling_enabled: bool,
-        record_shapes: bool,
-        aic_metrics: bool,
-        with_stack: bool,
-        profiling_step: int | None,
+        profiling_config: ProfilingConfig,
         memory_snapshot_steps: int | None,
     ) -> BaseProfiler:
         return _NpuProfiler(
             output_dir,
             worker_name,
             profiling_enabled,
-            record_shapes,
-            aic_metrics,
-            with_stack,
-            profiling_step,
+            profiling_config,
             memory_snapshot_steps,
         )

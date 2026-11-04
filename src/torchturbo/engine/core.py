@@ -33,7 +33,7 @@ from torchturbo.adapters.rl.packed import (
     shifted_packed_tensor,
 )
 from ..ops import get_or_create_ops
-from ..runtime import BaseProfiler, get_device_runtime
+from ..runtime import BaseProfiler, ProfilingConfig, get_device_runtime
 
 
 logger = get_logger(__name__)
@@ -822,14 +822,17 @@ class TorchTurboEngine:
         except Exception:
             pass
 
-        profiler = self.device_runtime.profiler(
-            output_dir=profiling_dir,
-            worker_name=f"rank{rank}_{socket.gethostname()}",
-            profiling_enabled=profiling_enabled,
+        runtime_config = ProfilingConfig(
             record_shapes=detailed_kernel_info,
             aic_metrics=detailed_kernel_info,
             with_stack=with_stack,
             profiling_step=profiling_step,
+        )
+        profiler = self.device_runtime.profiler(
+            output_dir=profiling_dir,
+            worker_name=f"rank{rank}_{socket.gethostname()}",
+            profiling_enabled=profiling_enabled,
+            profiling_config=runtime_config,
             memory_snapshot_steps=memory_snapshot_steps,
         )
         profiler.start()
