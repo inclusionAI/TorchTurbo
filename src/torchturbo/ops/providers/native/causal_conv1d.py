@@ -50,7 +50,7 @@ class FlaCausalConv1d(OpImpl):
             if cu_seqlens is not None:
                 raise ValueError("pass either cu_seqlens or packed_params, not both")
             cu_seqlens = packed_params.cu_seqlens
-        return causal_conv1d(
+        y, final_state = causal_conv1d(
             x=x,
             weight=weight,
             bias=bias,
@@ -59,3 +59,4 @@ class FlaCausalConv1d(OpImpl):
             output_final_state=output_final_state,
             cu_seqlens=cu_seqlens,
         )
+        return y, final_state

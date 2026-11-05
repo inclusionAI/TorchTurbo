@@ -1,0 +1,96 @@
+"""Dispatcher-level contracts for the kda op.
+
+The dynamic ``__getattr__`` facade must route the op to the native fla
+provider on CPU (that is the default path everywhere, NPU included) and
+pass the model kwargs through.  The operator contract is flat
+``[B, T, C]`` Q/K/V everywhere; the head split and any head-major
+spelling the AscendC kernels want are produced inside the providers
+themselves.
+"""
+
+from __future__ import annotations
+
+import sys
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+import torchturbo.runtime.runtime as runtime_impl
+from torchturbo.ops import (
+    OpPolicy,
+    get_or_create_ops,
+)
+from torchturbo.ops.providers import iter_provider_modules
+from torchturbo.runtime import TurboDevice
+from torchturbo.runtime.cpu import CpuRuntime
+
+
+@pytest.fixture(autouse=True)
+def _reset_state(monkeypatch):
+    monkeypatch.setattr(runtime_impl, "_SELECTED_RUNTIME", None)
+    runtime_impl.is_device_available.cache_clear()
+    get_or_create_ops(device_runtime=CpuRuntime())
+    yield
+    runtime_impl.is_device_available.cache_clear()
+
+
+@pytest.fixture()
+def fla_stub(monkeypatch):
+    calls = []
+
+    def chunk_kda(q, k, v, g, beta, **kwargs):
+        calls.append({"q": q, "k": k, "v": v, "g": g, "beta": beta, **kwargs})
+        return q, None
+
+    monkeypatch.setitem(
+        sys.modules, "fla.ops.kda", SimpleNamespace(chunk_kda=chunk_kda)
+    )
+    return calls
+
+
+def test_kda_provider_modules_are_discovered():
+    cpu_modules = iter_provider_modules(TurboDevice.CPU)
+    npu_modules = iter_provider_modules(TurboDevice.NPU)
+
+    assert "torchturbo.ops.providers.native.kda" in cpu_modules
+    assert "torchturbo.ops.providers.npu.kda" in npu_modules
+    # The vendored GDN adapter package is underscore-prefixed, so provider
+    # discovery must keep skipping it (the KDA adapter lives inside
+    # providers/npu/kda.py itself now).
+    assert not any(
+        module.startswith("torchturbo.ops.providers.npu._fla_gdn")
+        for module in npu_modules
+    )
+
+
+def test_kda_routes_to_native_fl_by_default(fla_stub):
+    ops = get_or_create_ops(device_runtime=CpuRuntime())
+    q = torch.randn(1, 8, 12)
+    k = torch.randn(1, 8, 12)
+    v = torch.randn(1, 8, 12)
+    g = torch.randn(1, 8, 3, 4)
+    beta_logits = torch.randn(1, 8, 3, dtype=torch.float32)
+
+    ops.kda(q=q, k=k, v=v, g=g, beta=beta_logits)
+
+    # Q/K/V pass through flat; the provider owns the head split.  Beta
+    # keeps its raw logits: the sigmoid runs inside the fla kernel.
+    assert len(fla_stub) == 1
+    assert fla_stub[0]["q"].shape == (1, 8, 3, 4)
+    torch.testing.assert_close(fla_stub[0]["beta"], beta_logits)
+    assert fla_stub[0]["use_beta_sigmoid_in_kernel"] is True
+
+
+def test_kda_explicit_ascendc_impl_fails_on_cpu(fla_stub):
+    ops = get_or_create_ops(device_runtime=CpuRuntime())
+    q = torch.randn(1, 8, 12)
+
+    # Explicit selection never falls back; the AscendC implementation is
+    # NPU-only, so a CPU runtime must refuse the call outright.
+    with pytest.raises(RuntimeError, match="ascendc_kda"):
+        ops.kda(
+            q=q, k=q.clone(), v=q.clone(),
+            g=torch.randn(1, 8, 3, 4), beta=torch.rand(1, 8, 3),
+            impl="ascendc_kda",
+        )
