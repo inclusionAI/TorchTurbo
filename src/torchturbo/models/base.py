@@ -175,6 +175,19 @@ class TurboModel:
             sliced_inputs=(("input_ids", 1), ("position_ids", -1)),
         )
 
+    def forward_sparse_logits(
+        self, inputs: dict[str, Any], logits_to_keep: torch.Tensor
+    ) -> Any:
+        """Run a full-context forward with selected local output-head rows.
+
+        Implementations must prune before projecting onto the vocabulary,
+        preserve the normal output object, and disable auxiliary objectives.
+        Unsupported models fail before allocating dense logits.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support sparse RL logits."
+        )
+
     def on_prepare_inputs(
         self,
         inputs: dict[str, Any],

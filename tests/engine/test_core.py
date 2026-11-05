@@ -883,6 +883,7 @@ class TestEngineSetup:
 
     def test_forward_backward_batch_runs_forward_and_backward(self):
         engine = object.__new__(TorchTurboEngine)
+        engine.config = EngineConfig()
         engine.model = TinyLogitsModel()
         engine.get_sp_info = lambda: {"sp_size": 1}
         engine.get_dp_info = lambda: {"dp_size": 1, "dp_group": None}
@@ -911,6 +912,7 @@ class TestEngineSetup:
 
     def test_forward_backward_batch_forward_only_skips_backward(self):
         engine = object.__new__(TorchTurboEngine)
+        engine.config = EngineConfig()
         engine.model = TinyLogitsModel()
         engine.get_sp_info = lambda: {"sp_size": 1}
         engine.get_dp_info = lambda: {"dp_size": 1, "dp_group": None}
