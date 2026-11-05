@@ -7,6 +7,8 @@ from typing import Any
 
 import torch
 
+from .packed import gather_logprobs_entropy
+
 
 @dataclass
 class SparseLogitsPlan:
@@ -128,10 +130,13 @@ def build_sparse_plan(ctx: dict[str, Any], sp_info: dict[str, Any]) -> SparseLog
     )
 
 
-def restore_sparse_logprobs_entropy(
-    logp: torch.Tensor,
-    entropy: torch.Tensor,
+def compute_sparse_logprobs_entropy(
+    logits: torch.Tensor,
     plan: SparseLogitsPlan,
+    *,
+    temperature: float = 1.0,
+    chunk_size: int = 32,
+    checkpoint_chunks: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Restore shifted packed vectors using the existing SP autograd gathers.
 
@@ -139,6 +144,17 @@ def restore_sparse_logprobs_entropy(
     finite and equal to one. Masked-out entropy is zero. Neither is a current
     policy evaluation on those positions; callers must honor the loss mask.
     """
+    if logits.ndim != 2 or logits.shape[0] != plan.model_rows.numel():
+        raise ValueError("Sparse model output does not match selected predictor rows.")
+    if temperature <= 0:
+        raise ValueError("temperature must be positive.")
+    logp, entropy = gather_logprobs_entropy(
+        logits,
+        plan.labels,
+        temperature,
+        chunk_size=chunk_size,
+        checkpoint_chunks=checkpoint_chunks,
+    )
     if plan.rows.numel():
         local_logp = logp.new_zeros(plan.local_length).index_copy(0, plan.rows, logp)
         local_entropy = entropy.new_zeros(plan.local_length).index_copy(

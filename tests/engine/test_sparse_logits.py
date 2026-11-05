@@ -8,7 +8,10 @@ import pytest
 import torch
 
 from . import sparse_test_support as h
-from torchturbo.adapters.rl.sparse import build_sparse_plan
+from torchturbo.adapters.rl.sparse import (
+    build_sparse_plan,
+    compute_sparse_logprobs_entropy,
+)
 from torchturbo.engine.config import EngineConfig, SparseLogitsConfig, build_from_args
 from torchturbo.models.base import TurboModel
 
@@ -221,17 +224,13 @@ def test_sp_predictor_boundary_alignment():
 
 
 def test_sparse_output_shape_and_temperature_contract():
-    eng, mb = setup()
+    _, mb = setup()
     _, ctx = h.packed.prepare_packed_mb_inputs(mb)
     plan = build_sparse_plan(ctx, dict(sp_size=1))
     with pytest.raises(ValueError, match="predictor rows"):
-        eng._compute_logrobs_and_entropy(
-            torch.zeros(31, 41), ctx, 1.0, True, sparse_plan=plan
-        )
+        compute_sparse_logprobs_entropy(torch.zeros(31, 41), plan)
     with pytest.raises(ValueError, match="temperature"):
-        eng._compute_logrobs_and_entropy(
-            torch.zeros(3, 41), ctx, 0, True, sparse_plan=plan
-        )
+        compute_sparse_logprobs_entropy(torch.zeros(3, 41), plan, temperature=0)
 
 
 def test_native_config_roundtrip_and_args(tmp_path):
@@ -252,11 +251,17 @@ def test_native_config_roundtrip_and_args(tmp_path):
 
     path = tmp_path / "config.yaml"
     path.write_text(
-        "engine_config:\n  sparse_logits:\n    enabled: true\n"
+        "engine_config:\n  sparse_logits:\n    enabled: true\n  logprob_computation:\n    chunk_size: 8\n    checkpoint_chunks: true\n"
     )
     assert (
         build_from_args(TorchTurboArgs(config_path=str(path))).sparse_logits
         == cfg.sparse_logits
+    )
+    assert (
+        build_from_args(
+            TorchTurboArgs(config_path=str(path))
+        ).logprob_computation.chunk_size
+        == 8
     )
     assert EngineConfig(sparse_logits=None).sparse_logits.enabled is False
 
@@ -277,6 +282,8 @@ def test_large_masks_retain_all_rows_and_dense_gradients(num_rows, reduction):
         sparse=False, lengths=(num_rows + 17,), active=tuple(range(1, num_rows + 1))
     )
     sparse, _ = setup(model=copy.deepcopy(dense.model))
+    for eng in (dense, sparse):
+        eng.config.logprob_computation.chunk_size = 128
     a = run(dense, copy.deepcopy(mb), reduction=reduction)
     b = run(sparse, copy.deepcopy(mb), reduction=reduction)
     h.check_equal(a, b, mb["orig_mb"]["ppo_loss_mask"])
@@ -329,14 +336,3 @@ def test_sparse_preserves_current_packed_input_contract():
     a = run(dense, copy.deepcopy(mb))
     b = run(sparse, copy.deepcopy(mb))
     h.check_equal(a, b, mb["orig_mb"]["ppo_loss_mask"])
-
-
-def test_sparse_uses_shared_logprob_helper():
-    eng, mb = setup()
-    with mock.patch.object(
-        h.core, "gather_logprobs_entropy", wraps=h.packed.gather_logprobs_entropy
-    ) as compute:
-        run(eng, mb)
-    compute.assert_called_once()
-    assert compute.call_args.args[0].shape == (3, 41)
-    assert compute.call_args.args[1].shape == (3,)

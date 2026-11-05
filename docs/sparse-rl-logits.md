@@ -42,21 +42,23 @@ For packed sequences of lengths `L1, L2, ...`, `ppo_loss_mask` has length
 packed-sequence boundary. The engine checks the rolled labels on SP shards.
 
 The vocabulary-sized output allocation becomes proportional to `R * V`
-instead of `T_local * V`. The engine uses the existing logprob and entropy
-computation for selected rows, then restores the packed layout. The existing
-chunking limits individual FP32 allocations, but autograd can retain activations
-across chunks until backward. Transformer activations, model weights, optimizer
-state, and inference KV caches are not reduced by row selection. Dense masks
-may give little benefit. No production memory reduction is claimed from the
-CPU correctness tests.
+instead of `T_local * V`. Existing chunked/checkpointed logprob and entropy
+computation bounds additional FP32 activations. Transformer activations, model
+weights, optimizer state, and inference KV caches are not reduced by this
+operation. Dense masks may give little benefit. No production memory reduction
+is claimed from the CPU correctness tests.
 
 ## Configuration and caller contract
 
 ```python
 from torchturbo.engine import EngineConfig, SparseLogitsConfig
+from torchturbo.engine.config import LogprobComputationConfig
 
 config = EngineConfig(
     sparse_logits=SparseLogitsConfig(enabled=True),
+    logprob_computation=LogprobComputationConfig(
+        chunk_size=32, checkpoint_chunks=True,
+    ),
 )
 config.mtp.enabled = False
 # Use config when constructing and preparing the ordinary TorchTurboEngine.
@@ -70,9 +72,10 @@ engine.forward_backward_batch(
 )
 ```
 
-The default is disabled. The sparse setting is available through Python
-dataclasses and YAML only, with no additional CLI flags, environment variables,
-or `TorchTurboArgs` fields.
+The default is disabled. Logprob computation defaults to `chunk_size=1024`
+and `checkpoint_chunks=False`; the example opts into smaller checkpointed chunks.
+These settings are available through Python dataclasses and YAML only, with no
+additional CLI flags, environment variables, or `TorchTurboArgs` fields.
 
 These fields also accept the normal config-file form:
 
@@ -82,6 +85,9 @@ engine_config:
     enabled: true
   mtp:
     enabled: false
+  logprob_computation:
+    chunk_size: 32
+    checkpoint_chunks: true
 ```
 
 - The original micro-batch contains full packed `input_ids`, `cu_seqlens`,
@@ -121,7 +127,7 @@ deleted or globally disabled by changing model mode.
 
 ```bash
 TORCH_TURBO_DISABLE=1 PYTHONPATH=src python -m pytest -q \
-  tests/engine/test_sparse_logits.py \
+  tests/engine/test_sparse_logits.py tests/engine/test_logprob_computation.py \
   tests/engine/test_engine_config_loading.py
 
 TORCH_TURBO_DISABLE=1 PYTHONPATH=src python \

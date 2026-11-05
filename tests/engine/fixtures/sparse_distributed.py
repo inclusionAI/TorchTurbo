@@ -81,10 +81,10 @@ def worker(args):
                     fully_shard(m.mtp.proj, mesh=mesh, reshard_after_forward=True)
                 fully_shard(m, mesh=mesh, reshard_after_forward=True)
         a = h.run_batch(
-            h.engine(core, model, info), copy.deepcopy(mb), Loss
+            h.engine(core, model, info, chunk_size=128), copy.deepcopy(mb), Loss
         )
         b = h.run_batch(
-            h.engine(core, candidate, info, sparse=True),
+            h.engine(core, candidate, info, sparse=True, chunk_size=128),
             copy.deepcopy(mb),
             Loss,
         )
@@ -133,7 +133,7 @@ def worker(args):
         if args.mtp:
             # Reuse FSDP after skipping its MTP child in the prior iteration.
             again = h.run_batch(
-                h.engine(core, candidate, info, sparse=True),
+                h.engine(core, candidate, info, sparse=True, chunk_size=128),
                 copy.deepcopy(mb),
                 Loss,
             )

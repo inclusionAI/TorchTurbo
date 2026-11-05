@@ -33,9 +33,8 @@ from torchturbo.adapters.rl.packed import (
     shifted_packed_tensor,
 )
 from torchturbo.adapters.rl.sparse import (
-    SparseLogitsPlan,
     build_sparse_plan,
-    restore_sparse_logprobs_entropy,
+    compute_sparse_logprobs_entropy,
 )
 from ..ops import get_or_create_ops
 from ..runtime import BaseProfiler, get_device_runtime
@@ -225,6 +224,12 @@ class TorchTurboEngine:
             "TorchTurboEngine initialized: backend=%s, device=%s",
             backend_name,
             self.device_runtime.device.type,
+        )
+        logger.info_rank0(
+            "Logprob computation: chunk_size=%d, checkpoint_chunks=%s, "
+            "use_reentrant=False",
+            self.config.logprob_computation.chunk_size,
+            self.config.logprob_computation.checkpoint_chunks,
         )
 
     # ------------------------------------------------------------------
@@ -1308,7 +1313,6 @@ class TorchTurboEngine:
 
         for mb_idx, mb_item in enumerate(mb_list):
             inputs, ctx = prepare_packed_mb_inputs(mb_item)
-            sparse_plan = None
             if use_sparse:
                 sparse_plan = build_sparse_plan(ctx, self.get_sp_info())
                 outputs = self.model.forward_sparse_logits(inputs, sparse_plan.model_rows)
@@ -1316,14 +1320,22 @@ class TorchTurboEngine:
                 outputs = self._forward_microbatch(inputs)
             logits = self._get_main_logits(outputs)
 
-            if process_fn is None:
+            if use_sparse:
+                logprobs, entropy = compute_sparse_logprobs_entropy(
+                    logits, sparse_plan, temperature=temperature,
+                    chunk_size=self.config.logprob_computation.chunk_size,
+                    checkpoint_chunks=self.config.logprob_computation.checkpoint_chunks,
+                )
+                loss = loss_fn(
+                    logprobs=logprobs, entropy=entropy, mb_input=ctx["mb_input"]
+                )
+            elif process_fn is None:
                 logprobs, entropy = (
                     self._compute_logrobs_and_entropy(
                         logits,
                         ctx,
                         temperature=temperature,
                         grad_scaler=True,
-                        sparse_plan=sparse_plan,
                     )
                 )
                 loss = loss_fn(
@@ -1396,21 +1408,27 @@ class TorchTurboEngine:
         ctx: Any,
         temperature: float,
         grad_scaler: bool,
-        sparse_plan: SparseLogitsPlan | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         sp_info = self.get_sp_info()
         sp_size = int(sp_info.get("sp_size", 1))
         mb_input = ctx["mb_input"]
         cu_seqlens = mb_input.get("cu_seqlens")
+        logprob_config = self.config.logprob_computation
 
-        if sp_size > 1 and sparse_plan is None:
+        if sp_size > 1:
             from torchturbo.adapters.rl.sp import (
                 gather_entropy_and_shift,
                 gather_logprobs_and_shift,
             )
 
             labels = mb_input["_input_ids_rolled"]
-            logprobs, entropy = gather_logprobs_entropy(logits, labels, temperature)
+            logprobs, entropy = gather_logprobs_entropy(
+                logits,
+                labels,
+                temperature,
+                chunk_size=logprob_config.chunk_size,
+                checkpoint_chunks=logprob_config.checkpoint_chunks,
+            )
             logprobs = gather_logprobs_and_shift(
                 logprobs,
                 ctx["sp_pad_size"],
@@ -1427,31 +1445,20 @@ class TorchTurboEngine:
             )
             return logprobs, entropy
 
-        if sparse_plan is not None:
-            if logits.ndim != 2 or logits.shape[0] != sparse_plan.model_rows.numel():
-                raise ValueError(
-                    "Sparse model output does not match selected predictor rows."
-                )
-            if temperature <= 0:
-                raise ValueError("temperature must be positive.")
-            # Sparse rows already have next-token labels; do not shift them again.
-            shifted_logits = logits
-            shifted_labels = sparse_plan.labels
-        else:
-            input_ids = ctx["model_inputs"]["input_ids"].squeeze(0)
-            if ctx["pad_length"] > 0:
-                logits = logits[: -ctx["pad_length"]]
-                input_ids = input_ids[: -ctx["pad_length"]]
+        input_ids = ctx["model_inputs"]["input_ids"].squeeze(0)
+        if ctx["pad_length"] > 0:
+            logits = logits[: -ctx["pad_length"]]
+            input_ids = input_ids[: -ctx["pad_length"]]
 
-            shifted_logits = shifted_packed_tensor(logits, cu_seqlens, 0, 1)
-            shifted_labels = shifted_packed_tensor(input_ids, cu_seqlens, 1, 0)
+        shifted_logits = shifted_packed_tensor(logits, cu_seqlens, 0, 1)
+        shifted_labels = shifted_packed_tensor(input_ids, cu_seqlens, 1, 0)
         logprobs, entropy = gather_logprobs_entropy(
             shifted_logits,
             shifted_labels,
             temperature,
+            chunk_size=logprob_config.chunk_size,
+            checkpoint_chunks=logprob_config.checkpoint_chunks,
         )
-        if sparse_plan is not None:
-            return restore_sparse_logprobs_entropy(logprobs, entropy, sparse_plan)
         return logprobs, entropy
 
     def _scale_loss(

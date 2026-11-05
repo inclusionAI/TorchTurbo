@@ -8,6 +8,7 @@ from torchturbo.engine import core
 from torchturbo.engine.config import (
     EngineConfig,
     SparseLogitsConfig,
+    LogprobComputationConfig,
 )
 from torchturbo.models.qwen3_5.model import TurboQwen3_5ForConditionalGeneration
 from torchturbo.models.base import TurboModel
@@ -176,7 +177,7 @@ def make_mb(
     return dict(orig_mb=orig, padded_mb=model_inputs), info
 
 
-def engine(core, model, info, *, sparse=False):
+def engine(core, model, info, *, sparse=False, chunk_size=4):
     obj = core.TorchTurboEngine.__new__(core.TorchTurboEngine)
     obj.model = model
     if info["sp_size"] > 1:
@@ -190,6 +191,9 @@ def engine(core, model, info, *, sparse=False):
     obj.get_dp_info = lambda: dict(dp_size=1, dp_group=None)
     obj.config = EngineConfig(
         sparse_logits=SparseLogitsConfig(enabled=sparse),
+        logprob_computation=LogprobComputationConfig(
+            chunk_size=chunk_size, checkpoint_chunks=True
+        ),
     )
     return obj
 

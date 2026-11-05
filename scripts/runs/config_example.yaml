@@ -75,6 +75,12 @@ engine_config:
   sparse_logits:
     enabled: false
 
+  logprob_computation:
+    # Positive number of token rows per FP32 logprob/entropy chunk.
+    chunk_size: 1024
+    # Recompute chunk activations during backward; does not chunk lm_head.
+    checkpoint_chunks: false
+
   # Engine-managed optimizer configuration.
   optimizer:
     # Optimizer selected by the engine. Currently only "muon" is supported.
