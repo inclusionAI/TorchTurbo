@@ -1,12 +1,13 @@
 """CANN LightningIndexerV2 integration for Qwen3.8-flash-next QSA indexer.
 
-Replaces the torch small-op indexer path with a fused CANN kernel when the
-operator package is available.  The adapter keeps the surrounding
-pre-processing (block pool + RMSNorm + RoPE) in torch so that the learned
-``k_layernorm`` weight and the rotary schedule stay unchanged.
+The torch pre-processing retains block pooling, RMSNorm, and RoPE.  Each packed
+sample is processed independently so sequence-parallel queries use their
+segment-local causal prefixes.
 """
 
 from __future__ import annotations
+
+from itertools import pairwise
 
 import torch
 
@@ -39,11 +40,7 @@ def _compressed_index_keys(
     k_norm: torch.nn.Module,
     compress_ratio: int,
 ) -> torch.Tensor:
-    """Pool raw keys into per-block representatives and apply norm + RoPE.
-
-    Follows the same numeric path as the torch indexer: FP32 mean pooling,
-    ``k_layernorm`` (RMSNorm), then RoPE at each block's first position.
-    """
+    """Pool raw keys into per-block representatives and apply norm + RoPE."""
     batch, kv_length, head_dim = raw_keys.shape
     blocks = kv_length // compress_ratio
     grouped = raw_keys[:, : blocks * compress_ratio].reshape(
@@ -55,46 +52,67 @@ def _compressed_index_keys(
     block_sin = sin[:, : blocks * compress_ratio : compress_ratio]
     return apply_rotary_pos_emb(
         normalised.unsqueeze(2),
-        cos=block_cos.unsqueeze(2),
-        sin=block_sin.unsqueeze(2),
-    ).squeeze(2).contiguous()
+        cos=block_cos,
+        sin=block_sin,
+        unsqueeze_dim=2,
+    ).squeeze(2).to(normalised.dtype).contiguous()
 
 
 def _blocks_to_token_ids(
     block_ids: torch.Tensor,
+    segment_start: int,
+    query_positions: torch.Tensor,
     ratio: int,
     budget: int,
 ) -> torch.Tensor:
-    """Expand per-query block indices into flat token indices.
-
-    Mirrors the output contract of the torch ``qsa_indexer_forward``:
-    shape ``[B, S, budget + ratio - 1]`` int32 with -1 padding.
-    """
-    batch, seq_len, _ = block_ids.shape
-    width = budget + ratio - 1
-    token_ids = torch.full(
-        (batch, seq_len, width), -1, dtype=torch.int32, device=block_ids.device
+    """Match the torch dense-prefix and causal-tail output contract."""
+    local_positions = query_positions - segment_start
+    complete_blocks = (local_positions + 1).div(ratio, rounding_mode="floor")
+    valid_blocks = (block_ids >= 0) & (block_ids < complete_blocks[:, None])
+    num_selected_blocks = valid_blocks.sum(dim=1)
+    # CANN may rank the current incomplete block among earlier complete blocks.
+    # Keep valid blocks in top-k order and compact them before appending the tail.
+    order = torch.argsort(~valid_blocks, dim=1, stable=True)
+    block_ids = block_ids.gather(1, order)
+    valid_blocks = valid_blocks.gather(1, order)
+    output = torch.full(
+        (1, block_ids.shape[0], budget + ratio - 1),
+        -1,
+        dtype=torch.int32,
+        device=block_ids.device,
     )
+    block_offsets = torch.arange(ratio, device=block_ids.device)
+    token_ids = (
+        segment_start + block_ids.unsqueeze(-1) * ratio + block_offsets
+    ).to(torch.int32)
+    token_ids.masked_fill_(~valid_blocks.unsqueeze(-1), -1)
+    token_ids = token_ids.flatten(1)
+    output[0, :, : token_ids.shape[1]] = token_ids
 
-    valid = block_ids >= 0
-    lanes = torch.arange(ratio, device=block_ids.device, dtype=torch.int32)
-    expanded = block_ids.unsqueeze(-1) * ratio + lanes.view(1, 1, 1, -1)
-    expanded = expanded.reshape(batch, seq_len, -1)
-    valid_expanded = (
-        valid.unsqueeze(-1).expand(-1, -1, -1, ratio).reshape(batch, seq_len, -1)
-    )
+    tail_offsets = block_offsets[:-1]
+    tail_start = complete_blocks * ratio
+    tail_length = local_positions + 1 - tail_start
+    destinations = num_selected_blocks[:, None] * ratio + tail_offsets[None, :]
+    tail_ids = segment_start + tail_start[:, None] + tail_offsets[None, :]
+    tail_ids = torch.where(
+        tail_offsets[None, :] < tail_length[:, None], tail_ids, -1
+    ).to(torch.int32)
+    output[0].scatter_(1, destinations, tail_ids)
+    return output
 
-    # Causal visibility: token position must not exceed the query's own index.
-    positions = torch.arange(seq_len, device=block_ids.device).view(1, -1, 1)
-    in_range = valid_expanded & (expanded >= 0) & (expanded <= positions)
 
-    cols = min(expanded.shape[-1], width)
-    token_ids[:, :, :cols] = torch.where(
-        in_range[:, :, :cols],
-        expanded[:, :, :cols],
-        torch.full_like(expanded[:, :, :cols], -1),
-    )
-    return token_ids
+def _rank_segments(cu_seq_lens, local_length: int, sp_size: int, sp_rank: int):
+    """Build local queries and their causal KV prefixes for each packed sample."""
+    rank_start = sp_rank * local_length
+    rank_stop = rank_start + local_length
+    segments = []
+    for segment_start, segment_stop in pairwise(cu_seq_lens.tolist()):
+        query_start = max(segment_start, rank_start)
+        query_stop = min(segment_stop, rank_stop)
+        if query_start >= query_stop:
+            continue
+        segments.append((segment_start, query_start, query_stop))
+    return segments
 
 
 @torch.no_grad()
@@ -102,37 +120,29 @@ def qsa_indexer_forward_cann(
     indexer,
     hidden_states: torch.Tensor,
     position_embeddings: tuple[torch.Tensor, torch.Tensor],
+    cu_seq_lens: torch.Tensor,
     *,
     sp_group=None,
     sp_size: int = 1,
     sp_rank: int = 0,
 ) -> torch.Tensor:
-    """LightningIndexerV2 drop-in replacement for ``qsa_indexer_forward``.
-
-    Supports both ``sp_size == 1`` and ``sp_size > 1``.  For SP>1 the raw
-    keys and rotary tables are all-gathered to reconstruct the full packed
-    sequence before block pooling, matching the torch path's semantics.
-    Returns the same ``[1, S_local, budget + ratio - 1]`` int32 tensor.
-    """
+    """Return global packed token IDs for local queries using CANN LIv2."""
     ops = _import_cann_ops()
+    batch, local_length, _ = hidden_states.shape
+    if batch != 1:
+        raise ValueError("Packed QSA expects a single flattened batch row.")
 
-    batch, seq_len, _ = hidden_states.shape
     cos, sin = position_embeddings
-
     head_dim = indexer.index_head_dim
     ratio = indexer.compress_ratio
-    block_topk = indexer.block_topk
-
-    # -- query branch ------------------------------------------------------
-    query, raw_keys = indexer.index_qk_proj(hidden_states.detach()).split(
+    qk = indexer.index_qk_proj(hidden_states.detach())
+    query, raw_keys = qk.split(
         (indexer.index_n_heads * head_dim, head_dim), dim=-1
     )
     query = indexer.q_layernorm(query.unflatten(-1, (indexer.index_n_heads, head_dim)))
-    query = apply_rotary_pos_emb(query, cos=cos, sin=sin, unsqueeze_dim=2)
+    query = apply_rotary_pos_emb(query, cos=cos, sin=sin, unsqueeze_dim=2).to(raw_keys.dtype)
 
     if sp_size > 1:
-        # SP: gather raw keys and rotary tables so block pooling sees the full
-        # packed sequence.  The indexer is no-grad; backward = split.
         raw_key_dtype = raw_keys.dtype
         widths = (head_dim, cos.shape[-1], sin.shape[-1])
         selection_state = torch.cat((raw_keys, cos, sin), dim=-1)
@@ -144,42 +154,64 @@ def qsa_indexer_forward_cann(
         raw_keys, cos, sin = selection_state.split(widths, dim=-1)
         raw_keys = raw_keys.to(raw_key_dtype)
 
-    # -- compressed block keys ----------------------------------------------
-    kv_length = raw_keys.shape[1]
-    compressed_keys = _compressed_index_keys(
-        raw_keys, cos, sin, indexer.k_layernorm, ratio
+    segments = _rank_segments(cu_seq_lens, local_length, sp_size, sp_rank)
+    query_offset = sp_rank * local_length
+    device = hidden_states.device
+    result = torch.full(
+        (1, local_length, indexer.token_budget + ratio - 1),
+        -1,
+        dtype=torch.int32,
+        device=device,
     )
-
-    # -- CANN LightningIndexerV2 --------------------------------------------
-    weights = torch.full(
-        (batch, kv_length, indexer.index_n_heads),
-        head_dim ** -0.5,
-        dtype=torch.float32,
-        device=hidden_states.device,
-    )
-    cmp_residual_k = torch.full(
-        (batch,), kv_length % ratio, dtype=torch.int32, device=hidden_states.device
-    )
-
-    selected_blocks, _ = ops.lightning_indexer(
-        query.contiguous(),
-        compressed_keys.unsqueeze(2).contiguous(),
-        weights,
-        block_topk,
-        cmp_residual_k=cmp_residual_k,
-        metadata=None,
-        max_seqlen_q=-1,
-        layout_q="BSND",
-        layout_k="BSND",
-        mask_mode=3,
-        cmp_ratio=ratio,
-        return_value=0,
-    )
-    selected_blocks = selected_blocks.squeeze(2)  # [B, S_full, topk]
-
-    # For SP>1, slice back to the local rank's queries.
-    if sp_size > 1:
-        start = sp_rank * seq_len
-        selected_blocks = selected_blocks[:, start : start + seq_len]
-
-    return _blocks_to_token_ids(selected_blocks, ratio, indexer.token_budget)
+    for segment_start, query_start, query_stop in segments:
+        local_start = query_start - query_offset
+        local_stop = query_stop - query_offset
+        positions = torch.arange(
+            query_start,
+            query_stop,
+            device=device,
+            dtype=torch.int32,
+        )
+        compressed_length = (query_stop - segment_start) // ratio * ratio
+        if compressed_length == 0:
+            offsets = torch.arange(ratio - 1, device=device)[None, :]
+            tail_ids = segment_start + offsets
+            tail_ids = torch.where(
+                offsets <= (positions - segment_start)[:, None], tail_ids, -1
+            ).to(torch.int32)
+            result[0, local_start:local_stop, : ratio - 1] = tail_ids
+            continue
+        segment_query = query[:, local_start:local_stop]
+        segment_keys = _compressed_index_keys(
+            raw_keys[:, segment_start : segment_start + compressed_length],
+            cos[:, segment_start : segment_start + compressed_length],
+            sin[:, segment_start : segment_start + compressed_length],
+            indexer.k_layernorm,
+            ratio,
+        )
+        kv_length = query_stop - segment_start
+        residual_k = torch.tensor([kv_length % ratio], dtype=torch.int32, device=device)
+        weights = torch.full(
+            (local_stop - local_start, indexer.index_n_heads),
+            head_dim ** -0.5,
+            dtype=torch.float32,
+            device=device,
+        )
+        selected_blocks, _ = ops.lightning_indexer(
+            segment_query.contiguous(),
+            segment_keys.unsqueeze(2).contiguous(),
+            weights.unsqueeze(0),
+            indexer.block_topk,
+            cmp_residual_k=residual_k,
+            metadata=None,
+            max_seqlen_q=-1,
+            layout_q="BSND",
+            layout_k="BSND",
+            mask_mode=3,
+            cmp_ratio=ratio,
+            return_value=0,
+        )
+        result[0, local_start:local_stop] = _blocks_to_token_ids(
+            selected_blocks[0, :, 0], segment_start, positions, ratio, indexer.token_budget
+        )
+    return result

@@ -55,9 +55,9 @@ def qsa_indexer_forward(
     if _ENABLE_NPU_LI:
         from .npu import has_cann_liv2, qsa_indexer_forward_cann
 
-        if has_cann_liv2():
+        if hidden_states.device.type == "npu" and has_cann_liv2():
             return qsa_indexer_forward_cann(
-                indexer, hidden_states, position_embeddings,
+                indexer, hidden_states, position_embeddings, cu_seq_lens,
                 sp_group=sp_group, sp_size=sp_size, sp_rank=sp_rank,
             )
 
@@ -72,7 +72,7 @@ def qsa_indexer_forward(
         (indexer.index_n_heads * head_dim, head_dim), dim=-1
     )
     query = indexer.q_layernorm(query.unflatten(-1, (indexer.index_n_heads, head_dim)))
-    query = apply_rotary_pos_emb(query, cos=cos, sin=sin, unsqueeze_dim=2)
+    query = apply_rotary_pos_emb(query, cos=cos, sin=sin, unsqueeze_dim=2).to(raw_keys.dtype)
 
     if sp_size > 1:
         raw_key_dtype = raw_keys.dtype
@@ -121,7 +121,7 @@ def qsa_indexer_forward(
                 cos=cos.index_select(1, block_starts),
                 sin=sin.index_select(1, block_starts),
                 unsqueeze_dim=2,
-            )[0, :, 0]
+            )[0, :, 0].to(raw_keys.dtype)
 
         for chunk_start in range(
             query_start, query_stop, _QSA_INDEXER_QUERY_CHUNK_SIZE

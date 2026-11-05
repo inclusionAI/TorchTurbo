@@ -265,7 +265,7 @@ class TurboQwen4ExpForConditionalGeneration(
             language_model, sp_size=sp_size, sp_rank=sp_rank
         )
 
-        if has_cann_liv2() and sp_size == 1:
+        if has_cann_liv2():
             from torchturbo.logging import get_logger
 
             get_logger(__name__).info(
