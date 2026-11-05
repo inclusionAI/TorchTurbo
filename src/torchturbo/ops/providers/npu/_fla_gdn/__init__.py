@@ -96,8 +96,8 @@ def ascendc_causal_conv1d(
         initial_state / output_final_state / cu_seqlens: as in ``fla``.
 
     Returns:
-        ``(y, final_state)`` where ``y`` is ``[B, T, D]`` (same layout as the
-        input) and ``final_state`` is ``None`` unless ``output_final_state``.
+        ``(y, final_state)`` where ``y`` is ``[B, T, D]`` and ``final_state``
+        is ``None`` unless ``output_final_state``.
     """
     if x.ndim != 3:
         raise ValueError(f"x must be [B, T, D], got shape={tuple(x.shape)}")
@@ -117,9 +117,10 @@ def ascendc_causal_conv1d(
     if cu_seqlens is not None and cu_seqlens.device != x.device:
         cu_seqlens = cu_seqlens.to(x.device)
 
-    # AscendC kernel returns head-first ``[B, H, T, Dh]``. Because the conv is
-    # depthwise with contiguous head grouping (``d = h * Dh + dh``), transposing
-    # back and flattening recovers the exact per-channel result in ``[B, T, D]``.
+    # The AscendC kernel always produces head-first ``[B, H, T, Dh]``. Because
+    # the conv is depthwise with contiguous head grouping (``d = h * Dh + dh``),
+    # transposing back and flattening recovers the exact per-channel result in
+    # ``[B, T, D]``.
     y_head, final_state = AscendCCausalConv1dFunction.apply(
         x,
         weight,
