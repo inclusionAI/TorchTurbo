@@ -25,4 +25,4 @@ pip install datasets==5.0.1
 pip install binpacking==1.5.2
 pip install safetensors==0.7.0
 
-pip install numpy==2.0
+pip install pyarrow==21.0.0
