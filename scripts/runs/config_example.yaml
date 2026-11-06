@@ -118,6 +118,27 @@ engine_config:
     z_loss_coeff: 0.0
     token_dispatcher: alltoall
 
+  # Profiler detail knobs, only effective with --tt_profiling.
+  profiling:
+    record_shapes: false  # On NPU, also set profiler_level=Level1 in experimental_config to record shapes.
+    profile_memory: false
+    with_stack: false
+    with_modules: false
+    with_flops: false
+    # Backend-specific experimental knobs as comma-separated key=value
+    # pairs. NPU keys:
+    #   aic_metrics: AiCoreNone, PipeUtilization, ArithmeticUtilization,
+    #                Memory, MemoryL0, MemoryUB, ResourceConflictRatio,
+    #                L2Cache, MemoryAccess
+    #   profiler_level: Level0, Level1, Level2
+    # CUDA currently ignores this string.
+    # Example:
+    #   experimental_config: "aic_metrics=PipeUtilization,profiler_level=Level1"
+    experimental_config: ""
+    # 1-based training step to profile; null profiles the first step.
+    # Always warmup=0, skip_first=step-1, data_simplification on.
+    profiling_step: null
+
   mtp:
     enabled: false
     loss_scaling_factor: 0.1

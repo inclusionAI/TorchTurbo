@@ -39,6 +39,7 @@ from torchturbo.engine.optimizers import (
 from torchturbo.models.base import TurboModel
 from torchturbo.models.modules.moe.moe_layer import BaseMoELayer, MoERuntimeInputs
 from torchturbo.models.modules.moe.moe_utils import MoEAuxLossAutoScaler
+from torchturbo.runtime import ProfilingConfig
 from torchturbo.runtime.cpu import CpuRuntime
 
 
@@ -992,10 +993,13 @@ class TestEngineSetup:
             output_dir: str,
             worker_name: str,
             profiling_enabled: bool,
+            profiling_config: ProfilingConfig,
             memory_snapshot_steps: int | None,
         ):
             profiler_kwargs["output_dir"] = output_dir
             profiler_kwargs["worker_name"] = worker_name
+            profiler_kwargs["profiling_enabled"] = profiling_enabled
+            profiler_kwargs["profiling_config"] = profiling_config
             return profiler
 
         monkeypatch.setattr(runtime, "profiler", fake_profiler)
@@ -1014,7 +1018,68 @@ class TestEngineSetup:
         assert profiler.calls == ["start", "step", "stop"]
         assert profiler_kwargs["output_dir"] == str(tmp_path / "profiling")
         assert profiler_kwargs["worker_name"].startswith("rank")
+        assert profiler_kwargs["profiling_enabled"] is True
+        # The engine forwards its config object untouched.
+        assert profiler_kwargs["profiling_config"] is engine.config.profiling
+        assert profiler_kwargs["profiling_config"] == ProfilingConfig()
         assert (tmp_path / "profiling").is_dir()
+
+    def test_profiling_config_knobs_reach_runtime_profiler(
+        self, monkeypatch, tmp_path
+    ):
+        runtime = CpuRuntime()
+        recorder = RecordingProfiler()
+        profiler_kwargs = {}
+
+        def fake_profiler(
+            *,
+            output_dir: str,
+            worker_name: str,
+            profiling_enabled: bool,
+            profiling_config: ProfilingConfig,
+            memory_snapshot_steps: int | None,
+        ):
+            profiler_kwargs["profiling_enabled"] = profiling_enabled
+            profiler_kwargs["profiling_config"] = profiling_config
+            return recorder
+
+        monkeypatch.setattr(runtime, "profiler", fake_profiler)
+        monkeypatch.setattr(engine_core, "get_device_runtime", lambda: runtime)
+        monkeypatch.setattr(
+            engine_core,
+            "get_backend",
+            lambda backend_name: DummyBackend if backend_name == "fsdp2" else None,
+        )
+
+        engine = TorchTurboEngine(
+            EngineConfig(
+                profiling=ProfilingConfig(
+                    record_shapes=True,
+                    experimental_config=(
+                        "aic_metrics=PipeUtilization,profiler_level=Level1"
+                    ),
+                    with_stack=True,
+                    profiling_step=20,
+                )
+            )
+        )
+
+        # The engine passes EngineConfig.profiling through verbatim;
+        # per-backend interpretation lives in the device runtimes.
+        engine.start_profiling(str(tmp_path), True, None)
+        assert profiler_kwargs["profiling_config"] is engine.config.profiling
+        assert profiler_kwargs["profiling_config"].record_shapes is True
+        assert (
+            profiler_kwargs["profiling_config"].experimental_config
+            == "aic_metrics=PipeUtilization,profiler_level=Level1"
+        )
+        assert profiler_kwargs["profiling_config"].with_stack is True
+        assert profiler_kwargs["profiling_config"].profiling_step == 20
+
+        # Snapshot-only mode forwards the same config with profiling off.
+        engine.start_profiling(str(tmp_path), False, 3)
+        assert profiler_kwargs["profiling_enabled"] is False
+        assert profiler_kwargs["profiling_config"] is engine.config.profiling
 
     def test_profiling_start_failure_clears_previous_profiler(
         self, monkeypatch, tmp_path
@@ -1035,8 +1100,17 @@ class TestEngineSetup:
             output_dir: str,
             worker_name: str,
             profiling_enabled: bool,
+            profiling_config: ProfilingConfig,
             memory_snapshot_steps: int | None,
         ):
+            # Failure-path test: kwargs are irrelevant.
+            del (
+                output_dir,
+                worker_name,
+                profiling_enabled,
+                profiling_config,
+                memory_snapshot_steps,
+            )
             return next(profilers)
 
         monkeypatch.setattr(runtime, "profiler", fake_profiler)

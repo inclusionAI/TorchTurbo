@@ -28,6 +28,7 @@ from omegaconf import OmegaConf
 
 from ..logging import get_logger
 from ..ops.base import OpPolicy
+from ..runtime.base import ProfilingConfig
 from .args import TorchTurboArgs, get_arg_specs, string_to_bool
 
 logger = get_logger(__name__)
@@ -525,6 +526,7 @@ class MfuConfig:
     enabled: bool = False
     card: str | None = None
 
+
 @dataclass(frozen=True)
 class FreezePolicy:
     """Freeze parameters by semantic group and/or FQN wildcard pattern
@@ -665,6 +667,9 @@ class EngineConfig:
     mfu: MfuConfig = field(default_factory=MfuConfig)
     """MFU/HFU reporting settings."""
 
+    profiling: ProfilingConfig = field(default_factory=ProfilingConfig)
+    """Profiler detail knobs; consumed only when profiling is started."""
+
     gbs: int | None = None
     """Global batch size in micro-batch units (``--tt_gbs``). When set, the
     engine derives ``gradient_accumulation_steps = gbs * sp_size / world_size``
@@ -701,6 +706,12 @@ class EngineConfig:
             self.optimizer = OptimizerConfig(**self.optimizer)
         elif not isinstance(self.optimizer, OptimizerConfig):
             raise TypeError("optimizer must be an OptimizerConfig or dict")
+        if self.profiling is None:
+            self.profiling = ProfilingConfig()
+        elif isinstance(self.profiling, dict):
+            self.profiling = ProfilingConfig(**self.profiling)
+        elif not isinstance(self.profiling, ProfilingConfig):
+            raise TypeError("profiling must be a ProfilingConfig or dict")
         if self.gbs is not None and self.gbs <= 0:
             raise ValueError(
                 f"gbs (--tt_gbs) must be a positive integer, got {self.gbs}."
@@ -824,6 +835,9 @@ class EngineConfig:
         # MFU/HFU reporting
         mfu_config = cls._parse_mfu_config(d.get("mfu", {}))
 
+        # Profiling detail knobs
+        profiling_config = cls._parse_profiling_config(d.get("profiling", {}))
+
         # Extra
         known_keys = {
             "backend",
@@ -865,6 +879,7 @@ class EngineConfig:
             "freeze_policy",
             "diffusion",
             "mfu",
+            "profiling",
             "gbs",
             "plugin_paths",
             "extra",
@@ -890,6 +905,7 @@ class EngineConfig:
             freeze_policy=freeze_policy,
             diffusion=_build_diffusion_config(d),
             mfu=mfu_config,
+            profiling=profiling_config,
             gbs=d.get("gbs"),
             plugin_paths=list(d.get("plugin_paths") or []),
             extra=extra,
@@ -965,6 +981,16 @@ class EngineConfig:
         if kwargs.get("enabled") is not None:
             kwargs["enabled"] = string_to_bool(kwargs["enabled"])
         return MfuConfig(**kwargs)
+
+    @staticmethod
+    def _parse_profiling_config(value: Any) -> ProfilingConfig:
+        if isinstance(value, ProfilingConfig):
+            return value
+        if value is None or value == {}:
+            return ProfilingConfig()
+        if not isinstance(value, dict):
+            raise TypeError("profiling must be a dict or ProfilingConfig.")
+        return _build_profiling_config({"profiling": value})
 
     @staticmethod
     def _parse_freeze_policy(value: Any) -> FreezePolicy:
@@ -1147,6 +1173,7 @@ def build_from_args(
         loss_chunk=_build_loss_chunk_config(fields),
         freeze_policy=_build_freeze_policy(fields),
         mfu=_build_mfu_config(fields),
+        profiling=_build_profiling_config(fields),
         diffusion=_build_diffusion_config(fields),
         gbs=fields.get("gbs"),
         plugin_paths=list(tt.plugins or []),
@@ -1197,6 +1224,7 @@ def _validate_config_file(data: Mapping[str, Any], parents: tuple[str, ...] = ()
         }
     )
     allowed.update(_dataclass_config_paths(OptimizerConfig, ("optimizer",)))
+    allowed.update(_dataclass_config_paths(ProfilingConfig, ("profiling",)))
 
     for key, value in data.items():
         parts = (*parents, key)
@@ -1354,6 +1382,23 @@ def _build_mfu_config(fields: Mapping[str, Any]) -> MfuConfig:
         enabled=string_to_bool(mfu_d.get("enabled", False)),
         card=mfu_d.get("card") or None,
     )
+
+
+def _build_profiling_config(fields: Mapping[str, Any]) -> ProfilingConfig:
+    """ProfilingConfig from the merged config dict (YAML ``profiling.*``)."""
+    profiling_d = dict(fields.get("profiling") or {})
+    for key in (
+        "record_shapes",
+        "profile_memory",
+        "with_stack",
+        "with_modules",
+        "with_flops",
+    ):
+        if profiling_d.get(key) is not None:
+            profiling_d[key] = string_to_bool(profiling_d[key])
+    if profiling_d.get("experimental_config") is None:
+        profiling_d.pop("experimental_config", None)
+    return ProfilingConfig(**profiling_d)
 
 
 def _build_diffusion_config(fields: Mapping[str, Any]) -> DiffusionConfig:

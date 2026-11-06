@@ -1,9 +1,35 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from enum import StrEnum
 
 import torch
+
+
+@dataclass
+class ProfilingConfig:
+    """Profiler knobs forwarded to the device profiler.
+
+    ``profiling_step`` is the 1-based training step to profile (default: the
+    first step). ``experimental_config`` is a backend-specific
+    ``key=value,...`` string parsed by device runtimes that support it.
+    """
+
+    record_shapes: bool = False
+    profile_memory: bool = False
+    with_stack: bool = False
+    with_modules: bool = False
+    with_flops: bool = False
+    experimental_config: str = ""
+    profiling_step: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.profiling_step is not None and self.profiling_step < 1:
+            raise ValueError(
+                f"profiling.profiling_step must be a positive integer, "
+                f"got {self.profiling_step}."
+            )
 
 
 class BaseProfiler(ABC):
@@ -13,6 +39,7 @@ class BaseProfiler(ABC):
         output_dir: str,
         worker_name: str,
         profiling_enabled: bool,
+        profiling_config: ProfilingConfig,
         memory_snapshot_steps: int | None,
     ) -> None:
         ...
@@ -133,6 +160,7 @@ class DeviceRuntime(ABC):
         output_dir: str,
         worker_name: str,
         profiling_enabled: bool,
+        profiling_config: ProfilingConfig,
         memory_snapshot_steps: int | None,
     ) -> BaseProfiler:
         ...

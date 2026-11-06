@@ -1,5 +1,6 @@
 from contextlib import nullcontext
 import os
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -7,6 +8,7 @@ import torch
 
 from torchturbo.runtime import (
     DeviceRuntime,
+    ProfilingConfig,
     TurboDevice,
     get_device_name,
     get_device_runtime,
@@ -15,7 +17,11 @@ from torchturbo.runtime import (
     is_npu_available,
 )
 from torchturbo.runtime.cpu import CpuRuntime
-from torchturbo.runtime.npu import _NPU_DETERMINISTIC_ENV, NpuRuntime
+from torchturbo.runtime.npu import (
+    _NPU_DETERMINISTIC_ENV,
+    NpuRuntime,
+    _parse_npu_experimental_config,
+)
 import torchturbo.runtime.runtime as runtime_impl
 
 
@@ -78,6 +84,7 @@ class FakeRuntime(DeviceRuntime):
         output_dir: str,
         worker_name: str,
         profiling_enabled: bool,
+        profiling_config: ProfilingConfig,
         memory_snapshot_steps: int | None,
     ):
         self.profiler_calls.append((output_dir, worker_name))
@@ -126,6 +133,7 @@ def test_cpu_runtime_contract():
             output_dir="/tmp",
             worker_name="worker",
             profiling_enabled=True,
+            profiling_config=ProfilingConfig(),
             memory_snapshot_steps=None,
         )
 
@@ -268,3 +276,141 @@ def test_device_runtime_get_returns_selected_runtime(monkeypatch):
 
     assert current is selected
     assert current.turbo_device is TurboDevice.CPU
+
+
+def _fake_torch_npu_module():
+    """Minimal torch_npu stand-in covering what _NpuProfiler reads."""
+    experimental_config_calls = []
+    profile_calls = []
+    schedule_calls = []
+
+    class FakeExperimentalConfig:
+        def __init__(self, **kwargs):
+            experimental_config_calls.append(kwargs)
+
+    class FakeProfile:
+        def __init__(self, **kwargs):
+            profile_calls.append(kwargs)
+
+        def start(self):
+            return None
+
+        def step(self):
+            return None
+
+        def stop(self):
+            return None
+
+    def fake_schedule(**kwargs):
+        schedule_calls.append(kwargs)
+        return None
+
+    profiler = SimpleNamespace(
+        _ExperimentalConfig=FakeExperimentalConfig,
+        ExportType=SimpleNamespace(Text="text"),
+        ProfilerLevel=SimpleNamespace(Level0="Level0", Level1="Level1"),
+        AiCMetrics=SimpleNamespace(AiCoreNone="none", PipeUtilization="pipe"),
+        ProfilerActivity=SimpleNamespace(CPU="cpu", NPU="npu"),
+        schedule=fake_schedule,
+        tensorboard_trace_handler=lambda *args, **kwargs: None,
+        profile=FakeProfile,
+    )
+    module = SimpleNamespace(profiler=profiler)
+    return module, experimental_config_calls, profile_calls, schedule_calls
+
+
+def test_parse_npu_experimental_config():
+    assert _parse_npu_experimental_config("") == {}
+    assert _parse_npu_experimental_config(
+        "aic_metrics=PipeUtilization, profiler_level=Level1"
+    ) == {"aic_metrics": "PipeUtilization", "profiler_level": "Level1"}
+
+    with pytest.raises(ValueError, match="Unknown NPU experimental_config key"):
+        _parse_npu_experimental_config("detailed_kernel_info=true")
+    with pytest.raises(ValueError, match="Invalid NPU experimental_config entry"):
+        _parse_npu_experimental_config("aic_metrics")
+    with pytest.raises(ValueError, match="Invalid NPU experimental_config"):
+        _parse_npu_experimental_config("aic_metrics=Bogus")
+    with pytest.raises(ValueError, match="Invalid NPU experimental_config"):
+        _parse_npu_experimental_config("profiler_level=Level9")
+
+
+@pytest.mark.parametrize(
+    ("config", "expected_level", "expected_aic"),
+    [
+        # Explicit detail selection: shapes + utilization + Level1.
+        (
+            ProfilingConfig(
+                record_shapes=True,
+                experimental_config=(
+                    "aic_metrics=PipeUtilization,profiler_level=Level1"
+                ),
+            ),
+            "Level1",
+            "pipe",
+        ),
+        # with_stack alone leaves level and metrics at stock defaults.
+        (ProfilingConfig(with_stack=True), "Level0", "none"),
+    ],
+)
+def test_npu_profiler_experimental_config(
+    monkeypatch, config, expected_level, expected_aic
+):
+    fake_module, experimental_config_calls, profile_calls, _ = (
+        _fake_torch_npu_module()
+    )
+    monkeypatch.setitem(sys.modules, "torch_npu", fake_module)
+
+    from torchturbo.runtime.npu import _NpuProfiler
+
+    profiler = _NpuProfiler(
+        "/tmp/profiling",
+        "rank0",
+        profiling_enabled=True,
+        profiling_config=config,
+        memory_snapshot_steps=None,
+    )
+    # Constructing records torch_npu calls; start() is never called so this
+    # test works on machines without torch_npu installed.
+    assert profiler._profiler is not None
+    assert experimental_config_calls[0]["profiler_level"] == expected_level
+    assert experimental_config_calls[0]["aic_metrics"] == expected_aic
+    assert experimental_config_calls[0]["data_simplification"] is True
+    assert profile_calls[0]["record_shapes"] is config.record_shapes
+    assert profile_calls[0]["with_stack"] is config.with_stack
+
+
+def test_npu_profiler_schedule_from_profiling_step(monkeypatch):
+    fake_module, _, _, schedule_calls = _fake_torch_npu_module()
+    monkeypatch.setitem(sys.modules, "torch_npu", fake_module)
+
+    from torchturbo.runtime.npu import _NpuProfiler
+
+    # Without profiling_step, the first step is profiled.
+    _NpuProfiler(
+        "/tmp/profiling",
+        "rank0",
+        profiling_enabled=True,
+        profiling_config=ProfilingConfig(),
+        memory_snapshot_steps=None,
+    )
+    assert schedule_calls[-1] == {
+        "wait": 0,
+        "warmup": 0,
+        "active": 1,
+        "repeat": 1,
+        "skip_first": 0,
+    }
+
+    # Training step N (1-based) runs in the ProfilerStep#(N-1) window.
+    for profiling_step, expected_skip_first in ((1, 0), (20, 19)):
+        _NpuProfiler(
+            "/tmp/profiling",
+            "rank0",
+            profiling_enabled=True,
+            profiling_config=ProfilingConfig(profiling_step=profiling_step),
+            memory_snapshot_steps=None,
+        )
+        last = schedule_calls[-1]
+        assert last["skip_first"] == expected_skip_first
+        assert last["warmup"] == 0
