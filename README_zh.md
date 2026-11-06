@@ -283,6 +283,7 @@ torchrun --nproc_per_node=8 scripts/checkpoint/dcp_to_hf.py \
 docs/runs/
 └── qwen3_5_moe/
 └── bailing_v3/
+└── glm5_3/
 ...
 ```
 

@@ -333,6 +333,7 @@ Built-in models are discovered from `src/torchturbo/models/`. Public environment
 docs/runs/
 └── qwen3_5_moe/
 └── bailing_v3/
+└── glm5_3/
 ...
 ```
 
