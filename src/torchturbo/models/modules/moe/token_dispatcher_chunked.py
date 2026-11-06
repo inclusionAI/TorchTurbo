@@ -1,10 +1,4 @@
-# Chunked all-to-all token dispatcher for MoE layers.
-#
-# Selected via ``moe_token_dispatcher_type = "alltoall_chunked"`` and kept in
-# a dedicated module so the default ``alltoall`` dispatch path imports and
-# executes exactly as before. Local tokens are split into contiguous chunks;
-# chunk-level all-to-all transfers run on a dedicated communication stream so
-# chunk ``c + 1`` transfers while chunk ``c`` computes.
+# Chunked all-to-all token dispatcher, kept in a dedicated module so the default path is unaffected.
 
 from dataclasses import dataclass
 from contextlib import contextmanager
@@ -17,7 +11,6 @@ import torch.distributed as dist
 from torchturbo.ops import ops
 from torchturbo.ops.moe import MoEPermutation
 
-from ..comm.comm import all_to_all
 from .moe_config import MoEConfig
 from .token_dispatcher import MoEAlltoAllTokenDispatcher
 from .utils import RoutingResult, maybe_move_tensor_to_cpu
@@ -38,13 +31,11 @@ class _ChunkHostSplits:
 class _ChunkMetadata:
     """Per-chunk routing counts derived once per layer on device."""
 
-    # int64 counts shaped [chunks, ep_size, num_local_experts]; per-chunk
-    # source-rank chunks received for every local expert.
+    # int64 [chunks, ep_size, num_local_experts]; received rows per local expert.
     received_counts: torch.Tensor
     # int64 counts shaped [chunks, ep_size]; rows this rank sends per chunk.
     send_counts: torch.Tensor
-    # int64 counts shaped [chunks, ep_size]; rows every rank sends per chunk
-    # to this rank.
+    # int64 [chunks, ep_size]; rows every rank sends to this rank per chunk.
     receive_counts: torch.Tensor
     # int64 counts shaped [chunks, num_local_experts]; expert totals per chunk.
     tokens_per_expert: torch.Tensor
@@ -52,28 +43,14 @@ class _ChunkMetadata:
 
 @dataclass
 class _ChunkGraph:
-    """Per-chunk expert-segment backward handle built during forward.
-
-    The chunked forward runs only the expert segment under
-    ``torch.enable_grad()`` (the dispatch all-to-all output becomes the
-    detached ``received_leaf``), so the backward consumes that graph
-    directly instead of re-executing the experts. The merge segment is
-    *not* part of the graph: its adjoint is computed from the saved
-    combine outputs (see ``_backward_merge_chunk``), so this record
-    holds no tensor whose value must survive the forward -- activation
-    retention stays identical to the plain dispatcher under any
-    external recomputation scheme. The value storages of ``restored``
-    and ``received_leaf`` are released once the forward pipeline has
-    consumed them; only the autograd structure is kept.
-    """
+    """Per-chunk expert-segment backward handle built during forward."""
 
     restored: torch.Tensor
     received_leaf: torch.Tensor
     row_indices: torch.Tensor
 
     def __repr__(self) -> str:
-        # Value storages may have been returned to the allocator; a repr
-        # must never read tensor data (debuggers/pytest would crash).
+        # Value storages may be freed; repr must never read tensor data.
         return (
             f"_ChunkGraph(restored{tuple(self.restored.shape)}, "
             f"received_leaf{tuple(self.received_leaf.shape)}, "
@@ -82,18 +59,7 @@ class _ChunkGraph:
 
 
 def _release_activation_value(tensor: torch.Tensor | None) -> None:
-    """Return *tensor*'s memory to the allocator, keeping the object alive.
-
-    The orchestrated backward consumes the expert-segment graphs
-    structurally -- grad_fn chains and leaf ``.grad`` accumulation work
-    with an empty storage -- and nothing on the backward path reads the
-    released values: the sort/restore permutation nodes keep only index
-    metadata, and the expert nodes keep their own (sorted) inputs. The
-    release is therefore mode-independent -- eager training, external
-    activation recomputation and their combinations all stay correct.
-    Only tensors that no autograd node has saved may be released; freeing
-    a storage that a SavedVariable aliases would corrupt backward.
-    """
+    """Return a tensor storage to the allocator without freeing the autograd object."""
     if tensor is None:
         return
     try:
@@ -101,36 +67,13 @@ def _release_activation_value(tensor: torch.Tensor | None) -> None:
         if storage.size() > 0:
             storage.resize_(0)
     except Exception:
-        # Pure memory optimization: allocator quirks on some backends must
-        # never affect correctness.
+        # Pure memory optimization; allocator quirks must never affect correctness.
         pass
 
 
 @contextmanager
 def shared_recompute_group() -> Iterator[None]:
-    """Pin a backward pass to a single checkpoint-recompute graph id.
-
-    Non-reentrant ``torch.utils.checkpoint`` keys saved-tensor rehydration
-    by backward graph-task id: for every distinct id it encounters while
-    running a frame's backward, it re-runs the region's ``recompute_fn``,
-    re-entering the recompute context that ``context_fn`` built exactly
-    once per ``checkpoint()`` call. When that context is one-shot (any
-    ``@contextmanager``-built CM), the second entry crashes inside
-    contextlib with ``AttributeError: '_GeneratorContextManager' object
-    has no attribute 'args'`` (or ``RuntimeError: generator didn't
-    yield`` on older Pythons).
-
-    Wrapping the whole ``loss.backward()`` in one
-    ``torch.utils.checkpoint.GraphExecGroup`` gives every checkpointed
-    frame exactly one id, so each region recomputes once per backward
-    and every consumer -- including the nested backwards issued by the
-    chunked MoE dispatcher -- shares the same rehydrated values.
-
-    No-op under ``use_reentrant=True`` (reentrant checkpointing ignores
-    groups), with checkpointing disabled, or on torch builds without
-    ``GraphExecGroup``. An already-active ambient group is reused, since
-    groups cannot nest.
-    """
+    """Pin a backward pass to one checkpoint-recompute graph id; no-op under reentrant checkpointing."""
     try:
         from torch.utils.checkpoint import GraphExecGroup
     except ImportError:  # pragma: no cover - torch without GraphExecGroup
@@ -145,25 +88,7 @@ def shared_recompute_group() -> Iterator[None]:
 
 @contextmanager
 def _shared_recompute_group() -> Iterator[None]:
-    """One recomputation for the whole chunked backward.
-
-    Under a non-reentrant ``torch.utils.checkpoint``, saved-value
-    rehydration is keyed by the backward graph-task id: every nested
-    ``torch.autograd.backward`` the chunked backward issues gets a fresh
-    id, and each id would pay a full layer recomputation (C chunks -> C+1
-    expert forwards instead of 2). A ``GraphExecGroup`` pins all those
-    backwards to one id, so the checkpoint recomputes exactly once and
-    every nested backward consumes the same rehydrated values.
-
-    The same id-split bites the other way around too: any node of the
-    checkpointed layer that backward-passes *before* this dispatcher and
-    unpacks a saved tensor pays a recompute under the outer backward id,
-    and this dispatcher's group id would then pay a second one (crashing
-    into one-shot recompute contexts). The dispatcher therefore installs
-    the autograd guard below: every ``torch.autograd.backward``/``grad``
-    call runs under one shared group, and this scope reuses that ambient
-    group instead of opening a second one (groups cannot nest).
-    """
+    """Wrap the chunked backward in a shared recompute group so checkpoint recomputes once."""
     with shared_recompute_group():
         yield
 
@@ -172,22 +97,7 @@ _ORIGINAL_AUTOGRAD: dict[str, Any] = {}
 
 
 def _install_shared_backward_guard() -> None:
-    """Route every backward/grad call through one GraphExecGroup per call.
-
-    Installed once when the first chunked dispatcher is built. The backward
-    engine snapshots the thread-local autograd state -- including the
-    graph-exec group -- into the GraphTask at the ``backward()`` call and
-    re-installs it around every node (per-node ``ThreadLocalStateGuard`` in
-    engine.cpp), so a group must be active *before* the call to cover the
-    whole graph; anything set mid-backward (e.g. from tensor hooks) is
-    wiped at the next node boundary. Wrapping the autograd entry points is
-    the single chokepoint that provably puts one group id over every node
-    of every checkpoint frame, so each frame recomputes exactly once even
-    though this dispatcher's backward adds its own nested backwards.
-    Nested calls find the ambient group and pass through unchanged; the
-    guard is a no-op without checkpoint hooks, under ``use_reentrant=True``
-    and on torch builds without ``GraphExecGroup``.
-    """
+    """Route every backward/grad call through one GraphExecGroup per call."""
     if _ORIGINAL_AUTOGRAD:
         return
     try:
@@ -234,11 +144,7 @@ def _fsdp_module(module: torch.nn.Module) -> bool:
 
 
 def _fsdp_param_groups(fsdp_state: Any) -> list[Any]:
-    """Parameter groups of an FSDP2 state across torch layouts.
-
-    torch 2.10 keeps a single ``_fsdp_param_group`` per state while 2.11+
-    stores ``_fsdp_param_groups``; normalize both to a list.
-    """
+    """Return the FSDP2 parameter groups as a list across torch layouts."""
     groups = getattr(fsdp_state, "_fsdp_param_groups", None)
     if groups is None:
         group = getattr(fsdp_state, "_fsdp_param_group", None)
@@ -247,13 +153,7 @@ def _fsdp_param_groups(fsdp_state: Any) -> list[Any]:
 
 
 def _fsdp_groups(experts: torch.nn.Module) -> list[Any] | None:
-    """FSDP parameter groups of *experts*; None for non-FSDP modules.
-
-    Runs FSDP's lazy initialisation (comm-stream setup, root detection)
-    when the installed torch exposes it on the state: the chunked
-    forward bypasses the module hooks that normally perform it, and
-    this may be the module's very first forward.
-    """
+    """Return the experts FSDP parameter groups, running lazy init when it exists."""
     try:
         from torch.distributed.fsdp._fully_shard import FSDPModule
     except ImportError:  # pragma: no cover - torch without FSDP2 internals
@@ -269,19 +169,7 @@ def _fsdp_groups(experts: torch.nn.Module) -> list[Any] | None:
 
 @contextmanager
 def _fsdp_forward_hold(experts: torch.nn.Module) -> Iterator[None]:
-    """One weight all-gather covering every per-chunk forward expert call.
-
-    The chunked forward calls ``experts.forward`` directly (bypassing
-    ``__call__`` so no FSDP forward hooks fire once per chunk and no
-    ``RegisterPostBackwardFunction`` node is inserted into the graph),
-    so it unshards explicitly once on entry -- idempotent when the
-    weights are already unsharded -- and reshards on exit to keep the
-    normal memory lifecycle. During activation recomputation the
-    forward runs inside the backward pass: resharding there would only
-    make the chunked backward hold unshard again, so the reshard is
-    deferred to the backward hold's single reduce/reshard flush.
-    Non-FSDP modules pass through untouched.
-    """
+    """A single unshard/reshard around all per-chunk expert forward calls."""
     try:
         from torch.distributed.fsdp._fully_shard._fsdp_common import (
             TrainingState,
@@ -296,9 +184,7 @@ def _fsdp_forward_hold(experts: torch.nn.Module) -> Iterator[None]:
     if groups is None:
         yield
         return
-    # Mirror ``pre_forward``'s state transition -- module hooks are
-    # bypassed -- so the unshard picks FSDP's forward all-gather
-    # streams and the exit reshard follows the forward reshard policy.
+    # Mirror pre_forward's state transition because module hooks are bypassed.
     saved_states = [
         getattr(group, "_training_state", None) for group in groups
     ]
@@ -311,15 +197,7 @@ def _fsdp_forward_hold(experts: torch.nn.Module) -> Iterator[None]:
         yield
     finally:
         if not is_bw():
-            # Normal forward: mirror ``post_forward`` -- reshard once
-            # after all chunks and restore the training state. Under
-            # activation recomputation the forward runs inside the
-            # backward pass and FSDP's own post_forward skips the
-            # reshard (is_bw()), and so do we: the chunked backward
-            # hold reuses the unsharded weights and its single
-            # post_backward performs the one reduce-scatter and
-            # reshard, so a recomputed forward plus backward costs one
-            # experts all-gather instead of two.
+            # Normal forward reshard once; recompute defers reshard to backward.
             for group in groups:
                 group.reshard()
             for group, saved in zip(groups, saved_states):
@@ -340,16 +218,7 @@ def _fsdp_state_is_post_backward(group: Any) -> bool:
 
 
 def _fsdp_reset_group_state_to_idle(group: Any) -> None:
-    """Reset a group's training state to IDLE after a manual flush.
-
-    ``FSDPParamGroup.post_backward()`` leaves ``_training_state`` at
-    ``POST_BACKWARD``; in FSDP's own wiring the root post-backward final
-    callback -- which the chunked path never triggers, since it bypasses
-    the module hooks -- resets it to ``IDLE``. Without this reset, the
-    next chunked backward's flush sees the stale ``POST_BACKWARD`` and
-    skips the gradient reduce-scatter and reshard entirely: silently
-    unsynchronized expert gradients from the second backward on.
-    """
+    """Reset an FSDP group to IDLE after a manual post_backward."""
     try:
         from torch.distributed.fsdp._fully_shard._fsdp_common import (
             TrainingState,
@@ -362,28 +231,13 @@ def _fsdp_reset_group_state_to_idle(group: Any) -> None:
 
 @contextmanager
 def _fsdp_backward_hold(experts: torch.nn.Module) -> Iterator[None]:
-    """One all-gather and one reduce-scatter for chunked experts backward.
-
-    FSDP's backward wiring -- pre-backward unshard, gradient reduction,
-    reshard -- is installed by its forward hooks, which the chunked
-    forward bypasses, so nothing FSDP-side fires per chunk here. This
-    hold supplies the wiring explicitly: unshard once on entry, let the
-    per-chunk backwards accumulate into the unsharded ``.grad`` buffers,
-    then invoke ``post_backward`` exactly once so the accumulated
-    gradients reduce-scatter and the weights reshard a single time.
-    The flush is queued at the end of this backward task: under a
-    non-reentrant checkpoint the rest of the checkpointed layer
-    rehydrates after this module's backward, and that recomputation
-    re-runs the forward hold, which would re-unshard whatever this hold
-    resharded eagerly. Non-FSDP modules pass through untouched.
-    """
+    """A single unshard and post_backward flush around chunked expert backward."""
     groups = _fsdp_groups(experts)
     if groups is None:
         yield
         return
     for group in groups:
-        # Idempotent when the (recomputed) forward left the group
-        # unsharded; otherwise performs the one backward all-gather.
+        # Idempotent unshard; recomputed forward may leave weights unsharded.
         group.unshard()
         group.wait_for_unshard()
         set_grad_dtypes = getattr(group, "_set_unsharded_grad_dtypes", None)
@@ -392,17 +246,12 @@ def _fsdp_backward_hold(experts: torch.nn.Module) -> Iterator[None]:
     try:
         yield
     finally:
-        # Single flush at the end of the backward task (see docstring):
-        # one reduce-scatter over every chunk's accumulated gradients
-        # plus one reshard, honoring the module's original policies.
+        # Single flush at the end of the backward task: one reduce-scatter plus reshard.
         def _finalize_chunked_backward(fsdp_groups=tuple(groups)):
             for group in fsdp_groups:
                 if not _fsdp_state_is_post_backward(group):
                     group.post_backward()
-                # post_backward() parks the group in POST_BACKWARD; restore
-                # the IDLE invariant FSDP's own final callback maintains, so
-                # the next backward's flush is not skipped (see the reset
-                # helper's docstring).
+                # Restore IDLE so the next backward's flush is not skipped.
                 _fsdp_reset_group_state_to_idle(group)
         try:
             torch.autograd.Variable._execution_engine.queue_callback(
@@ -413,20 +262,7 @@ def _fsdp_backward_hold(experts: torch.nn.Module) -> Iterator[None]:
 
 
 class MoEChunkedAlltoAllTokenDispatcher(MoEAlltoAllTokenDispatcher):
-    """All-to-all dispatcher that pipelines token chunks with expert compute.
-
-    Local tokens are split into ``moe_num_chunks`` contiguous chunks along the
-    token dimension. Every chunk runs an independent dispatch/experts/combine
-    sequence, and chunk-level all-to-all transfers run on a dedicated
-    communication stream so that chunk ``c + 1`` transfers while chunk ``c``
-    computes. Routing weights stay on the source ranks and are applied during
-    the final weighted merge (output-side weights), so the separate
-    probability all-to-all of the plain dispatcher disappears.
-
-    Backward is owned by ``_ChunkedMoEFunction`` and reorders the per-chunk
-    expert backward and dispatch all-to-all across the two streams so chunk
-    ``c + 1`` transfers while chunk ``c`` backpropagates.
-    """
+    """All-to-all dispatcher that pipelines token chunks with expert compute on a side stream."""
 
     def __init__(
         self, num_local_experts: int, local_expert_indices: list[int],
@@ -440,8 +276,7 @@ class MoEChunkedAlltoAllTokenDispatcher(MoEAlltoAllTokenDispatcher):
             )
         _install_shared_backward_guard()
         self.num_chunks = max(1, int(config.moe_num_chunks))
-        # Stream-based pipelining requires device streams; CPU test runtimes
-        # and single-rank EP fall back to the serial chunk loop.
+        # Stream-based pipelining needs device streams; CPU and single-rank EP fall back to serial.
         overlap_supported = self.device_runtime.current_stream() is not None
         self._comm_stream = (
             self.device_runtime.new_stream()
@@ -455,6 +290,7 @@ class MoEChunkedAlltoAllTokenDispatcher(MoEAlltoAllTokenDispatcher):
         routing: RoutingResult,
         experts: torch.nn.Module,
     ) -> torch.Tensor:
+        """Run dispatch, expert compute, and combine with the chunked backward."""
         hidden_shape = hidden_states.shape
         flat = hidden_states.reshape(-1, hidden_shape[-1])
         if self._needs_custom_backward(flat, routing, experts):
@@ -474,13 +310,7 @@ class MoEChunkedAlltoAllTokenDispatcher(MoEAlltoAllTokenDispatcher):
         self, flat: torch.Tensor, routing: RoutingResult,
         experts: torch.nn.Module,
     ) -> bool:
-        """True when gradients may flow and the chunked backward must run.
-
-        The orchestrating autograd function owns backward so per-chunk
-        FSDP all-gathers/reduces collapse to one each and chunk backwards
-        overlap the communication stream. Under inference or a no-grad
-        caller the plain forward loop is enough.
-        """
+        """True when gradients may flow and the chunked backward must run."""
         if not torch.is_grad_enabled():
             return False
         if flat.requires_grad or routing.probs.requires_grad:
@@ -499,8 +329,7 @@ class MoEChunkedAlltoAllTokenDispatcher(MoEAlltoAllTokenDispatcher):
         bounds = self._chunk_bounds(flat.shape[0])
         metadata = self._chunk_metadata(routing, bounds)
         host = self._host_metadata(metadata)
-        # Output-side routing weights stay dense on the source rank; the
-        # fused unpermute gathers and applies them during each chunk merge.
+        # Output-side weights stay dense on the source rank for the fused merge.
         dense_probs = routing.probs.to(torch.float32)
         return flat, routing, bounds, metadata, host, dense_probs
 
@@ -515,42 +344,20 @@ class MoEChunkedAlltoAllTokenDispatcher(MoEAlltoAllTokenDispatcher):
         dense_probs: torch.Tensor,
         graphs: "list[_ChunkGraph] | None" = None,
     ) -> tuple[torch.Tensor, "torch.Tensor | None"]:
-        """Run the per-chunk forward pipeline, concatenated.
-
-        Returns ``(merged, combined)``: the token-ordered MoE output and,
-        on the grad-tracked (``graphs``) path, the concatenated combine
-        rows -- the merge inputs that the manual merge adjoint consumes
-        in backward; ``combined`` is ``None`` on the plain path.
-
-        One expert-weight all-gather per layer regardless of chunk count:
-        FSDP-wrapped experts are invoked through ``forward`` directly in
-        both paths (per-chunk FSDP hooks are bypassed), and the forward
-        hold unshards once on entry and reshards once on exit.
-        """
+        """Run the per-chunk forward pipeline into preallocated outputs."""
         with _fsdp_forward_hold(experts):
             if self._comm_stream is None:
-                outputs, combined_parts = self._execute_serial(
+                return self._execute_serial(
                     flat, routing, experts, bounds, host,
                     metadata.received_counts, dense_probs, graphs,
                 )
-            else:
-                outputs, combined_parts = self._execute_pipelined(
-                    flat, routing, experts, bounds, host,
-                    metadata.received_counts, dense_probs, graphs,
-                )
-        combined: "torch.Tensor | None" = (
-            torch.cat(combined_parts, dim=0)
-            if combined_parts is not None else None
-        )
-        return torch.cat(outputs, dim=0), combined
+            return self._execute_pipelined(
+                flat, routing, experts, bounds, host,
+                metadata.received_counts, dense_probs, graphs,
+            )
 
     def _chunk_bounds(self, num_tokens: int) -> list[tuple[int, int]]:
-        """Split token rows into contiguous chunk row intervals.
-
-        Every EP rank builds exactly ``num_chunks`` intervals, possibly
-        empty, so all ranks issue the same collective sequence even when
-        their token counts differ.
-        """
+        """Split token rows into contiguous chunk row intervals."""
         chunk_count = max(1, self.num_chunks)
         base_size = num_tokens // chunk_count
         remainder = num_tokens % chunk_count
@@ -569,10 +376,7 @@ class MoEChunkedAlltoAllTokenDispatcher(MoEAlltoAllTokenDispatcher):
         """Build per-chunk count matrices with a fast histogram and one gather."""
         routing_map = routing.routing_map
         chunk_count = len(bounds)
-        # Per-chunk routing histogram via the same masking reduction the
-        # plain dispatcher uses, replacing the atomic index_put_
-        # accumulate that NPU serialized and that, issued inline before
-        # the chunk transfers, amplified into a multi-ms stall.
+        # Masking reduction avoids the index_put_ accumulate that stalls NPU.
         counts = torch.stack(
             [routing_map[start:end].sum(dim=0) for start, end in bounds]
         ).long()
@@ -596,14 +400,7 @@ class MoEChunkedAlltoAllTokenDispatcher(MoEAlltoAllTokenDispatcher):
         )
 
     def _gather_counts(self, counts: torch.Tensor, chunk_count: int) -> torch.Tensor:
-        """All-gather the chunk histogram across the EP group.
-
-        When chunk transfers are pipelined on a side stream, run this gather on
-        that same stream too, so every EP collective stays ordered on a single
-        HCCL stream. Issuing the gather on the compute stream while chunk
-        all-to-all runs on the communication stream made the shared communicator
-        serialize and cost ~30 ms in NPU measurement.
-        """
+        """All-gather the chunk histogram on the communication stream when pipelining."""
         gathered = counts.new_empty(self.ep_size, chunk_count, self.num_experts)
         if self._comm_stream is None:
             dist.all_gather_into_tensor(
@@ -697,42 +494,45 @@ class MoEChunkedAlltoAllTokenDispatcher(MoEAlltoAllTokenDispatcher):
     def _merge_chunk(
         self,
         combined: torch.Tensor,
-        permutation: MoEPermutation,
+        row_indices: torch.Tensor,
+        expert_indices: torch.Tensor,
         dense_probs: torch.Tensor,
     ) -> torch.Tensor:
-        """Weight and sum the chunk's expert rows back into source tokens.
-
-        Delegates to the fused ``moe_unpermutation`` operator
-        (``npu_moe_token_unpermute`` on NPU), which gathers the chunk's dense
-        routing weights and accumulates the weighted merge in FP32 in a single
-        kernel with autograd, replacing the separate gather/mul/sum sequence.
-        """
-        restore_shape = (permutation.row_indices.shape[0], combined.shape[-1])
+        """Weight and sum the chunk expert rows back into source tokens with the fused unpermutation kernel."""
+        restore_shape = (row_indices.shape[0], combined.shape[-1])
         chunk_permutation = MoEPermutation(
-            combined, None, permutation.row_indices, permutation.expert_indices,
+            combined, None, row_indices, expert_indices,
         )
         return ops.moe_unpermutation(
             chunk_permutation, restore_shape=restore_shape, probs=dense_probs,
         )
 
-    # ------------------------------------------------------------------
     # Orchestrated backward (owned by _ChunkedMoEFunction)
-    # ------------------------------------------------------------------
 
-    def _a2a_no_grad(
-        self, grad: torch.Tensor,
-        output_split_sizes: list[int], input_split_sizes: list[int],
+    def _a2a_into_no_grad(
+        self,
+        input_: torch.Tensor,
+        output: torch.Tensor,
+        output_split_sizes: list[int],
+        input_split_sizes: list[int],
+        comm: Any = None,
     ) -> torch.Tensor:
-        """Bare collective without an autograd node.
-
-        The chunked backward is orchestrated by ``_ChunkedMoEFunction``
-        and moves the all-to-all gradients on the communication stream
-        explicitly instead of through autograd nodes.
-        """
+        """Run a bare all-to-all that writes into a preallocated output buffer."""
         with torch.no_grad():
-            return all_to_all(
-                self.ep_group, grad, output_split_sizes, input_split_sizes,
-            )
+            input_ = input_.contiguous()
+            if comm is not None:
+                self.device_runtime.record_stream(input_, comm)
+            if self.ep_size == 1:
+                output.copy_(input_)
+            else:
+                dist.all_to_all_single(
+                    output,
+                    input_,
+                    output_split_sizes=output_split_sizes,
+                    input_split_sizes=input_split_sizes,
+                    group=self.ep_group,
+                )
+        return output
 
     def _backward_merge_chunk(
         self,
@@ -743,33 +543,15 @@ class MoEChunkedAlltoAllTokenDispatcher(MoEAlltoAllTokenDispatcher):
         expert_indices_chunk: torch.Tensor,
         need_input_grads: bool,
         need_probs_grad: bool,
+        g_combined_out: torch.Tensor | None = None,
     ) -> tuple["torch.Tensor | None", "torch.Tensor | None"]:
-        """Manual adjoint of the weighted merge (unpermutation) segment.
-
-        The forward merged ``merged[i] = sum_j w[i, j] * combined[inv[i, j]]``
-        with ``w[i, j] = probs[i, expert_indices[i, j]]`` and ``inv`` the
-        bijective packed-row map ``row_indices``. The adjoints are
-        therefore
-
-        * ``g_combined[inv[i, j]] = w[i, j] * g_merged[i]`` (one row per
-          assignment, no accumulation), and
-        * ``g_probs[i, e] = sum_j (g_merged[i] . combined[inv[i, j]])``
-          over the slots assigned to expert ``e``,
-
-        computed with gather/multiply/scatter primitives instead of an
-        autograd graph. That keeps this segment's forward values out of
-        the chunk graphs (they travel through ``save_for_backward`` like
-        any plain activation), so the dispatcher needs no knowledge of
-        whatever external recomputation wraps the layer. Accumulation
-        runs in FP32 to mirror the merge kernel.
-        """
+        """Manual adjoint of the weighted merge computed with gather/multiply/scatter primitives."""
         chunk_tokens = grad_out_chunk.shape[0]
         topk = graph.row_indices.shape[1]
         row_indices = graph.row_indices.to(torch.long)
         packed = row_indices.reshape(-1)
         num_rows = packed.numel()
-        # g_merged broadcast into per-(token, slot) order, so every entry
-        # lines up with packed[k] = row_indices[i, j].
+        # Broadcast g_merged into per-(token, slot) order.
         g_merged_ij = (
             grad_out_chunk.unsqueeze(1)
             .expand(chunk_tokens, topk, grad_out_chunk.shape[-1])
@@ -778,21 +560,21 @@ class MoEChunkedAlltoAllTokenDispatcher(MoEAlltoAllTokenDispatcher):
         g_combined: "torch.Tensor | None" = None
         if need_input_grads:
             weights = dense_probs_chunk.gather(1, expert_indices_chunk)
-            g_flat = (
-                g_merged_ij.to(torch.float32)
-                * weights.flatten().unsqueeze(-1)
-            ).to(g_merged_ij.dtype)
-            # Scatter into packed (assignment) row order; ``row_indices``
-            # is a bijection over the chunk rows, so the assignment is
-            # deterministic.
-            g_combined = grad_out_chunk.new_zeros(
-                num_rows, grad_out_chunk.shape[-1],
-            )
-            g_combined[packed] = g_flat
+            # Mixed dtype promotes to FP32 in one multiply.
+            g_flat = g_merged_ij * weights.flatten().unsqueeze(-1)
+            # Row indices are a bijection over the chunk rows.
+            if g_combined_out is None:
+                g_combined = grad_out_chunk.new_zeros(
+                    num_rows, grad_out_chunk.shape[-1],
+                )
+                g_combined[packed] = g_flat
+            else:
+                g_combined = g_combined_out
+                g_combined.zero_()
+                g_combined[packed] = g_flat
         g_probs: "torch.Tensor | None" = None
         if need_probs_grad:
-            # Combine rows gathered into per-(token, slot) order, then
-            # g_probs[i, e] = sum_j (g_merged[i] . combined[i, j]).
+            # g_probs[i, e] = sum_j g_merged[i] . combined[inv[i, j]].
             combined_ij = combined_slice.index_select(0, packed)
             d_weights = (
                 g_merged_ij.to(torch.float32)
@@ -812,21 +594,13 @@ class MoEChunkedAlltoAllTokenDispatcher(MoEAlltoAllTokenDispatcher):
         graph: "_ChunkGraph",
         grad_restored: torch.Tensor,
     ) -> torch.Tensor:
-        """Expert-segment backward through the forward-built graph.
-
-        Runs ``backward`` on the graph captured during the (possibly
-        recomputed) forward so parameter gradients accumulate through
-        the normal autograd path -- the expert backward kernels consume
-        the forward-saved activations and the experts are never run
-        forward a second time. Returns the received-token gradient.
-        """
+        """Run expert backward through the forward-built graph and return the received-token gradient."""
         torch.autograd.backward(graph.restored, grad_restored)
         grad = graph.received_leaf.grad
         if grad is None:
             grad = torch.zeros_like(graph.received_leaf)
         graph.received_leaf.grad = None
-        # The expert graph is consumed; free the segment values eagerly so
-        # the backward peak tracks only the chunk in flight.
+        # Free consumed graph values so backward peak tracks the chunk in flight.
         _release_activation_value(graph.restored)
         _release_activation_value(graph.received_leaf)
         return grad
@@ -837,14 +611,7 @@ class MoEChunkedAlltoAllTokenDispatcher(MoEAlltoAllTokenDispatcher):
         grad_permuted: torch.Tensor,
         row_indices: torch.Tensor,
     ) -> None:
-        """Scatter permuted gradients back into the flat chunk slice.
-
-        The permute forward gathered source-token rows into expert order;
-        ``row_indices[t]`` lists the permuted positions of token ``t``'s
-        top-k copies, so the adjoint gathers those rows and sums them.
-        No re-execution of the permutation operator is needed, so the
-        flat input does not have to be persisted for backward.
-        """
+        """Scatter permuted gradients back into the flat chunk slice using the saved indices."""
         indices = row_indices.to(torch.long)
         gathered = grad_permuted[indices.reshape(-1)]
         grad_flat_slice += gathered.view(
@@ -866,19 +633,7 @@ class MoEChunkedAlltoAllTokenDispatcher(MoEAlltoAllTokenDispatcher):
         need_input_grads: bool,
         need_probs_grad: bool,
     ) -> tuple["torch.Tensor | None", "torch.Tensor | None"]:
-        """Chunked backward: one FSDP all-gather/reduce, overlapped chunks.
-
-        ``graphs`` holds the per-chunk expert graphs captured by the
-        forward (or whatever external recomputation re-ran it); the
-        backward orchestrates the adjoints -- merge adjoints first
-        (feeding combine-backwards to the communication stream), then
-        expert backwards and dispatch-backwards -- and never re-executes
-        the experts, so expert compute runs exactly once per training
-        step. The merge adjoint is a manual gather/multiply/scatter over
-        the saved combine outputs and routing weights; the permute
-        backward is a gather-sum scatter keyed on the saved permutation
-        indices; the flat input itself is not persisted.
-        """
+        """Run the chunked backward with a single FSDP hold and overlapped chunk adjoints."""
         if not need_input_grads and not need_probs_grad:
             return None, None
         hidden_cols = flat_shape[-1]
@@ -928,6 +683,25 @@ class MoEChunkedAlltoAllTokenDispatcher(MoEAlltoAllTokenDispatcher):
         expert_indices, combined, grad_flat_in, grad_flat, grad_probs,
         need_input_grads, need_probs_grad,
     ) -> None:
+        topk = self.config.moe_router_topk
+        recv_rows = [sum(splits) for splits in host.output_splits]
+        recv_offsets = [0]
+        for rows in recv_rows[:-1]:
+            recv_offsets.append(recv_offsets[-1] + rows)
+        hidden_cols = grad_flat_in.shape[-1]
+        combined_rows = grad_flat_in.shape[0] * topk
+        grad_combined_buffer: "torch.Tensor | None" = (
+            grad_flat_in.new_empty((combined_rows, hidden_cols))
+            if need_input_grads else None
+        )
+        grad_restored_buffer: "torch.Tensor | None" = (
+            grad_flat_in.new_empty((sum(recv_rows), hidden_cols))
+            if need_input_grads else None
+        )
+        # Reuse the forward combine rows as the dispatch-backward output.
+        grad_permuted_buffer: "torch.Tensor | None" = (
+            combined if need_input_grads else None
+        )
         for index in reversed(range(len(bounds))):
             start, end = bounds[index]
             c_start, c_end = combined_bounds[index]
@@ -936,22 +710,32 @@ class MoEChunkedAlltoAllTokenDispatcher(MoEAlltoAllTokenDispatcher):
                 grad_flat_in[start:end], graph, combined[c_start:c_end],
                 dense_probs[start:end], expert_indices[start:end],
                 need_input_grads, need_probs_grad,
+                g_combined_out=(
+                    grad_combined_buffer[c_start:c_end]
+                    if need_input_grads else None
+                ),
             )
             if grad_probs is not None:
                 grad_probs[start:end] = g_probs
             if not need_input_grads:
                 graphs[index] = None
                 continue
-            g_restored = self._a2a_no_grad(
-                g_combined, host.output_splits[index], host.input_splits[index],
+            offset = recv_offsets[index]
+            row_count = recv_rows[index]
+            self._a2a_into_no_grad(
+                g_combined, grad_restored_buffer[offset:offset + row_count],
+                host.output_splits[index], host.input_splits[index],
             )
-            g_received = self._backward_experts_grad(graph, g_restored)
-            g_permuted = self._a2a_no_grad(
-                g_received, host.input_splits[index], host.output_splits[index],
+            g_received = self._backward_experts_grad(
+                graph, grad_restored_buffer[offset:offset + row_count],
+            )
+            self._a2a_into_no_grad(
+                g_received, grad_permuted_buffer[c_start:c_end],
+                host.input_splits[index], host.output_splits[index],
             )
             if grad_flat is not None:
                 self._backward_permute_chunk(
-                    grad_flat[start:end], g_permuted,
+                    grad_flat[start:end], grad_permuted_buffer[c_start:c_end],
                     graph.row_indices,
                 )
             graphs[index] = None  # free the chunk graph promptly
@@ -961,19 +745,29 @@ class MoEChunkedAlltoAllTokenDispatcher(MoEAlltoAllTokenDispatcher):
         expert_indices, combined, grad_flat_in, grad_flat, grad_probs,
         need_input_grads, need_probs_grad,
     ) -> None:
-        """Mirror of the forward pipeline, run in reverse per chunk.
-
-        Merge adjoints run first (pure gather/multiply/scatter over the
-        saved combine outputs), feeding combine-backwards to the
-        communication stream back to back; every expert backward then
-        overlaps the remaining combine-backwards, and each
-        dispatch-backward overlaps the next expert backward. Only the
-        trailing dispatch-backward has no compute left to hide behind.
-        """
+        """Mirror of the forward pipeline, run in reverse per chunk."""
         runtime = self.device_runtime
         compute = runtime.current_stream()
         comm = self._comm_stream
         chunk_count = len(bounds)
+        topk = self.config.moe_router_topk
+        hidden_cols = grad_flat_in.shape[-1]
+        combined_rows = grad_flat_in.shape[0] * topk
+        recv_rows = [sum(splits) for splits in host.output_splits]
+        recv_offsets = [0]
+        for rows in recv_rows[:-1]:
+            recv_offsets.append(recv_offsets[-1] + rows)
+        # Preallocate one contiguous workspace per boundary instead of one output per chunk.
+        grad_combined_buffer = (
+            grad_flat_in.new_empty((combined_rows, hidden_cols))
+            if need_input_grads else None
+        )
+        grad_restored_buffer = (
+            grad_flat_in.new_empty((sum(recv_rows), hidden_cols))
+            if need_input_grads else None
+        )
+        # Reuse the forward combine rows as the dispatch-backward output.
+        grad_permuted_buffer = combined if need_input_grads else None
         ev_merge = [runtime.new_event() for _ in range(chunk_count)]
         ev_combine_bwd = [runtime.new_event() for _ in range(chunk_count)]
         ev_experts = [runtime.new_event() for _ in range(chunk_count)]
@@ -991,20 +785,33 @@ class MoEChunkedAlltoAllTokenDispatcher(MoEAlltoAllTokenDispatcher):
                 grad_flat_in[start:end], graphs[index],
                 combined[c_start:c_end], dense_probs[start:end],
                 expert_indices[start:end], need_input_grads, need_probs_grad,
+                g_combined_out=(
+                    grad_combined_buffer[c_start:c_end]
+                    if need_input_grads else None
+                ),
             )
             grad_combined[index] = g_combined
             if grad_probs is not None:
                 grad_probs[start:end] = g_probs
+            if not need_input_grads:
+                # No expert backward follows; drop the graph after merge adjoint.
+                graphs[index] = None
             ev_merge[index].record(compute)
 
         def enqueue_combine_backward(index):
             comm.wait_event(ev_merge[index])
+            offset = recv_offsets[index]
+            row_count = recv_rows[index]
+            slot = grad_restored_buffer[offset:offset + row_count]
+            grad_restored[index] = slot
             with runtime.stream(comm):
-                grad_restored[index] = self._a2a_no_grad(
-                    grad_combined[index],
+                self._a2a_into_no_grad(
+                    grad_combined[index], slot,
                     host.output_splits[index], host.input_splits[index],
+                    comm,
                 )
             runtime.record_stream(grad_combined[index], comm)
+            runtime.record_stream(slot, comm)
             grad_combined[index] = None
             ev_combine_bwd[index].record(comm)
 
@@ -1015,17 +822,23 @@ class MoEChunkedAlltoAllTokenDispatcher(MoEAlltoAllTokenDispatcher):
             grad_received[index] = self._backward_experts_grad(
                 graphs[index], grad_restored[index],
             )
+            grad_restored[index] = None
             graphs[index] = None  # free the chunk graph promptly
             ev_experts[index].record(compute)
 
         def enqueue_dispatch_backward(index):
             comm.wait_event(ev_experts[index])
+            c_start, c_end = combined_bounds[index]
+            slot = grad_permuted_buffer[c_start:c_end]
+            grad_permuted[index] = slot
             with runtime.stream(comm):
-                grad_permuted[index] = self._a2a_no_grad(
-                    grad_received[index],
+                self._a2a_into_no_grad(
+                    grad_received[index], slot,
                     host.input_splits[index], host.output_splits[index],
+                    comm,
                 )
             runtime.record_stream(grad_received[index], comm)
+            runtime.record_stream(slot, comm)
             grad_received[index] = None
             ev_dispatch[index].record(comm)
 
@@ -1038,6 +851,7 @@ class MoEChunkedAlltoAllTokenDispatcher(MoEAlltoAllTokenDispatcher):
                     grad_flat[start:end], grad_permuted[index],
                     row_indices[index],
                 )
+            row_indices[index] = None
             grad_permuted[index] = None
 
         for index in reversed(range(chunk_count)):
@@ -1061,9 +875,7 @@ class MoEChunkedAlltoAllTokenDispatcher(MoEAlltoAllTokenDispatcher):
     ) -> torch.Tensor:
         expert_input = self._sort_received(received, received_counts)
         if _fsdp_module(experts):
-            # Bypass ``__call__`` like the graph path: per-chunk FSDP
-            # forward hooks would unshard/reshard once per chunk; the
-            # enclosing forward hold does it once instead.
+            # Bypass __call__; the enclosing forward hold unshards once.
             expert_output, bias = experts.forward(
                 expert_input, tokens_per_expert, None,
             )
@@ -1079,21 +891,7 @@ class MoEChunkedAlltoAllTokenDispatcher(MoEAlltoAllTokenDispatcher):
         tokens_per_expert: torch.Tensor,
         experts: torch.nn.Module,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Expert segment with an autograd graph, FSDP hooks bypassed.
-
-        Returns ``(restored, received_leaf)``: the chunk's expert output
-        with its backward graph and the detached received-token leaf.
-        The surrounding forward hold keeps the weights unsharded for all
-        chunks; the chunked backward consumes the returned graph
-        directly, so the experts run forward exactly once per training
-        step (no re-execution under ``_execute_backward``, and during
-        activation recomputation this *is* the recomputation).
-        FSDP-wrapped experts are called through ``forward`` directly:
-        going through ``__call__`` would re-fire FSDP's forward hooks
-        once per chunk (extra all-gathers plus, when this runs during
-        recomputation inside backward, forward hooks in the middle of
-        the backward pass disturbing ``FSDP::backward_prefetch``).
-        """
+        """Expert segment with an autograd graph and FSDP hooks bypassed."""
         with torch.enable_grad():
             rcv_leaf = received.detach().requires_grad_(True)
             expert_input = self._sort_received(rcv_leaf, received_counts)
@@ -1112,73 +910,82 @@ class MoEChunkedAlltoAllTokenDispatcher(MoEAlltoAllTokenDispatcher):
     def _execute_serial(
         self, flat, routing, experts, bounds, host, received_counts,
         dense_probs, graphs: "list[_ChunkGraph] | None" = None,
-    ) -> tuple[list[torch.Tensor], "list[torch.Tensor] | None"]:
-        outputs = []
-        combined_parts: "list[torch.Tensor] | None" = (
-            [] if graphs is not None else None
-        )
+    ) -> tuple[torch.Tensor, "torch.Tensor | None"]:
+        """Serial chunk loop with one workspace buffer per dispatch and combine boundary."""
+        topk = self.config.moe_router_topk
+        recv_rows = [sum(splits) for splits in host.output_splits]
+        recv_offsets = [0]
+        for rows in recv_rows[:-1]:
+            recv_offsets.append(recv_offsets[-1] + rows)
+        dispatch_buffer = flat.new_empty((sum(recv_rows), flat.shape[-1]))
+        combined_buffer = flat.new_empty(
+            (flat.shape[0] * topk, flat.shape[-1]))
+        merged = flat.new_empty(flat.shape)
+        combined_rows = combined_buffer if graphs is not None else None
         for index, (start, end) in enumerate(bounds):
             permutation = self._permute_chunk(flat, routing, start, end)
-            received = all_to_all(
-                self.ep_group, permutation.tokens,
+            offset = recv_offsets[index]
+            row_count = recv_rows[index]
+            received = dispatch_buffer[offset:offset + row_count]
+            self._a2a_into_no_grad(
+                permutation.tokens, received,
                 host.output_splits[index], host.input_splits[index],
             )
+            c_start = start * topk
+            c_end = end * topk
+            combined = combined_buffer[c_start:c_end]
             if graphs is None:
                 expert_output = self._expert_chunk(
                     received, received_counts[index],
                     host.tokens_per_expert[index], experts,
                 )
-                combined = all_to_all(
-                    self.ep_group, expert_output,
+                self._a2a_into_no_grad(
+                    expert_output, combined,
                     host.input_splits[index], host.output_splits[index],
                 )
-                merged = self._merge_chunk(
-                    combined, permutation, dense_probs[start:end],
+                merged_chunk = self._merge_chunk(
+                    combined, permutation.row_indices,
+                    permutation.expert_indices, dense_probs[start:end],
                 )
             else:
                 restored, rcv_leaf = self._expert_chunk_graph(
                     received, received_counts[index],
                     host.tokens_per_expert[index], experts,
                 )
-                combined = all_to_all(
-                    self.ep_group, restored,
+                self._a2a_into_no_grad(
+                    restored, combined,
                     host.input_splits[index], host.output_splits[index],
                 )
-                # The merge segment stays out of the autograd graph: its
-                # adjoint is computed manually in backward from the saved
-                # combine outputs, so no leaf values are retained here.
-                merged = self._merge_chunk(
-                    combined, permutation, dense_probs[start:end],
+                # Merge stays out of the autograd graph; backward computes its adjoint manually.
+                merged_chunk = self._merge_chunk(
+                    combined, permutation.row_indices,
+                    permutation.expert_indices, dense_probs[start:end],
                 )
                 graphs.append(
                     _ChunkGraph(restored, rcv_leaf, permutation.row_indices)
                 )
-                combined_parts.append(combined)
-            outputs.append(merged)
-        return outputs, combined_parts
+            merged[start:end].copy_(merged_chunk)
+        return merged, combined_rows
 
     def _execute_pipelined(
         self, flat, routing, experts, bounds, host, received_counts,
         dense_probs, graphs: "list[_ChunkGraph] | None" = None,
-    ) -> tuple[list[torch.Tensor], "list[torch.Tensor] | None"]:
-        """Overlap chunk transfers with expert compute on two streams.
-
-        The communication stream is fed as ``D0, D1, D2, C0, D3, C1, ...``:
-        dispatch chunk ``c + 2`` enters before combine chunk ``c`` so the
-        queue never idles while some chunk is computable.
-
-        The compute stream runs in two phases. Phase 1 issues every expert
-        computation back to back (each depending only on its own dispatch),
-        feeding each chunk's combine to the communication stream as soon as
-        its experts finish. Phase 2 waits for each combine and merges. This
-        matters most for C=2: the second chunk's GMM overlaps the first
-        chunk's combine all-to-all, instead of stalling until that combine
-        completes (a merge-wait inside a single loop serialized them).
-        """
+    ) -> tuple[torch.Tensor, "torch.Tensor | None"]:
+        """Overlap chunk transfers with expert compute on two streams."""
         runtime = self.device_runtime
         compute = runtime.current_stream()
         comm = self._comm_stream
         chunk_count = len(bounds)
+        topk = self.config.moe_router_topk
+        merged = flat.new_empty(flat.shape)
+        combined_buffer = flat.new_empty(
+            (flat.shape[0] * topk, flat.shape[-1]))
+        combined_bounds = [(start * topk, end * topk) for start, end in bounds]
+        recv_rows = [sum(splits) for splits in host.output_splits]
+        recv_offsets = [0]
+        for rows in recv_rows[:-1]:
+            recv_offsets.append(recv_offsets[-1] + rows)
+        dispatch_buffer = flat.new_empty((sum(recv_rows), flat.shape[-1]))
 
         ev_permute = [runtime.new_event() for _ in range(chunk_count)]
         ev_dispatch = [runtime.new_event() for _ in range(chunk_count)]
@@ -1186,33 +993,48 @@ class MoEChunkedAlltoAllTokenDispatcher(MoEAlltoAllTokenDispatcher):
         ev_combine = [runtime.new_event() for _ in range(chunk_count)]
         permuted = [None] * chunk_count
         received = [None] * chunk_count
-        outputs = [None] * chunk_count
+        perm_row_indices = [None] * chunk_count
+        perm_expert_indices = [None] * chunk_count
 
         def enqueue_permute(index):
             start, end = bounds[index]
-            permuted[index] = self._permute_chunk(flat, routing, start, end)
+            permutation = self._permute_chunk(flat, routing, start, end)
+            permuted[index] = permutation
+            # Copy merge metadata before releasing the packed source rows.
+            perm_row_indices[index] = permutation.row_indices
+            perm_expert_indices[index] = permutation.expert_indices
             ev_permute[index].record(compute)
 
         def enqueue_dispatch(index):
             comm.wait_event(ev_permute[index])
+            offset = recv_offsets[index]
+            row_count = recv_rows[index]
+            slot = dispatch_buffer[offset:offset + row_count]
+            received[index] = slot
             with runtime.stream(comm):
-                received[index] = all_to_all(
-                    self.ep_group, permuted[index].tokens,
+                self._a2a_into_no_grad(
+                    permuted[index].tokens, slot,
                     host.output_splits[index], host.input_splits[index],
+                    comm,
                 )
             runtime.record_stream(permuted[index].tokens, comm)
+            runtime.record_stream(slot, comm)
+            # Free packed source rows once dispatch has consumed them.
+            permuted[index] = None
             ev_dispatch[index].record(comm)
 
         def enqueue_combine(index, expert_output):
             comm.wait_event(ev_experts[index])
+            c_start, c_end = combined_bounds[index]
             with runtime.stream(comm):
-                combined = all_to_all(
-                    self.ep_group, expert_output,
+                self._a2a_into_no_grad(
+                    expert_output, combined_buffer[c_start:c_end],
                     host.input_splits[index], host.output_splits[index],
+                    comm,
                 )
+            runtime.record_stream(combined_buffer, comm)
             runtime.record_stream(expert_output, comm)
             ev_combine[index].record(comm)
-            return combined
 
         enqueue_permute(0)
         enqueue_dispatch(0)
@@ -1220,14 +1042,7 @@ class MoEChunkedAlltoAllTokenDispatcher(MoEAlltoAllTokenDispatcher):
             enqueue_permute(1)
             enqueue_dispatch(1)
 
-        combined = [None] * chunk_count
-        rcv_leaves = [None] * chunk_count
-        restored_graphs = [None] * chunk_count
-        # Phase 1: expert compute for every chunk; combines are fed to the
-        # communication stream as each chunk's experts finish. The
-        # grad-tracked path builds the expert graphs from detached
-        # received leaves (FSDP hooks bypassed; the forward hold
-        # unshards once).
+        # Phase 1: run every chunk's experts and enqueue its combine.
         for index in range(chunk_count):
             compute.wait_event(ev_dispatch[index])
             runtime.record_stream(received[index], compute)
@@ -1237,78 +1052,42 @@ class MoEChunkedAlltoAllTokenDispatcher(MoEAlltoAllTokenDispatcher):
                     host.tokens_per_expert[index], experts,
                 )
             else:
-                expert_output, rcv_leaves[index] = self._expert_chunk_graph(
+                expert_output, rcv_leaf = self._expert_chunk_graph(
                     received[index], received_counts[index],
                     host.tokens_per_expert[index], experts,
                 )
-                restored_graphs[index] = expert_output
+                graphs.append(
+                    _ChunkGraph(
+                        expert_output, rcv_leaf, perm_row_indices[index],
+                    )
+                )
             ev_experts[index].record(compute)
             if index + 2 < chunk_count:
                 enqueue_permute(index + 2)
                 enqueue_dispatch(index + 2)
-            combined[index] = enqueue_combine(index, expert_output)
+            enqueue_combine(index, expert_output)
+            expert_output = None
+            received[index] = None
 
-        # Phase 2: wait for each combine on demand and merge in order;
-        # the grad-tracked path merges the combine rows as plain values
-        # (the merge segment stays out of the autograd graph -- its
-        # adjoint is computed manually in ``_backward_merge_chunk``) and
-        # records the expert-segment graphs for the orchestrated
-        # backward.
-        combined_parts: "list[torch.Tensor] | None" = (
-            [] if graphs is not None else None
-        )
+        # Phase 2: wait for each combine on demand and merge in order.
         for index in range(chunk_count):
             compute.wait_event(ev_combine[index])
-            runtime.record_stream(combined[index], compute)
             start, end = bounds[index]
-            outputs[index] = self._merge_chunk(
-                combined[index], permuted[index], dense_probs[start:end],
+            c_start, c_end = combined_bounds[index]
+            combined_chunk = combined_buffer[c_start:c_end]
+            runtime.record_stream(combined_chunk, compute)
+            merged_chunk = self._merge_chunk(
+                combined_chunk, perm_row_indices[index],
+                perm_expert_indices[index], dense_probs[start:end],
             )
-            if graphs is not None:
-                graphs.append(
-                    _ChunkGraph(
-                        restored_graphs[index], rcv_leaves[index],
-                        permuted[index].row_indices,
-                    )
-                )
-                combined_parts.append(combined[index])
-        return outputs, combined_parts
+            merged[start:end].copy_(merged_chunk)
+            merged_chunk = None
+            perm_row_indices[index] = None
+            perm_expert_indices[index] = None
+        return merged, combined_buffer if graphs is not None else None
 
 class _ChunkedMoEFunction(torch.autograd.Function):
-    """Owns both forward and backward of the chunked MoE dispatcher.
-
-    Forward runs the pipelined chunk loop inside ``Function.forward``
-    with only the expert segment re-enabled for autograd (all-to-all
-    boundaries stay detached leaves, moved explicitly on the
-    communication stream); the merge segment stays out of the graph --
-    its adjoint is computed manually in backward from the saved combine
-    rows. The resulting per-chunk expert graphs are held on ``ctx`` in
-    *structure only*: their activation values are returned to the
-    allocator as soon as the merged output is produced, so retention is
-    identical to the plain dispatcher under any external recomputation
-    scheme. FSDP hooks never fire for the per-chunk expert calls
-    (direct ``forward`` under the explicit unshard hold).
-
-    Recomputation support, both reentrant modes: the merge inputs are
-    carried by ``save_for_backward``, so an external non-reentrant
-    checkpoint packs/releases them here and rebuilds them during its own
-    recomputation pass (the reentrant pass rebuilds them by re-running
-    this very ``forward``); the expert graphs either are the recomputed
-    segment themselves (reentrant) or are consumed structurally by the
-    original node after the checkpoint rehydrates their packed saved
-    tensors (non-reentrant). Either way the experts never run an extra
-    forward for the chunked backward.
-
-    Backward only orchestrates: manual merge adjoints (feeding
-    combine-backwards to the communication stream), expert backwards
-    through the saved expert graphs (expert parameter gradients
-    accumulate through the normal autograd path), manual dispatch
-    gradient all-to-alls, and a gather-sum scatter for the permute
-    backward. ``_fsdp_backward_hold`` collapses the per-chunk FSDP
-    weight all-gathers and gradient reduce-scatters into one of each
-    per layer (reusing the unsharded weights across a recomputation
-    pass).
-    """
+    """Autograd function that owns the chunked MoE forward and backward."""
 
     @staticmethod
     def forward(
@@ -1330,29 +1109,13 @@ class _ChunkedMoEFunction(torch.autograd.Function):
         ctx.bounds = bounds
         ctx.host = host
         ctx.flat_shape = flat.shape
-        # Per-chunk expert graphs are internal to this node; keep them as
-        # plain attributes (saved_tensors is for node inputs/outputs
-        # only). They die with the backward node.
+        # Keep per-chunk expert graphs as plain attributes; they die with the backward node.
         ctx.chunk_graphs = graphs
-        # The merged output and the saved combine rows below have copied
-        # every per-chunk value the forward still owed its consumers, so
-        # the expert segments are needed *structurally* only from here
-        # on: the backward walks their grad_fn chains and reads the leaf
-        # ``.grad`` slots, never the released values. Returning those
-        # storages to the allocator right after the forward is therefore
-        # mode-independent -- eager training, external recomputation and
-        # both reentrant modes all stay correct -- and it is what keeps
-        # activation retention identical to the plain dispatcher under
-        # layer-level checkpointing.
+        # Backward consumes the expert graphs structurally, so their value storages can be released here.
         for graph in graphs:
             _release_activation_value(graph.restored)
             _release_activation_value(graph.received_leaf)
-        # The merge inputs travel through save_for_backward like any
-        # plain activation: under an external non-reentrant checkpoint
-        # they are packed and released here and rebuilt by the checkpoint
-        # recomputation; under reentrant recomputation this very call
-        # *is* the rebuild. Either way ``backward`` sees rehydrated
-        # values and does no reconstruction of its own.
+        # Merge inputs travel through save_for_backward and rehydrate through the checkpoint.
         ctx.save_for_backward(
             probs, dense_probs, routing.expert_indices, combined,
         )
@@ -1361,9 +1124,7 @@ class _ChunkedMoEFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         dispatcher = ctx.dispatcher
-        # Everything that may trigger a checkpoint rehydration -- the
-        # saved-tensor unpack and every per-chunk expert backward -- runs
-        # inside one shared recomputation group (see its docstring).
+        # Run checkpoint-triggering work inside one shared recompute group.
         with _shared_recompute_group():
             return _ChunkedMoEFunction._backward_impl(ctx, grad_output)
 
@@ -1373,9 +1134,7 @@ class _ChunkedMoEFunction(torch.autograd.Function):
         (
             probs, dense_probs, expert_indices, combined,
         ) = ctx.saved_tensors
-        # ``needs_input_grad``: (dispatcher, experts, flat, probs,
-        # routing_map, expert_indices); the backward consumes the
-        # forward-built chunk graphs and needs no saved flat.
+        # needs_input_grad indexes: (dispatcher, experts, flat, probs, routing_map, expert_indices).
         need_input_grads = ctx.needs_input_grad[2] or any(
             param.requires_grad for param in ctx.experts.parameters()
         )

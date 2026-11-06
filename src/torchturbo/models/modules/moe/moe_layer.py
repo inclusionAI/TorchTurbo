@@ -96,6 +96,28 @@ class MoELayer(BaseMoELayer):
     Mixture of experts Layer **currently only supports no token dropping**.
     """
 
+    def _build_token_dispatcher(self, ep_group: dist.ProcessGroup) -> MoEAlltoAllTokenDispatcher:
+        """Build the configured dispatcher, importing the chunked path lazily."""
+        if self.config.moe_token_dispatcher_type == "alltoall_chunked":
+            from .token_dispatcher_chunked import MoEChunkedAlltoAllTokenDispatcher
+
+            return MoEChunkedAlltoAllTokenDispatcher(
+                self.num_local_experts,
+                self.local_expert_indices,
+                config=self.config,
+                ep_group=ep_group,
+            )
+        if self.config.moe_token_dispatcher_type == "alltoall":
+            return MoEAlltoAllTokenDispatcher(
+                self.num_local_experts,
+                self.local_expert_indices,
+                config=self.config,
+                ep_group=ep_group,
+            )
+        raise ValueError(
+            f"Unsupported token dispatcher type: {self.config.moe_token_dispatcher_type}"
+        )
+
     def __init__(
         self,
         config: MoEConfig,
@@ -118,29 +140,7 @@ class MoELayer(BaseMoELayer):
             sp_group=sp_group,
         )
 
-        # Initialize token dispatcher
-        if config.moe_token_dispatcher_type == "alltoall":
-            self.token_dispatcher = MoEAlltoAllTokenDispatcher(
-                self.num_local_experts,
-                self.local_expert_indices,
-                config=self.config,
-                ep_group=ep_group,
-            )
-        elif config.moe_token_dispatcher_type == "alltoall_chunked":
-            # Lazy import: the chunked dispatcher lives in a dedicated
-            # module that must not affect the default alltoall path.
-            from .token_dispatcher_chunked import MoEChunkedAlltoAllTokenDispatcher
-
-            self.token_dispatcher = MoEChunkedAlltoAllTokenDispatcher(
-                self.num_local_experts,
-                self.local_expert_indices,
-                config=self.config,
-                ep_group=ep_group,
-            )
-        else:
-            raise ValueError(
-                f"Unsupported token dispatcher type: {config.moe_token_dispatcher_type}"
-            )
+        self.token_dispatcher = self._build_token_dispatcher(ep_group)
 
         # Initialize experts
         self.experts = build_module(
@@ -167,25 +167,9 @@ class MoELayer(BaseMoELayer):
         )
         logits = logits.view(-1, logits.shape[-1])
 
-        if self.config.moe_token_dispatcher_type == "alltoall_chunked":
-            # The chunked dispatcher pipelines dispatch, expert compute, and
-            # combine across token chunks internally.
-            expert_tokens = self.token_dispatcher.execute(
-                hidden_states, routing, self.experts
-            )
-        else:
-            dispatcher = self.token_dispatcher
-            # Reuse stage variables so completed layouts are not kept alive here.
-            expert_tokens, expert_probs = dispatcher.dispatch_preprocess(hidden_states, routing)
-            expert_tokens, expert_probs = dispatcher.token_dispatch(expert_tokens, expert_probs)
-            expert_tokens, tokens_per_expert, expert_probs = dispatcher.dispatch_postprocess(
-                expert_tokens, expert_probs,
-            )
-            expert_tokens, bias = self.experts(expert_tokens, tokens_per_expert, expert_probs)
-            assert bias is None, "Bias is not supported in MoEAlltoAllTokenDispatcher"
-            expert_tokens = dispatcher.combine_preprocess(expert_tokens)
-            expert_tokens = dispatcher.token_combine(expert_tokens)
-            expert_tokens = dispatcher.combine_postprocess(expert_tokens)
+        expert_tokens = self.token_dispatcher.execute(
+            hidden_states, routing, self.experts
+        )
         output = expert_tokens.to(hidden_states.dtype)
 
         if self.shared_expert is not None:

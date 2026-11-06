@@ -535,9 +535,7 @@ _TURBO_ARG_SPECS: tuple[TurboArgSpec, ...] = (
         config_path="moe.num_chunks",
         type=int,
         metavar="INT",
-        help="Token chunk count for the alltoall_chunked MoE dispatcher. "
-        "Chunks pipeline EP all-to-all against expert compute. Ignored by "
-        "the alltoall dispatcher. Must be a positive integer.",
+        help="Token chunk count for the alltoall_chunked MoE dispatcher.",
     ),
     TurboArgSpec(
         name="moe_aux_loss_coeff",

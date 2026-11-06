@@ -181,11 +181,7 @@ class GroupedMLP(torch.nn.Module):
     def activation_func_with_probs(
         self, hidden_states: torch.Tensor, probs: torch.Tensor | None,
     ) -> torch.Tensor:
-        """Activate expert features and weight them before FC2.
-
-        ``probs=None`` applies no weights and keeps the routing weights for
-        the output-side merge (chunked dispatcher).
-        """
+        """Activate expert features and weight them before FC2; ``probs=None`` defers weighting to the output-side merge."""
         hidden_states = self.activation_func(hidden_states)
         if probs is None:
             return hidden_states

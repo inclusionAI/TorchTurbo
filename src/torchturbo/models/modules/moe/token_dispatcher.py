@@ -71,6 +71,16 @@ class MoETokenDispatcher(ABC):
         """Sum expert contributions and restore the source-token shape."""
         raise NotImplementedError
 
+    @abstractmethod
+    def execute(
+        self,
+        hidden_states: torch.Tensor,
+        routing: RoutingResult,
+        experts: torch.nn.Module,
+    ) -> torch.Tensor:
+        """Dispatch, run the experts, and combine in one forward pass."""
+        raise NotImplementedError
+
 
 class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
     """Variable-size all-to-all dispatch without token dropping or TP."""
@@ -116,6 +126,25 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         self.num_global_tokens_per_local_expert: torch.Tensor | None = None
         self.input_splits: torch.Tensor | np.ndarray | None = None
         self.output_splits: torch.Tensor | np.ndarray | None = None
+
+    def execute(
+        self,
+        hidden_states: torch.Tensor,
+        routing: RoutingResult,
+        experts: torch.nn.Module,
+    ) -> torch.Tensor:
+        """Dispatch, run the experts, and combine in one forward pass."""
+        expert_tokens, expert_probs = self.dispatch_preprocess(hidden_states, routing)
+        expert_tokens, expert_probs = self.token_dispatch(expert_tokens, expert_probs)
+        expert_tokens, tokens_per_expert, expert_probs = self.dispatch_postprocess(
+            expert_tokens, expert_probs,
+        )
+        expert_tokens, bias = experts(expert_tokens, tokens_per_expert, expert_probs)
+        assert bias is None, "Bias is not supported in MoEAlltoAllTokenDispatcher"
+        expert_tokens = self.combine_preprocess(expert_tokens)
+        expert_tokens = self.token_combine(expert_tokens)
+        expert_tokens = self.combine_postprocess(expert_tokens)
+        return expert_tokens
 
     def preprocess(self, routing_map: torch.Tensor) -> torch.Tensor:
         """Compute device counts and split sizes without copying them to CPU."""
