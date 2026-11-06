@@ -477,18 +477,23 @@ class MoEChunkedAlltoAllTokenDispatcher(MoEAlltoAllTokenDispatcher):
         g_combined: "torch.Tensor | None" = None
         if need_input_grads:
             weights = dense_probs_chunk.gather(1, expert_indices_chunk)
-            # Mixed dtype promotes to FP32 in one multiply.
-            g_flat = g_merged_ij * weights.flatten().unsqueeze(-1)
+            # Mixed dtype promotes to FP32; cast back on the write.
+            combine_dtype = (
+                g_combined_out.dtype
+                if g_combined_out is not None else grad_out_chunk.dtype
+            )
+            g_flat = (
+                g_merged_ij * weights.flatten().unsqueeze(-1)
+            ).to(combine_dtype)
             # Row indices are a bijection over the chunk rows.
             if g_combined_out is None:
                 g_combined = grad_out_chunk.new_zeros(
                     num_rows, grad_out_chunk.shape[-1],
                 )
-                g_combined[packed] = g_flat
             else:
                 g_combined = g_combined_out
                 g_combined.zero_()
-                g_combined[packed] = g_flat
+            g_combined[packed] = g_flat
         g_probs: "torch.Tensor | None" = None
         if need_probs_grad:
             # g_probs[i, e] = sum_j g_merged[i] . combined[inv[i, j]].
