@@ -18,6 +18,7 @@ from .moe_config import MoEConfig
 from .router import TopKRouter
 from .token_dispatcher import MoETokenDispatcher, MoEAlltoAllTokenDispatcher
 from .module import ModuleSpec, build_module
+from .utils import RoutingResult
 
 
 @dataclass
@@ -157,6 +158,40 @@ class MoELayer(BaseMoELayer):
                 self.submodules.shared_experts, config=self.config
             )
 
+    def _compute_experts(
+        self, hidden_states: torch.Tensor, routing: RoutingResult,
+    ) -> torch.Tensor:
+        """Run the configured dispatcher and experts as one integrated MoE path."""
+        if self.config.moe_token_dispatcher_type == "alltoall_chunked":
+            from .token_dispatcher_chunked import run_chunked_moe
+
+            return run_chunked_moe(
+                self.token_dispatcher, self.experts, hidden_states, routing,
+            )
+        return self._alltoall_compute_experts(hidden_states, routing)
+
+    def _alltoall_compute_experts(
+        self, hidden_states: torch.Tensor, routing: RoutingResult,
+    ) -> torch.Tensor:
+        """Dispatch, run experts, and combine with the all-to-all stages."""
+        dispatcher = self.token_dispatcher
+        expert_tokens, expert_probs = dispatcher.dispatch_preprocess(
+            hidden_states, routing,
+        )
+        expert_tokens, expert_probs = dispatcher.token_dispatch(
+            expert_tokens, expert_probs,
+        )
+        expert_tokens, tokens_per_expert, expert_probs = dispatcher.dispatch_postprocess(
+            expert_tokens, expert_probs,
+        )
+        expert_tokens, bias = self.experts(
+            expert_tokens, tokens_per_expert, expert_probs,
+        )
+        assert bias is None, "Bias is not supported in MoEAlltoAllTokenDispatcher"
+        expert_tokens = dispatcher.combine_preprocess(expert_tokens)
+        expert_tokens = dispatcher.token_combine(expert_tokens)
+        return dispatcher.combine_postprocess(expert_tokens)
+
     def forward(
         self, hidden_states: torch.Tensor, input_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -167,9 +202,7 @@ class MoELayer(BaseMoELayer):
         )
         logits = logits.view(-1, logits.shape[-1])
 
-        expert_tokens = self.token_dispatcher.execute(
-            hidden_states, routing, self.experts
-        )
+        expert_tokens = self._compute_experts(hidden_states, routing)
         output = expert_tokens.to(hidden_states.dtype)
 
         if self.shared_expert is not None:
