@@ -66,6 +66,9 @@ engine_config:
     # HF safetensors exports: "every" (default) exports with every checkpoint,
     # while "final" exports only with the final save.
     hf_export: every
+    # LoRA HF exports: "merge" (default) merges adapter deltas into base
+    # weights; "adapter" writes a standalone PEFT adapter directory.
+    hf_export_lora: merge
 
   activation_checkpointing:
     enabled: true

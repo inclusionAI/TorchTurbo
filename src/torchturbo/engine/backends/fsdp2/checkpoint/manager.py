@@ -4,17 +4,35 @@ from __future__ import annotations
 
 import os
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+import torch
+from safetensors.torch import save_file
+from torch.distributed.tensor import DTensor
 import torch.nn as nn
+import torch.distributed as dist
 from torch.optim import Optimizer
 
 from ...base import BaseCheckpointManager
 from ....checkpoint.format import ComponentStatus
+from ....checkpoint.distributed import rank_zero_call
+from ....checkpoint.layout import sync_directory
+from ....utils import strip_peft_prefix
 from .layout import MODEL_DCP_DIR, OPTIMIZER_DCP_DIR, dcp_status
 from .dcp import DcpCheckpoint
 from .weight_loader import DistParamLoader
 from .weight_saver import ShardedParamManager
+
+
+@dataclass(frozen=True)
+class _GroupedLoRATensor:
+    """A grouped expert tensor and the metadata needed to split it."""
+
+    source: Any
+    clean_name: str
+    num_global_experts: int
+
 
 if TYPE_CHECKING:
     from torch.distributed.device_mesh import DeviceMesh
@@ -87,8 +105,198 @@ class FSDP2CheckpointManager(BaseCheckpointManager):
         *,
         source_path: str,
         weight_converter: BaseWeightConverter,
+        hf_export_lora: str = "merge",
     ) -> None:
+        if hf_export_lora == "adapter":
+            self._save_adapter(model, output_dir)
+            return
         self._hf_saver(model, source_path, weight_converter).save_model(output_dir)
+
+    def _save_adapter(self, model: nn.Module, output_dir: str) -> None:
+        """Write a standalone PEFT adapter directory on rank zero.
+
+        Adapter tensors are gathered to full tensors on every rank because
+        LoRA parameters can be DTensors under the backend's parallel mesh.
+        Only rank zero writes the resulting, typically small, state dict.
+        """
+        from peft import get_peft_model_state_dict
+
+        adapter_state_dict = get_peft_model_state_dict(model)
+        expert_tensors = self._grouped_lora_tensors(model)
+        gathered_state_dict = {}
+        for name, tensor in adapter_state_dict.items():
+            if name in expert_tensors:
+                # Expert tensors have a two-level layout (EDP shard and EP
+                # local experts) and use a dedicated global gather.
+                grouped = expert_tensors[name]
+                full_tensor = self._gather_expert_lora_tensor(
+                    grouped.source, grouped.num_global_experts
+                )
+                gathered_state_dict.update(
+                    self._split_grouped_lora_tensor(
+                        full_tensor, grouped.clean_name, name
+                    )
+                )
+            else:
+                gathered_state_dict[name] = self._full_cpu_tensor(tensor)
+
+        def write_adapter() -> None:
+            os.makedirs(output_dir, exist_ok=True)
+            save_file(
+                gathered_state_dict,
+                os.path.join(output_dir, "adapter_model.safetensors"),
+            )
+            for config in self._hf_adapter_configs(
+                model, expert_tensors.values()
+            ).values():
+                config.save_pretrained(output_dir)
+            sync_directory(output_dir)
+
+        rank_zero_call(write_adapter)
+
+    def _grouped_lora_tensors(
+        self, model: nn.Module
+    ) -> dict[str, _GroupedLoRATensor]:
+        """Map saved GroupedMLPLoRA keys to their source tensors."""
+        from ....peft.lora import GroupedMLPLoRA
+
+        experts = {}
+        for module_name, module in model.named_modules():
+            if not isinstance(module, GroupedMLPLoRA):
+                continue
+            clean_name = strip_peft_prefix(module_name)
+            for layer_name in ("lora_A", "lora_B", "lora_A2", "lora_B2"):
+                key = f"base_model.model.{clean_name}.{layer_name}.weight"
+                experts[key] = _GroupedLoRATensor(
+                    getattr(module, layer_name)["default"].weight,
+                    clean_name,
+                    module.base_layer.config.num_moe_experts,
+                )
+        return experts
+
+    def _split_grouped_lora_tensor(
+        self, tensor: torch.Tensor, clean_name: str, source_name: str
+    ) -> dict[str, torch.Tensor]:
+        """Split one grouped GMM LoRA tensor into standard PEFT expert tensors."""
+        kind = source_name.rsplit(".", 2)[-2]
+        if kind not in {"lora_A", "lora_B", "lora_A2", "lora_B2"}:
+            raise ValueError(f"Unsupported grouped LoRA tensor: {source_name}")
+
+        split: dict[str, torch.Tensor] = {}
+        for expert_index, expert_tensor in enumerate(tensor):
+            if kind == "lora_A":
+                # A is shared by gate_proj and up_proj.
+                for projection in ("gate_proj", "up_proj"):
+                    split[f"base_model.model.{clean_name}.{expert_index}.{projection}.lora_A.weight"] = (
+                        expert_tensor.transpose(0, 1).contiguous()
+                    )
+            elif kind == "lora_B":
+                intermediate = expert_tensor.shape[-1] // 2
+                for projection, rows in (
+                    ("gate_proj", expert_tensor[:, :intermediate]),
+                    ("up_proj", expert_tensor[:, intermediate:]),
+                ):
+                    split[f"base_model.model.{clean_name}.{expert_index}.{projection}.lora_B.weight"] = (
+                        rows.transpose(0, 1).contiguous()
+                    )
+            else:
+                layer_name = "lora_A" if kind == "lora_A2" else "lora_B"
+                split[f"base_model.model.{clean_name}.{expert_index}.down_proj.{layer_name}.weight"] = (
+                    expert_tensor.transpose(0, 1).contiguous()
+                )
+        return split
+
+    def _hf_adapter_configs(
+        self, model: nn.Module, grouped_tensors: Any
+    ) -> dict[str, Any]:
+        """Return PEFT configs whose targets match standard HF expert modules."""
+        import copy
+
+        configs = copy.deepcopy(model.peft_config)
+        grouped_names = {tensor.clean_name for tensor in grouped_tensors}
+        if not grouped_names:
+            return configs
+
+        for config in configs.values():
+            targets = getattr(config, "target_modules", None)
+            if isinstance(targets, str) or not isinstance(targets, (list, set, frozenset)):
+                raise TypeError(
+                    "Cannot export grouped expert LoRA with non-enumerable "
+                    f"target_modules={targets!r}; expand it first."
+                )
+            targets = set(targets)
+            targets.discard("experts")
+            for clean_name in grouped_names:
+                num_experts = next(
+                    tensor.num_global_experts
+                    for tensor in grouped_tensors
+                    if tensor.clean_name == clean_name
+                )
+                for expert_index in range(num_experts):
+                    for projection in ("gate_proj", "up_proj", "down_proj"):
+                        targets.add(
+                            f"{clean_name}.{expert_index}.{projection}"
+                        )
+            config.target_modules = targets
+        return configs
+
+    def _stage_cpu_offload_tensor(self, tensor: Any) -> Any:
+        """Stage a CPU-resident DTensor shard onto its mesh's device."""
+        if not self._cpu_offload or not isinstance(tensor, DTensor):
+            return tensor
+        local = tensor.to_local()
+        compute_device = self._device_runtime.device
+        if local.device.type == compute_device.type:
+            return tensor
+        return DTensor.from_local(
+            local.to(compute_device),
+            tensor.device_mesh,
+            tensor.placements,
+            run_check=False,
+            shape=tensor.shape,
+            stride=tensor.stride(),
+        )
+
+    def _full_cpu_tensor(self, tensor: Any) -> Any:
+        """Detach a local or distributed tensor into a CPU safetensors value."""
+        if isinstance(tensor, DTensor):
+            tensor = self._stage_cpu_offload_tensor(tensor)
+            tensor = tensor.full_tensor()
+        return tensor.detach().to("cpu", copy=True).contiguous()
+
+    def _gather_expert_lora_tensor(
+        self, tensor: Any, num_global_experts: int
+    ) -> torch.Tensor:
+        """Concatenate GroupedMLPLoRA local expert tensors over the EP mesh."""
+        if isinstance(tensor, DTensor):
+            tensor = self._stage_cpu_offload_tensor(tensor)
+            local = tensor.full_tensor()
+        else:
+            local = tensor
+        local = local.detach().contiguous()
+        if local.device.type != self._device_runtime.device.type:
+            local = local.to(self._device_runtime.device)
+
+        ep_mesh = self._mesh["ep"]
+        ep_group = ep_mesh.get_group(0)
+        ep_size = dist.get_world_size(group=ep_group)
+        if ep_size == 1:
+            gathered = [local]
+        else:
+            gathered = [torch.empty_like(local) for _ in range(ep_size)]
+            dist.all_gather(gathered, local, group=ep_group)
+
+        # EP communication must stay on the process-group device; HCCL groups
+        # reject CPU inputs. Move only the final concatenated tensor to CPU.
+        full = torch.cat(gathered, dim=0).to("cpu", copy=True).contiguous()
+        if full.shape[0] != num_global_experts:
+            raise ValueError(
+                "GroupedMLPLoRA expert gather produced an incomplete adapter: "
+                f"expected {num_global_experts} experts, got {full.shape[0]} "
+                f"(local={tuple(local.shape)}, ep_size={ep_size}, "
+                f"tensor={type(tensor).__name__})"
+            )
+        return full
 
     def save_native(self, model: nn.Module, output_dir: str) -> None:
         self._dcp.save_model(model, output_dir)

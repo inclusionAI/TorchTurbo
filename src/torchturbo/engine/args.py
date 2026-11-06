@@ -155,6 +155,10 @@ class TorchTurboArgs:
     hf_export:
         Whether to export HF safetensors with the final training checkpoint
         or every training checkpoint. Defaults to every checkpoint.
+    hf_export_lora:
+        How LoRA checkpoints are exported: 'merge' (default) merges adapter
+        deltas into the base weights, and 'adapter' writes a standalone PEFT
+        adapter directory.
     log_level:
         TorchTurbo log level. Defaults to ``LogLevel.INFO``.
     """
@@ -190,6 +194,7 @@ class TorchTurboArgs:
     freeze_multi_modal_projector: bool = False
     freeze_language_model: bool = False
     hf_export: str | None = None
+    hf_export_lora: str | None = None
     profiling: bool = False
     memory_snapshot_steps: int | None = None
     log_level: LogLevel = LogLevel.INFO
@@ -709,6 +714,18 @@ _TURBO_ARG_SPECS: tuple[TurboArgSpec, ...] = (
             "exports with the final checkpoint only, 'every' (default) with "
             "every checkpoint. Exact model state is always saved in the "
             "backend's native format; FSDP2 stores it as DCP."
+        ),
+    ),
+    TurboArgSpec(
+        name="hf_export_lora",
+        args_name="hf_export_lora",
+        config_path="checkpoint.hf_export_lora",
+        cli_name="--tt_hf_export_lora",
+        choices=("merge", "adapter"),
+        help=(
+            "How LoRA checkpoints are exported to HF format: 'merge' "
+            "(default) merges adapter deltas into the base weights, while "
+            "'adapter' writes a standalone PEFT adapter directory."
         ),
     ),
     # turbo's plugin mechanism loads these modules; each registers a Plugin for a framework
