@@ -178,10 +178,6 @@ class FSDP2CheckpointManager(BaseCheckpointManager):
         self, tensor: torch.Tensor, clean_name: str, source_name: str
     ) -> dict[str, torch.Tensor]:
         """Split one grouped GMM LoRA tensor into standard PEFT expert tensors."""
-        # TorchTurbo stores one grouped tensor per expert matrix, with shape
-        # [expert, in_features, rank] for A and [expert, rank, out_features]
-        # for B.  Standard HF/PEFT adapters instead have one 2-D A/B pair per
-        # expert Linear: A is [rank, in_features] and B is [out_features, rank].
         kind = source_name.rsplit(".", 2)[-2]
         if kind not in {"lora_A", "lora_B", "lora_A2", "lora_B2"}:
             raise ValueError(f"Unsupported grouped LoRA tensor: {source_name}")
@@ -272,11 +268,6 @@ class FSDP2CheckpointManager(BaseCheckpointManager):
         self, tensor: Any, num_global_experts: int
     ) -> torch.Tensor:
         """Concatenate GroupedMLPLoRA local expert tensors over the EP mesh."""
-        # A GroupedMLPLoRA DTensor is sharded over EDP. full_tensor() first
-        # reconstructs this rank's complete set of local experts (for example
-        # 32), after which the EP gather below obtains every peer's experts.
-        # In full CPU-offload mode the local shard is CPU-resident while its
-        # mesh still uses the NPU/HCCL backend, so stage it before gathering.
         if isinstance(tensor, DTensor):
             tensor = self._stage_cpu_offload_tensor(tensor)
             local = tensor.full_tensor()

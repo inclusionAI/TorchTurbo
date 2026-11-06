@@ -1,14 +1,11 @@
 #!/usr/bin/env python
 """Merge a standalone TorchTurbo LoRA adapter into an HF base checkpoint.
 
-The merge is performed directly on safetensors shards: no distributed process
-group and no full model object are required.  The output preserves the base
-checkpoint's shard boundaries and non-weight files.
-
 Usage:
     python scripts/checkpoint/merge_lora_adapter.py \
-        --adapter-dir output/checkpoint-10/huggingface \
-        --output-dir output/checkpoint-10/merged-hf
+        [--base-dir /path/to/HF_base_model] \
+        --adapter-dir /path/to/lora_adapter/huggingface \
+        --output-dir /path/to/merged-hf
 """
 
 from __future__ import annotations
