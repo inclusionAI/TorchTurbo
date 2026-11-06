@@ -1,0 +1,4 @@
+engine_config:
+  parallel_plan:
+    sp_size: 2
+    ep_size: 8
