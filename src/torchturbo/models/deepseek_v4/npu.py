@@ -4,9 +4,12 @@ from functools import partialmethod
 
 import torch
 
+from torchturbo.logging import get_logger
 from torchturbo.ops import ops
 
 from .packing_utils import _segment_spans
+
+logger = get_logger(__name__)
 
 
 def patch_deepseek_v4_npu_sfa_li(sp_rank: int, sp_group, sp_size: int):
@@ -340,8 +343,31 @@ def _npu_li(
         0,
         self.ratio,
     )
-    k_tnd = k_tnd.detach().to(torch.bfloat16).unsqueeze(1).contiguous()
     sparse_count = min(self.index_topk, k_indexer.size(1))
+    if k_tnd.numel() == 0:
+        # Every covered segment is shorter than compress_ratio (e.g. a
+        # zero-loss placeholder micro-batch sliced by SP so a rank sees fewer
+        # than ``ratio`` tokens), so no complete compressed block is visible.
+        # ``lightning_indexer`` hard-crashes on an empty key tensor; return an
+        # all -1 topk (no compressed-KV hit) instead. Use the full index_topk
+        # width so the downstream sparse-attention path sees a stable shape it
+        # already pads/truncates to. This is a no-op for zero-loss placeholder
+        # slots and otherwise matches what the op would produce.
+        logger.warning_rank0_once(
+            "_npu_li: empty compressed-kv selection (all segments shorter "
+            "than compress_ratio=%d); returning all -1 topk indices",
+            self.ratio,
+        )
+        topk_idxs = torch.full(
+            (bsz, q_full.size(1), self.index_topk),
+            -1,
+            dtype=torch.int64,
+            device=q_indexer.device,
+        )
+        if sp_size > 1:
+            topk_idxs = topk_idxs[:, sp_rank * local_len : (sp_rank + 1) * local_len]
+        return topk_idxs.contiguous(), None
+    k_tnd = k_tnd.detach().to(torch.bfloat16).unsqueeze(1).contiguous()
     # TND batch size equals the number of segments.
     metadata = ops.lightning_indexer_metadata(
         num_heads_q=num_heads,
