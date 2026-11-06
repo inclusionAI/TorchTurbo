@@ -179,10 +179,12 @@ class GroupedMLP(torch.nn.Module):
         }
 
     def activation_func_with_probs(
-        self, hidden_states: torch.Tensor, probs: torch.Tensor,
+        self, hidden_states: torch.Tensor, probs: torch.Tensor | None,
     ) -> torch.Tensor:
-        """Weight activated expert features before FC2, retaining probability precision."""
+        """Activate expert features and weight them before FC2; ``probs=None`` defers weighting to the output-side merge."""
         hidden_states = self.activation_func(hidden_states)
+        if probs is None:
+            return hidden_states
         return (hidden_states * probs).to(hidden_states.dtype)
 
     def forward(
@@ -206,7 +208,9 @@ class GroupedMLP(torch.nn.Module):
             # Probs already applied, so reset to 1.
             permuted_probs = torch.ones_like(permuted_probs)
 
-        activation_probs = permuted_probs.unsqueeze(-1)
+        activation_probs = (
+            None if permuted_probs is None else permuted_probs.unsqueeze(-1)
+        )
 
         # `tokens_per_expert` is the per-expert token count used as the grouped-GEMM
         # `batch_sizes`. The grouped_gemm C++ kernel hard-requires it on CPU

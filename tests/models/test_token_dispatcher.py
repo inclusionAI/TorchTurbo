@@ -2,6 +2,7 @@
 
 import importlib
 import sys
+import contextlib
 from types import ModuleType
 
 import numpy as np
@@ -197,3 +198,395 @@ def test_npu_dispatch_handles_empty_sources_and_input_probs(
     expected_probs_grad = x.detach().float().sum(-1, keepdim=True).expand_as(probs) * routing_map
     torch.testing.assert_close(probs.grad, expected_probs_grad)
     assert bool(calls) == (policy == OpPolicy.AUTO and num_tokens > 0)
+
+
+class _ScaleExperts(torch.nn.Module):
+    """Row-wise per-expert scaling stand-in for GroupedMLP in chunked tests."""
+
+    def __init__(self, num_local_experts: int):
+        super().__init__()
+        self.scales = torch.nn.Parameter(
+            torch.arange(1, num_local_experts + 1, dtype=torch.float32)
+        )
+
+    def forward(self, tokens, tokens_per_expert, probs):
+        assert probs is None, "chunked dispatcher keeps weights for the merge"
+        if tokens.numel() == 0:
+            return tokens, None
+        counts = [int(count) for count in tokens_per_expert.tolist()]
+        parts = torch.split(tokens, counts)
+        weighted = [part * scale for part, scale in zip(parts, self.scales)]
+        return torch.cat(weighted, dim=0), None
+
+
+_chunked_requires_device_stream = pytest.mark.skip(
+    reason="chunked all-to-all requires a device stream",
+)
+
+
+def _chunked_dispatcher(
+    num_chunks: int,
+    num_local_experts: int = 2,
+    topk: int = 2,
+):
+    from torchturbo.models.modules.moe import token_dispatcher_chunked as chunked_module
+
+    kwargs = dict(
+        num_moe_experts=num_local_experts,
+        moe_router_topk=topk,
+        moe_num_chunks=num_chunks,
+    )
+    return chunked_module.MoEChunkedAlltoAllTokenDispatcher(
+        num_local_experts,
+        list(range(num_local_experts)),
+        MoEConfig(**kwargs),
+        object(),
+    )
+
+
+def _run_chunked_moe(dispatcher, experts, hidden_states, routing):
+    from torchturbo.models.modules.moe import token_dispatcher_chunked as chunked_module
+
+    return chunked_module.run_chunked_moe(dispatcher, experts, hidden_states, routing)
+
+
+def test_chunked_rejects_apply_probs_on_input():
+    from torchturbo.models.modules.moe import token_dispatcher_chunked as chunked_module
+
+    with pytest.raises(ValueError, match="alltoall_chunked"):
+        chunked_module.MoEChunkedAlltoAllTokenDispatcher(
+            2, [0, 1], MoEConfig(
+                num_moe_experts=2, moe_router_topk=1,
+                moe_apply_probs_on_input=True,
+            ), object(),
+        )
+
+
+def test_chunk_bounds_split_tokens():
+    from torchturbo.models.modules.moe import (
+        token_dispatcher_chunked as chunked_module,
+    )
+
+    dispatcher = object.__new__(chunked_module.MoEChunkedAlltoAllTokenDispatcher)
+    dispatcher.num_chunks = 3
+    assert dispatcher._chunk_bounds(7) == [(0, 3), (3, 5), (5, 7)]
+    assert dispatcher._chunk_bounds(3) == [(0, 1), (1, 2), (2, 3)]
+    assert dispatcher._chunk_bounds(2) == [(0, 1), (1, 2), (2, 2)]
+    assert dispatcher._chunk_bounds(1) == [(0, 1), (1, 1), (1, 1)]
+    assert dispatcher._chunk_bounds(0) == [(0, 0), (0, 0), (0, 0)]
+
+
+@_chunked_requires_device_stream
+@pytest.mark.parametrize("num_chunks", [1, 2, 5])
+def test_chunked_execute_matches_manual_reference(num_chunks):
+    dispatcher = _chunked_dispatcher(num_chunks)
+    experts = _ScaleExperts(2)
+    x = torch.tensor(
+        [[10.0], [20.0], [30.0], [40.0], [50.0]], requires_grad=True,
+    )
+    probs = torch.tensor(
+        [
+            [0.25, 0.75], [0.5, 0.5], [0.2, 0.8], [1.0, 0.0], [0.4, 0.6],
+        ],
+        requires_grad=True,
+    )
+    routing_map = torch.ones(5, 2, dtype=torch.bool)
+    expert_indices = torch.tensor([[0, 1]] * 5)
+    routing = RoutingResult(probs, routing_map, expert_indices)
+
+    output = _run_chunked_moe(dispatcher, experts, x, routing)
+
+    reference = x * (probs[:, :1] + 2.0 * probs[:, 1:])
+    torch.testing.assert_close(output, reference)
+    output.sum().backward()
+    torch.testing.assert_close(x.grad, probs[:, :1] + 2.0 * probs[:, 1:])
+    torch.testing.assert_close(probs.grad, torch.cat([x, 2.0 * x], dim=1))
+
+
+@_chunked_requires_device_stream
+def test_chunked_execute_keeps_hidden_shape():
+    dispatcher = _chunked_dispatcher(2)
+    experts = _ScaleExperts(2)
+    x = torch.randn(2, 3, 8, requires_grad=True)
+    probs = torch.rand(6, 2)
+    probs = probs / probs.sum(dim=1, keepdim=True)
+    probs.requires_grad_(True)
+    routing_map = torch.ones(6, 2, dtype=torch.bool)
+    routing = RoutingResult(probs, routing_map, torch.tensor([[0, 1]] * 6))
+    output = _run_chunked_moe(dispatcher, experts, x, routing)
+    assert output.shape == x.shape
+    output.sum().backward()
+    assert x.grad is not None and probs.grad is not None
+
+
+@_chunked_requires_device_stream
+def test_chunked_two_rank_metadata_and_host_splits(monkeypatch):
+    # Rank 1 owns E2/E3; rank 0's chunk counts are injected through the gather.
+    rank0_counts = torch.tensor([[1, 2, 2, 0], [0, 1, 1, 3]])
+
+    def fake_all_gather_into_tensor(output, input, group=None, async_op=False):
+        output = output.view(2, 2, 4)
+        output[0].copy_(rank0_counts)
+        output[1].copy_(input.view(2, 4))
+
+    monkeypatch.setattr(
+        torch.distributed, "all_gather_into_tensor", fake_all_gather_into_tensor,
+    )
+    from torchturbo.models.modules.moe import token_dispatcher_chunked as chunked_module
+
+    dispatcher = chunked_module.MoEChunkedAlltoAllTokenDispatcher(
+        2, [2, 3], MoEConfig(
+            num_moe_experts=4, expert_model_parallel_size=2,
+            moe_router_topk=2, moe_num_chunks=2,
+        ), object(),
+    )
+    # Counts derive from the routing mask, matching these selected experts.
+    routing_map = torch.tensor([
+        [True, False, True, False],
+        [False, False, True, True],
+        [False, True, True, False],
+        [True, False, False, True],
+    ])
+    routing = RoutingResult(
+        routing_map.float(), routing_map,
+        torch.tensor([[0, 2], [2, 3], [1, 2], [0, 3]]),
+    )
+    bounds = [(0, 2), (2, 4)]
+
+    metadata = dispatcher._chunk_metadata(routing, bounds)
+    torch.testing.assert_close(
+        metadata.received_counts,
+        torch.tensor([[[2, 0], [2, 1]], [[1, 3], [1, 1]]]),
+    )
+    torch.testing.assert_close(metadata.receive_counts, torch.tensor([[2, 3], [4, 2]]))
+    torch.testing.assert_close(metadata.tokens_per_expert, torch.tensor([[4, 1], [2, 4]]))
+
+    host = dispatcher._host_metadata(metadata)
+    assert host.input_splits == [[1, 3], [2, 2]]
+    assert host.output_splits == [[2, 3], [4, 2]]
+    torch.testing.assert_close(host.tokens_per_expert[0], torch.tensor([4, 1]))
+    torch.testing.assert_close(host.tokens_per_expert[1], torch.tensor([2, 4]))
+
+
+def _imbalanced_routing(num_tokens: int, num_experts: int, topk: int):
+    """Skewed routing: half of the tokens target expert 0."""
+    gen = torch.Generator().manual_seed(7)
+    primary = torch.randint(0, num_experts, (num_tokens,), generator=gen)
+    primary[: num_tokens // 2] = 0
+    expert_indices = [primary]
+    for k in range(1, topk):
+        expert_indices.append((primary + k * 3) % num_experts)
+    expert_indices = torch.stack(expert_indices, dim=1)
+    routing_map = torch.zeros(num_tokens, num_experts, dtype=torch.bool)
+    routing_map.scatter_(1, expert_indices, True)
+    topk_probs = torch.rand(num_tokens, topk, generator=gen)
+    topk_probs = topk_probs / topk_probs.sum(dim=1, keepdim=True)
+    topk_probs.requires_grad_(True)
+    # Router probs are dense over experts with unselected entries zeroed.
+    probs = torch.zeros(num_tokens, num_experts).scatter(
+        1, expert_indices, topk_probs,
+    )
+    return RoutingResult(probs, routing_map, expert_indices)
+
+
+@_chunked_requires_device_stream
+def test_chunked_execute_imbalanced_routing_matches_closed_form():
+    num_experts, num_chunks, num_tokens = 8, 3, 64
+    dispatcher = _chunked_dispatcher(
+        num_chunks, num_local_experts=num_experts,
+    )
+    experts = _ScaleExperts(num_experts)
+    x = torch.randn(num_tokens, 8, requires_grad=True)
+    routing = _imbalanced_routing(num_tokens, num_experts, topk=2)
+    routing.probs.retain_grad()
+
+    output = _run_chunked_moe(dispatcher, experts, x, routing)
+
+    scales = torch.arange(1, num_experts + 1, dtype=torch.float32)
+    weighted = (routing.probs * scales).sum(dim=1, keepdim=True)
+    reference = x * weighted
+    torch.testing.assert_close(output, reference, atol=1e-5, rtol=1e-5)
+    output.sum().backward()
+    assert x.grad is not None and routing.probs.grad is not None
+    torch.testing.assert_close(
+        x.grad, weighted.expand_as(x.grad), atol=1e-5, rtol=1e-5,
+    )
+
+
+@_chunked_requires_device_stream
+def test_chunked_execute_handles_empty_tokens():
+    dispatcher = _chunked_dispatcher(3, num_local_experts=4)
+    experts = _ScaleExperts(4)
+    x = torch.zeros(0, 4, requires_grad=True)
+    routing = RoutingResult(
+        torch.zeros(0, 2),
+        torch.zeros(0, 4, dtype=torch.bool),
+        torch.zeros(0, 2, dtype=torch.long),
+    )
+    output = _run_chunked_moe(dispatcher, experts, x, routing)
+    assert output.shape == x.shape
+
+
+@_chunked_requires_device_stream
+@pytest.mark.parametrize(
+    "num_tokens, topk",
+    [(1, 1), (2, 1), (3, 2), (5, 1)],
+)
+def test_chunked_execute_fewer_tokens_than_chunks(num_tokens, topk):
+    # More chunks than tokens: some chunks end up empty.
+    num_experts, num_chunks = 4, 4
+    dispatcher = _chunked_dispatcher(
+        num_chunks, num_local_experts=num_experts, topk=topk,
+    )
+    experts = _ScaleExperts(num_experts)
+    x = torch.randn(num_tokens, 4, requires_grad=True)
+    routing = _imbalanced_routing(num_tokens, num_experts, topk=topk)
+    routing.probs.retain_grad()
+
+    output = _run_chunked_moe(dispatcher, experts, x, routing)
+
+    scales = torch.arange(1, num_experts + 1, dtype=torch.float32)
+    weighted = (routing.probs * scales).sum(dim=1, keepdim=True)
+    torch.testing.assert_close(output, x * weighted, atol=1e-5, rtol=1e-5)
+    output.sum().backward()
+    assert x.grad is not None and routing.probs.grad is not None
+
+
+@_chunked_requires_device_stream
+def test_chunked_execute_topk1_single_expert_hotspot():
+    # Extreme imbalance: every token routes to expert 0 only.
+    num_experts, num_chunks, num_tokens = 4, 3, 48
+    dispatcher = _chunked_dispatcher(
+        num_chunks, num_local_experts=num_experts, topk=1,
+    )
+    experts = _ScaleExperts(num_experts)
+    x = torch.randn(num_tokens, 4, requires_grad=True)
+    expert_indices = torch.zeros(num_tokens, 1, dtype=torch.long)
+    routing_map = torch.zeros(num_tokens, num_experts, dtype=torch.bool)
+    routing_map[:, 0] = True
+    probs = torch.ones(num_tokens, num_experts, requires_grad=True)
+    probs = probs * routing_map  # dense, only expert 0 weighted
+    routing = RoutingResult(probs, routing_map, expert_indices)
+    routing.probs.retain_grad()
+
+    output = _run_chunked_moe(dispatcher, experts, x, routing)
+    torch.testing.assert_close(output, x, atol=1e-5, rtol=1e-5)
+    output.sum().backward()
+    assert x.grad is not None
+
+
+@_chunked_requires_device_stream
+def test_chunked_backward_autograd_guard_single_recompute():
+    """Checkpointed chunked MoE recomputes exactly once per backward.
+
+    Regression for the use_reentrant=False crash: the engine's AC wires
+    checkpoint with a ``context_fn`` whose recompute context is a
+    one-shot ``@contextmanager``. torch re-enters that context once per
+    *distinct* backward graph id a frame sees. Without a whole-backward
+    GraphExecGroup the frame sees two ids -- the outer backward id (a
+    node deeper than the dispatcher unpacks first) and the dispatcher's
+    own group id -- so the second recompute re-enters the one-shot
+    context and dies in contextlib. Constructing the chunked dispatcher
+    installs an autograd guard that runs every backward under one shared
+    group; assert a plain ``backward()`` recomputes once with reference
+    grads, and characterize the unguarded failure mode.
+    """
+    import torch.utils.checkpoint as checkpoint_module
+    from torch.utils.checkpoint import checkpoint
+
+    from torchturbo.models.modules.moe import (
+        token_dispatcher_chunked as chunked_module,
+    )
+    from torchturbo.models.modules.moe.token_dispatcher_chunked import (
+        shared_recompute_group,
+    )
+
+    if not hasattr(checkpoint_module, "GraphExecGroup"):
+        pytest.skip("torch build without GraphExecGroup")
+
+    dispatcher = _chunked_dispatcher(2)
+    experts = _ScaleExperts(2)
+    routing_map = torch.ones(5, 2, dtype=torch.bool)
+    expert_indices = torch.tensor([[0, 1]] * 5)
+    probs_data = torch.tensor(
+        [[0.25, 0.75], [0.5, 0.5], [0.2, 0.8], [1.0, 0.0], [0.4, 0.6]],
+    )
+
+    state = {"recomputes": 0}
+
+    @contextlib.contextmanager
+    def one_shot_recompute_context():
+        # One-shot, like ``fsdp_recompute_context``: a second __enter__
+        # raises inside contextlib.
+        state["recomputes"] += 1
+        yield
+
+    def context_fn():
+        return contextlib.nullcontext(), one_shot_recompute_context()
+
+    def block_forward(x, probs):
+        routing = RoutingResult(probs, routing_map, expert_indices)
+        merged = _run_chunked_moe(dispatcher, experts, x, routing)
+        # Saving node *deeper* than the chunked dispatcher: its backward
+        # runs first and performs the frame's first unpack/recompute.
+        return torch.sigmoid(merged)
+
+    def clone_inputs():
+        x = torch.tensor(
+            [[10.0], [20.0], [30.0], [40.0], [50.0]], requires_grad=True,
+        )
+        return x, probs_data.clone().requires_grad_(True)
+
+    # Reference: same block without checkpointing.
+    x_ref, probs_ref = clone_inputs()
+    block_forward(x_ref, probs_ref).sum().backward()
+
+    # The guard is installed with the dispatcher: a plain backward() must
+    # run under one group and recompute exactly once.
+    assert chunked_module._ORIGINAL_AUTOGRAD
+    assert torch.autograd.backward is not chunked_module._ORIGINAL_AUTOGRAD["backward"]
+
+    x, probs = clone_inputs()
+    out = checkpoint(
+        block_forward, x, probs, use_reentrant=False, context_fn=context_fn,
+    )
+    before = state["recomputes"]
+    out.sum().backward()
+    assert state["recomputes"] - before == 1
+    torch.testing.assert_close(x.grad, x_ref.grad)
+    torch.testing.assert_close(probs.grad, probs_ref.grad)
+    assert experts.scales.grad is not None
+
+    # Explicit wrapping keeps working and stays at one recompute
+    # (ambient-group reuse, no nesting).
+    x, probs = clone_inputs()
+    out = checkpoint(
+        block_forward, x, probs, use_reentrant=False, context_fn=context_fn,
+    )
+    before = state["recomputes"]
+    with shared_recompute_group():
+        out.sum().backward()
+    assert state["recomputes"] - before == 1
+    torch.testing.assert_close(x.grad, x_ref.grad)
+    torch.testing.assert_close(probs.grad, probs_ref.grad)
+
+    # Characterize the unguarded shape: with the guard removed the frame
+    # sees two gid domains. Either torch crashes re-entering the one-shot
+    # recompute context (current contextlib behavior) or it tolerates it
+    # and pays one recompute per gid domain (>= 2).
+    chunked_module._uninstall_shared_backward_guard()
+    try:
+        x, probs = clone_inputs()
+        out = checkpoint(
+            block_forward, x, probs, use_reentrant=False, context_fn=context_fn,
+        )
+        before = state["recomputes"]
+        crashed = False
+        try:
+            out.sum().backward()
+        except Exception:
+            crashed = True
+        assert crashed or state["recomputes"] - before >= 2
+    finally:
+        chunked_module._install_shared_backward_guard()
+    assert torch.autograd.backward is not chunked_module._ORIGINAL_AUTOGRAD["backward"]

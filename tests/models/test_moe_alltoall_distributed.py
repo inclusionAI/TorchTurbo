@@ -194,3 +194,88 @@ def test_alltoall_checkpoint_outputs_and_gradients(ep_size, tmp_path) -> None:
         _run_moe, args=(ep_size, str(tmp_path / "moe-ep")),
         nprocs=ep_size, join=True,
     )
+
+
+def _check_chunked_moe(
+    rank: int, ep_size: int, num_chunks: int, empty_source: str,
+) -> None:
+    """Chunked dispatcher must match the alltoall dispatcher bit for bit."""
+    ep_group = dist.group.WORLD
+    torch.manual_seed(930 + dist.get_rank(ep_group))
+    common = dict(
+        hidden_size=8, num_moe_experts=ep_size * 2,
+        expert_model_parallel_size=ep_size, moe_ffn_hidden_size=4,
+        gated_linear_unit=True, activation_func=torch.nn.functional.silu,
+        moe_router_topk=2, moe_router_score_function="softmax",
+        moe_router_dtype="fp32",
+    )
+    reference_config = MoEConfig(**common)
+    chunked_config = MoEConfig(
+        moe_token_dispatcher_type="alltoall_chunked",
+        moe_num_chunks=num_chunks,
+        **common,
+    )
+    submodules = MoESubmodules(experts=ModuleSpec(module=GroupedMLP))
+    reference = MoELayer(reference_config, ep_group, submodules=submodules)
+    candidate = MoELayer(chunked_config, ep_group, submodules=submodules)
+    with torch.no_grad():
+        for parameter in reference.parameters():
+            parameter.normal_(std=0.15)
+        reference.router.weight.normal_(std=0.15, generator=torch.Generator().manual_seed(450))
+    candidate.load_state_dict(reference.state_dict(), strict=True)
+
+    is_empty = empty_source == "all" or (empty_source == "one" and rank == 0)
+    lengths = [0, 0] if is_empty else [3 + rank, 5 + rank]
+    inputs = [torch.randn(1, length, 8, requires_grad=True) for length in lengths]
+    ref_inputs = [x.detach().clone().requires_grad_(True) for x in inputs]
+    outputs = [candidate(x)[0] for x in inputs]
+    expected = [reference(x)[0] for x in ref_inputs]
+    context = (
+        f"rank={rank}, EP={ep_size}, chunks={num_chunks}, "
+        f"empty_source={empty_source}"
+    )
+
+    def failure_message(message: str) -> str:
+        return f"{context}\n{message}"
+
+    for actual, ref in zip(outputs, expected, strict=True):
+        torch.testing.assert_close(actual, ref, msg=failure_message)
+    sum(y.square().sum() for y in outputs).backward()
+    sum(y.square().sum() for y in expected).backward()
+    for actual, ref in zip(inputs, ref_inputs, strict=True):
+        torch.testing.assert_close(actual.grad, ref.grad, msg=failure_message)
+    ref_parameters = dict(reference.named_parameters())
+    for name, parameter in candidate.named_parameters():
+        torch.testing.assert_close(
+            parameter.grad, ref_parameters[name].grad,
+            msg=lambda message: f"{context}, parameter={name}\n{message}",
+        )
+
+
+def _run_chunked_moe(rank: int, ep_size: int, init_file: str) -> None:
+    torch.set_num_threads(1)
+    os.environ.setdefault("GLOO_SOCKET_IFNAME", "lo0" if sys.platform == "darwin" else "lo")
+    dist.init_process_group(
+        "gloo", init_method=f"file://{init_file}", rank=rank, world_size=ep_size,
+        timeout=timedelta(seconds=60),
+    )
+    try:
+        runtime = CpuRuntime()
+        runtime_module._SELECTED_RUNTIME = runtime
+        get_or_create_ops(device_runtime=runtime, default_policy=OpPolicy.NATIVE)
+        for num_chunks, empty_source in product(
+            (2, 3), ("none", "one", "all"),
+        ):
+            _check_chunked_moe(rank, ep_size, num_chunks, empty_source)
+            dist.barrier()
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skip(reason="chunked all-to-all requires a device stream")
+@pytest.mark.parametrize("ep_size", [2])
+def test_alltoall_chunked_outputs_and_gradients(ep_size, tmp_path) -> None:
+    mp.spawn(
+        _run_chunked_moe, args=(ep_size, str(tmp_path / "moe-chunked-ep")),
+        nprocs=ep_size, join=True,
+    )

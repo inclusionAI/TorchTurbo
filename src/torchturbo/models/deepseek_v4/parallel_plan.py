@@ -68,6 +68,7 @@ def _replace_moe_only(
         moe_aux_loss_coeff=engine_config.moe.aux_loss_coeff,
         moe_z_loss_coeff=engine_config.moe.z_loss_coeff,
         moe_token_dispatcher_type=engine_config.moe.token_dispatcher,
+        moe_num_chunks=engine_config.moe.num_chunks,
         moe_router_topk_scaling_factor=hf_config.routed_scaling_factor,
         moe_router_score_function=hf_config.scoring_func,
         moe_router_pre_softmax=True,
