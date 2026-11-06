@@ -33,5 +33,5 @@ class TorchNpuMatmulAdd(OpImpl):
     ) -> None:
         # torch-npu supports BF16/FP16 inputs with an FP32 accumulator.
         if transpose_lhs:
-            lhs = lhs.t()
+            lhs = lhs.t().contiguous()
         accumulator.addmm_(lhs, rhs)
