@@ -624,11 +624,10 @@ def _forward_chunked_pipeline(
         runtime.record_stream(expert_output, comm)
         ev_combine[index].record(comm)
 
-    enqueue_permute(0)
-    enqueue_dispatch(0)
-    if chunk_count > 1:
-        enqueue_permute(1)
-        enqueue_dispatch(1)
+    # Enqueue every permute and dispatch up front
+    for index in range(chunk_count):
+        enqueue_permute(index)
+        enqueue_dispatch(index)
 
     # Phase 1: run every chunk's experts and enqueue its combine.
     for index in range(chunk_count):
@@ -642,9 +641,6 @@ def _forward_chunked_pipeline(
             _ChunkGraph(expert_output, rcv_leaf, perm_row_indices[index])
         )
         ev_experts[index].record(compute)
-        if index + 2 < chunk_count:
-            enqueue_permute(index + 2)
-            enqueue_dispatch(index + 2)
         enqueue_combine(index, expert_output)
         expert_output = None
         received[index] = None
