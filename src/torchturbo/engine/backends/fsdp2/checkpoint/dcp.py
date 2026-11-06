@@ -43,7 +43,10 @@ from torchturbo.models.modules.cpu_resident import (
     NodeSharedCPUResidentParameter,
 )
 
-from ....checkpoint.distributed import collective_check
+from ....checkpoint.distributed import (
+    collective_check,
+    get_control_plane_group,
+)
 
 logger = get_logger(__name__)
 
@@ -262,7 +265,11 @@ class DcpCheckpoint:
                 if parameter.shard_sizes is not None
             )
         start = time.perf_counter()
-        dcp.save(state, checkpoint_id=dcp_dir)
+        dcp.save(
+            state,
+            checkpoint_id=dcp_dir,
+            process_group=get_control_plane_group(),
+        )
         logger.info_rank0(
             "[save] model DCP saved to %s in %.2fs (%d entries)",
             dcp_dir, time.perf_counter() - start, len(state_dict),
@@ -381,7 +388,11 @@ class DcpCheckpoint:
             optim_state, self._ep_partitioned_fqns(model)
         )
         start = time.perf_counter()
-        dcp.save({_OPTIMIZER_KEY: stamped}, checkpoint_id=dcp_dir)
+        dcp.save(
+            {_OPTIMIZER_KEY: stamped},
+            checkpoint_id=dcp_dir,
+            process_group=get_control_plane_group(),
+        )
         logger.info_rank0(
             "[save] optimizer state saved to %s in %.2fs",
             dcp_dir, time.perf_counter() - start,
