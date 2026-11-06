@@ -382,8 +382,22 @@ def test_grouped_lora_adapter_gathers_all_ep_experts(tmp_path):
 
 
 @pytest.mark.parametrize("accelerated", [False, True])
-def test_resume_matches_uninterrupted_training(manager, tmp_path, accelerated):
+def test_resume_matches_uninterrupted_training(
+    manager, tmp_path, accelerated, monkeypatch
+):
     from accelerate import Accelerator
+
+    # The launcher may export a multi-rank environment even for a single-process
+    # unit test. Accelerator(cpu=True) still consumes those variables and waits
+    # for the missing peer, so isolate this test from the outer job.
+    for variable in (
+        "RANK",
+        "WORLD_SIZE",
+        "LOCAL_RANK",
+        "MASTER_ADDR",
+        "MASTER_PORT",
+    ):
+        monkeypatch.delenv(variable, raising=False)
 
     def build():
         model, optimizer = _make_training_state()
