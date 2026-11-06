@@ -19,6 +19,7 @@ The parsed args can later be retrieved::
 from __future__ import annotations
 
 import argparse
+import json
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -45,6 +46,35 @@ def parse_log_level(value: str) -> LogLevel:
         raise argparse.ArgumentTypeError(
             f"Unsupported log level {value!r}; supported levels: {supported}"
         ) from exc
+
+
+def parse_profiling_config(value: str) -> dict[str, bool | int]:
+    """Parse a --tt_profiling_config JSON dict of profiling knobs.
+
+    Accepted keys are ``detailed_kernel_info`` and ``with_stack`` (bool) and
+    ``profiling_step`` (int >= 1, the training step to profile).
+    """
+    _BOOL_KEYS = {"detailed_kernel_info", "with_stack"}
+    _INT_KEYS = {"profiling_step"}
+    try:
+        parsed = json.loads(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"Invalid JSON: {value!r}") from exc
+    unknown = set(parsed) - _BOOL_KEYS - _INT_KEYS
+    if unknown:
+        raise argparse.ArgumentTypeError(
+            f"Unknown profiling keys: {sorted(unknown)}"
+        )
+    for key, knob in parsed.items():
+        if key in _BOOL_KEYS and not isinstance(knob, bool):
+            raise argparse.ArgumentTypeError(f"Value must be bool: {key}")
+        if key in _INT_KEYS and (
+            not isinstance(knob, int) or isinstance(knob, bool) or knob < 1
+        ):
+            raise argparse.ArgumentTypeError(
+                f"Value must be an int >= 1: {key}"
+            )
+    return parsed
 
 
 # ---------------------------------------------------------------------------
@@ -155,6 +185,11 @@ class TorchTurboArgs:
     hf_export:
         Whether to export HF safetensors with the final training checkpoint
         or every training checkpoint. Defaults to every checkpoint.
+    profiling_config:
+        Profiling knobs (``detailed_kernel_info``/``with_stack`` as bool,
+        ``profiling_step`` as int) as a JSON dict from
+        ``--tt_profiling_config``. Only effective when ``profiling`` is
+        enabled. ``None`` means all knobs are off.
     log_level:
         TorchTurbo log level. Defaults to ``LogLevel.INFO``.
     """
@@ -191,6 +226,7 @@ class TorchTurboArgs:
     freeze_language_model: bool = False
     hf_export: str | None = None
     profiling: bool = False
+    profiling_config: dict[str, bool | int] | None = None
     memory_snapshot_steps: int | None = None
     log_level: LogLevel = LogLevel.INFO
 
@@ -650,9 +686,25 @@ _TURBO_ARG_SPECS: tuple[TurboArgSpec, ...] = (
         cli_name="--tt_profiling",
         type=string_to_bool,
         metavar="BOOL",
-        help="Enable NPU/CUDA profiling for the second step. "
+        help="Enable NPU/CUDA profiling for one optimizer step (the first "
+        "step, or the step chosen by profiling_step in "
+        "--tt_profiling_config). "
         "Outputs to {output_dir}/profiling/. "
         "Accepts --tt_profiling, ... true, or ... false.",
+    ),
+    TurboArgSpec(
+        name="profiling_config",
+        args_name="profiling_config",
+        cli_name="--tt_profiling_config",
+        type=parse_profiling_config,
+        metavar="DICT",
+        help="Profiling knobs as a JSON dict. Only effective with "
+        "--tt_profiling. detailed_kernel_info records kernel-level input "
+        "shapes and AiCore utilization metrics (enables record_shapes, "
+        "aic_metrics=PipeUtilization, and NPU profiler level Level1); "
+        "with_stack records the Python call stack; profiling_step (int >= 1) "
+        'selects the training step to profile. '
+        'E.g. {"detailed_kernel_info": true, "profiling_step": 20}.',
     ),
     TurboArgSpec(
         name="memory_snapshot_steps",

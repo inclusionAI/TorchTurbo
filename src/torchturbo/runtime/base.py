@@ -1,9 +1,20 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from enum import StrEnum
 
 import torch
+
+
+@dataclass
+class ProfilingConfig:
+    """Profiling detail knobs forwarded from the engine to device profilers."""
+
+    record_shapes: bool = False
+    aic_metrics: bool = False
+    with_stack: bool = False
+    profiling_step: int | None = None
 
 
 class BaseProfiler(ABC):
@@ -13,6 +24,7 @@ class BaseProfiler(ABC):
         output_dir: str,
         worker_name: str,
         profiling_enabled: bool,
+        profiling_config: ProfilingConfig,
         memory_snapshot_steps: int | None,
     ) -> None:
         ...
@@ -133,6 +145,7 @@ class DeviceRuntime(ABC):
         output_dir: str,
         worker_name: str,
         profiling_enabled: bool,
+        profiling_config: ProfilingConfig,
         memory_snapshot_steps: int | None,
     ) -> BaseProfiler:
         ...
