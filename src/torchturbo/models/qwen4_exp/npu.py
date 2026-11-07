@@ -69,12 +69,6 @@ def _blocks_to_token_ids(
     local_positions = query_positions - segment_start
     complete_blocks = (local_positions + 1).div(ratio, rounding_mode="floor")
     valid_blocks = (block_ids >= 0) & (block_ids < complete_blocks[:, None])
-    num_selected_blocks = valid_blocks.sum(dim=1)
-    # CANN may rank the current incomplete block among earlier complete blocks.
-    # Keep valid blocks in top-k order and compact them before appending the tail.
-    order = torch.argsort(~valid_blocks, dim=1, stable=True)
-    block_ids = block_ids.gather(1, order)
-    valid_blocks = valid_blocks.gather(1, order)
     output = torch.full(
         (1, block_ids.shape[0], budget + ratio - 1),
         -1,
@@ -92,7 +86,10 @@ def _blocks_to_token_ids(
     tail_offsets = block_offsets[:-1]
     tail_start = complete_blocks * ratio
     tail_length = local_positions + 1 - tail_start
-    destinations = num_selected_blocks[:, None] * ratio + tail_offsets[None, :]
+    # Invalid blocks are filtered by the attention KV gather. Place the tail
+    # after all complete blocks so it cannot overwrite a valid selection.
+    destinations = complete_blocks.clamp(max=block_ids.shape[1])[:, None] * ratio
+    destinations = destinations + tail_offsets[None, :]
     tail_ids = segment_start + tail_start[:, None] + tail_offsets[None, :]
     tail_ids = torch.where(
         tail_offsets[None, :] < tail_length[:, None], tail_ids, -1
