@@ -152,6 +152,21 @@ class ActivationCheckpointingConfig:
     use_reentrant: bool = False
 
 
+@dataclass
+class SparseLogitsConfig:
+    """Opt-in output-head row selection for masked packed RL losses.
+
+    The full context still enters the transformer. Each sequence-parallel
+    rank projects every loss-bearing row in its micro-batch without a row cap.
+    """
+
+    enabled: bool = False
+
+    def __post_init__(self) -> None:
+        if type(self.enabled) is not bool:
+            raise TypeError("sparse_logits.enabled must be a boolean.")
+
+
 # ---------------------------------------------------------------------------
 # Communication optimization (common)
 # ---------------------------------------------------------------------------
@@ -635,6 +650,9 @@ class EngineConfig:
     )
     """Activation checkpointing settings."""
 
+    sparse_logits: SparseLogitsConfig = field(default_factory=SparseLogitsConfig)
+    """Opt-in loss-mask output-head row selection for packed RL training."""
+
     comm: CommConfig = field(default_factory=CommConfig)
     """Communication optimization settings."""
 
@@ -701,6 +719,12 @@ class EngineConfig:
             self.optimizer = OptimizerConfig(**self.optimizer)
         elif not isinstance(self.optimizer, OptimizerConfig):
             raise TypeError("optimizer must be an OptimizerConfig or dict")
+        if self.sparse_logits is None:
+            self.sparse_logits = SparseLogitsConfig()
+        elif isinstance(self.sparse_logits, dict):
+            self.sparse_logits = SparseLogitsConfig(**self.sparse_logits)
+        elif not isinstance(self.sparse_logits, SparseLogitsConfig):
+            raise TypeError("sparse_logits must be a dict or SparseLogitsConfig.")
         if self.gbs is not None and self.gbs <= 0:
             raise ValueError(
                 f"gbs (--tt_gbs) must be a positive integer, got {self.gbs}."
@@ -834,6 +858,7 @@ class EngineConfig:
             "fsdp",
             "backend_config",
             "activation_checkpointing",
+            "sparse_logits",
             "comm",
             "optimizer",
             "ops",
@@ -880,6 +905,7 @@ class EngineConfig:
             ops=ops,
             backend_config=backend_config,
             activation_checkpointing=ac,
+            sparse_logits=d.get("sparse_logits"),
             comm=comm,
             optimizer=optimizer,
             checkpoint=ckpt,
@@ -1138,6 +1164,7 @@ def build_from_args(
         ops=_build_ops_config(fields),
         backend_config=_build_fsdp_config(fields),
         activation_checkpointing=ActivationCheckpointingConfig(**ac_d),
+        sparse_logits=fields.get("sparse_logits"),
         comm=CommConfig(**comm_d),
         optimizer=_build_optimizer_config(fields),
         checkpoint=_build_checkpoint_config(fields),
@@ -1197,6 +1224,7 @@ def _validate_config_file(data: Mapping[str, Any], parents: tuple[str, ...] = ()
         }
     )
     allowed.update(_dataclass_config_paths(OptimizerConfig, ("optimizer",)))
+    allowed.update(_dataclass_config_paths(SparseLogitsConfig, ("sparse_logits",)))
 
     for key, value in data.items():
         parts = (*parents, key)
