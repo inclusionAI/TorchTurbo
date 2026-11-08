@@ -1,5 +1,6 @@
 # Use the CANN 9.0.0 runtime for Ascend A3 on openEuler with Python 3.11.
-FROM quay.io/ascend/cann:9.0.0-a3-openeuler24.03-py3.11
+ARG BASE_IMAGE=quay.io/ascend/cann:9.0.0-a3-openeuler24.03-py3.11
+FROM ${BASE_IMAGE}
 
 # Install build tools, tmux, NFS utilities, ossutil, and installation dependencies.
 RUN dnf install -y \
@@ -67,15 +68,40 @@ RUN git clone --branch v2.10.0 --depth 1 --recurse-submodules --shallow-submodul
 # Install other packages
 RUN pip install py-spy==0.4.2
 
-# Compile MoonEP + MegaMoE against the final Torch ABI during image construction.
-WORKDIR /opt/torchturbo
-COPY pyproject.toml README.md ./
-COPY src ./src
-COPY scripts/runs/deps/mega_moe.sh ./scripts/runs/deps/mega_moe.sh
-RUN bash -c "source /usr/local/Ascend/ascend-toolkit/set_env.sh \
-    && bash scripts/runs/deps/mega_moe.sh --jobs ${MAX_JOBS} \
-    && python -m pip install --no-build-isolation --no-deps -e . \
-    && rm -rf /opt/torchturbo/src/torchturbo/optimizations/mega_moe/build"
+# INSTALL_MOONEP=1 also builds HyperMulticore for the shared SHMEM runtime.
+# Optional backends are compiled against the final Torch ABI, once per image.
+# Supply a compatible CANN toolkit/ops image (validated on 9.1) and matching source commit SHAs.
+COPY scripts/runs/deps/mega_moe.sh scripts/runs/deps/moonep.sh /opt/torchturbo-deps/
+ARG INSTALL_HYPER_MULTICORE=0
+ARG INSTALL_MOONEP=0
+ARG HYPER_MULTICORE_REF
+ARG MOONEP_REF
+RUN bash -c 'set -euo pipefail; \
+    if [[ "$INSTALL_HYPER_MULTICORE" == 1 || "$INSTALL_MOONEP" == 1 ]]; then \
+        : "${HYPER_MULTICORE_REF:?Supply the matching hyper-multicore full commit SHA}"; \
+        [[ "$HYPER_MULTICORE_REF" =~ ^[[:xdigit:]]{40}$ ]] || { echo "HYPER_MULTICORE_REF must be a full 40-digit commit SHA" >&2; exit 1; }; \
+        if [[ "$INSTALL_MOONEP" == 1 ]]; then \
+            : "${MOONEP_REF:?Supply the matching official Ascend/MoonEP full commit SHA}"; \
+            [[ "$MOONEP_REF" =~ ^[[:xdigit:]]{40}$ ]] || { echo "MOONEP_REF must be a full 40-digit commit SHA" >&2; exit 1; }; \
+        fi; \
+        source /usr/local/Ascend/ascend-toolkit/set_env.sh; \
+        export HYPER_MULTICORE_SOURCE=/opt/build/hyper-multicore; \
+        git init "$HYPER_MULTICORE_SOURCE"; \
+        git -C "$HYPER_MULTICORE_SOURCE" fetch --depth 1 https://github.com/mindspore-ai/hyper-multicore.git "$HYPER_MULTICORE_REF"; \
+        git -C "$HYPER_MULTICORE_SOURCE" checkout --detach FETCH_HEAD; \
+        test "$(git -C "$HYPER_MULTICORE_SOURCE" rev-parse HEAD)" = "${HYPER_MULTICORE_REF,,}"; \
+        git -C "$HYPER_MULTICORE_SOURCE" rev-parse HEAD; \
+        bash /opt/torchturbo-deps/mega_moe.sh; \
+        if [[ "$INSTALL_MOONEP" == 1 ]]; then \
+            export MOONEP_SOURCE=/opt/build/MoonEP; \
+            git init "$MOONEP_SOURCE"; \
+            git -C "$MOONEP_SOURCE" fetch --depth 1 https://gitcode.com/Ascend/MoonEP.git "$MOONEP_REF"; \
+            git -C "$MOONEP_SOURCE" checkout --detach FETCH_HEAD; \
+            test "$(git -C "$MOONEP_SOURCE" rev-parse HEAD)" = "${MOONEP_REF,,}"; \
+            git -C "$MOONEP_SOURCE" rev-parse HEAD; \
+            bash /opt/torchturbo-deps/moonep.sh; \
+        fi; \
+    fi'
 
 # Configure shell startup and SSH access.
 RUN rm -f /etc/profile.d/system-info.sh /etc/motd

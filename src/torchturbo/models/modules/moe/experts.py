@@ -18,6 +18,7 @@ from torchturbo.logging import get_logger
 
 if TYPE_CHECKING:
     from torchturbo.engine.optimizers import MuonParameterSpec
+    from torchturbo.optimizations.routed_experts import RoutedExpertsBackend
 
 logger = get_logger(__name__)
 
@@ -48,7 +49,6 @@ class GroupedMLP(torch.nn.Module):
         super().__init__()
         self.config = config
         self.num_local_experts = num_local_experts
-        self._execution_backend = None
         self.layer_number = layer_number
         limit_list = getattr(config, "moe_swiglu_limit", None)
         if (
@@ -189,15 +189,25 @@ class GroupedMLP(torch.nn.Module):
     def forward(
         self,
         permuted_local_hidden_states: torch.Tensor,
-        tokens_per_expert: torch.Tensor,
+        tokens_per_expert: torch.Tensor | None,
         permuted_probs: torch.Tensor,
+        *,
+        routed_backend: "RoutedExpertsBackend | None" = None,
+        expert_indices: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, None]:
-        """Apply routing probabilities inside each expert before its second linear."""
-        if self._execution_backend is not None and tokens_per_expert.ndim == 2:
-            return ops.mega_moe(
-                permuted_local_hidden_states, tokens_per_expert, permuted_probs,
-                experts=self, backend=self._execution_backend,
+        """Execute experts through the normal module and FSDP forward hooks.
+
+        The routed backend supplies original token rows and expert_indices through
+        keyword arguments; ordinary dispatch supplies per-expert token counts.
+        """
+        if routed_backend is not None:
+            if expert_indices is None:
+                raise ValueError("Routed experts require router-selected expert IDs.")
+            return routed_backend.execute(
+                self, permuted_local_hidden_states, expert_indices, permuted_probs,
             ), None
+        if tokens_per_expert is None:
+            raise ValueError("Native grouped experts require tokens_per_expert.")
         if self.config.moe_apply_probs_on_input:
             assert (
                 self.config.moe_router_topk == 1

@@ -238,3 +238,22 @@ def test_parse_torchturbo_args_mtp_log_loss():
 
     assert args.mtp_log_loss is True
     assert remaining == ["--other"]
+
+
+def test_parse_independent_expert_backend_switches():
+    from torchturbo.engine.args import parse_torchturbo_args
+
+    args, _ = parse_torchturbo_args([])
+    assert args.enable_mega_moe is None
+    assert args.enable_moonep is None
+    assert "tt_enable_mega_moe" not in args.config_overrides
+    assert "tt_enable_moonep" not in args.config_overrides
+
+    args, remaining = parse_torchturbo_args([
+        "--tt_enable_mega_moe", "false", "--tt_enable_moonep", "true", "--model", "example"
+    ])
+    assert args.enable_mega_moe is False
+    assert args.enable_moonep is True
+    assert args.config_overrides["tt_enable_mega_moe"] is False
+    assert args.config_overrides["tt_enable_moonep"] is True
+    assert remaining == ["--model", "example"]

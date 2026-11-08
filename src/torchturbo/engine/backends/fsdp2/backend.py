@@ -357,10 +357,6 @@ class FSDP2Backend(BaseBackend):
                     else:
                         logger.debug_rank0("FSDP2Backend patched module %s in-place", fqn)
 
-        if self.config.mega_moe:
-            from ....optimizations.mega_moe.integration import install
-
-            install(model, self.config, self.get_ep_info()["ep_group"])
         return model
 
     @staticmethod
@@ -454,12 +450,13 @@ class FSDP2Backend(BaseBackend):
         else:
             plan = parallel_plan
 
-        if self.config.mega_moe and peft_config is not None:
+        if (self.config.moe.enable_mega_moe or self.config.moe.enable_moonep) and peft_config is not None:
             logger.warning_rank0(
-                "MegaMoE + MoonEP does not support LoRA. Disabling mega_moe "
+                "MegaMoE/MoonEP do not support LoRA. Disabling enable_mega_moe and enable_moonep "
                 "and using the native MoE modules; LoRA remains enabled."
             )
-            self.config.mega_moe = False
+            self.config.moe.enable_mega_moe = False
+            self.config.moe.enable_moonep = False
 
         self.parallel_plan = plan
 
@@ -475,6 +472,11 @@ class FSDP2Backend(BaseBackend):
 
             logger.info_rank0("Applying PEFT LoRA to model")
             model = apply_peft(model, peft_config)
+
+        if self.config.moe.enable_mega_moe or self.config.moe.enable_moonep:
+            from ....optimizations.routed_experts import bind_expert_backends
+
+            bind_expert_backends(model, self.config, self.get_ep_info()["ep_group"])
 
         # Models slice inputs at their declared boundary. Install slicing
         # first so activation checkpointing wraps it and remains effective.

@@ -59,14 +59,15 @@ def build_config_from_swift_args(args: Any) -> EngineConfig:
         tt.moe_aux_loss_coeff = args.router_aux_loss_coef
 
     config = build_from_args(tt)
-    if config.mega_moe and vars(args).get("tuner_type") == "lora":
+    if (config.moe.enable_mega_moe or config.moe.enable_moonep) and vars(args).get("tuner_type") == "lora":
         logger.warning_rank0(
-            "MegaMoE + MoonEP does not support LoRA. Disabling mega_moe "
+            "MegaMoE/MoonEP do not support LoRA. Disabling enable_mega_moe and enable_moonep "
             "and using the native MoE modules; LoRA remains enabled."
         )
-        config.mega_moe = False
-    if config.mega_moe:
-        from ...optimizations.mega_moe.integration import configure_token_bound
+        config.moe.enable_mega_moe = False
+        config.moe.enable_moonep = False
+    if config.moe.enable_mega_moe or config.moe.enable_moonep:
+        from ...optimizations.routed_experts import configure_token_bound
 
         configure_token_bound(config, args)
     return config

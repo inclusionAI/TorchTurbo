@@ -39,10 +39,6 @@ engine_config:
   mixed_precision: bf16
   use_deterministic_algorithms: false
 
-  # Fused MoonEP + MegaMoE on Ascend A3; incompatible with LoRA.
-  # Swift derives the local token capacity from length, batch size and SP.
-  mega_moe: false
-
   ops:
     policy: auto
     overrides:
@@ -118,6 +114,13 @@ engine_config:
         bucket_cap_mb: null
 
   moe:
+    # Independent Ascend A3 expert compute and load-balancing optimizations.
+    # Enable both to select MegaMoE + MoonEP; disable both for native MoE.
+    # Swift derives the local token capacity from length, batch size and SP.
+    enable_mega_moe: false
+    enable_moonep: false
+    moonep_grad_reduce_dtype: fp32  # bf16 is optional
+    local_token_capacity: null  # Swift derives this; other launchers set a positive 128-aligned bound.
     aux_loss_coeff: 0.0
     z_loss_coeff: 0.0
     token_dispatcher: alltoall

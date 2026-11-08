@@ -1,4 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
 """Compare standalone MegaMoE forward/backward with ordinary NPU experts."""
+
 import json
 import argparse
 import os
@@ -6,7 +8,6 @@ import os
 import torch
 import torch.distributed as dist
 import torch_npu
-
 
 
 def compare(actual: torch.Tensor, expected: torch.Tensor) -> dict:
@@ -20,13 +21,19 @@ def compare(actual: torch.Tensor, expected: torch.Tensor) -> dict:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=["none", "pre_activation", "post_activation"], default="none")
-    parser.add_argument("--limit", type=float, default=0.)
+    parser.add_argument(
+        "--mode", choices=["none", "pre_activation", "post_activation"], default="none"
+    )
+    parser.add_argument("--limit", type=float, default=0.0)
     parser.add_argument("--identity", action="store_true")
     parser.add_argument("--routing", choices=["uniform", "hot"], default="uniform")
     parser.add_argument("--checkpoint", action="store_true")
-    parser.add_argument("--checkpoint-mode", choices=["none", "reentrant", "nonreentrant"])
-    parser.add_argument("--checkpoint-scope", choices=["layer", "stack"], default="layer")
+    parser.add_argument(
+        "--checkpoint-mode", choices=["none", "reentrant", "nonreentrant"]
+    )
+    parser.add_argument(
+        "--checkpoint-scope", choices=["layer", "stack"], default="layer"
+    )
     parser.add_argument("--disable-early-stop", action="store_true")
     parser.add_argument("--layers", type=int, default=1)
     parser.add_argument("--require-copies", action="store_true")
@@ -34,7 +41,9 @@ def main() -> None:
     parser.add_argument("--topk", type=int, default=2)
     parser.add_argument("--tokens", type=int, default=128)
     args = parser.parse_args()
-    checkpoint_mode = args.checkpoint_mode or ("reentrant" if args.checkpoint else "none")
+    checkpoint_mode = args.checkpoint_mode or (
+        "reentrant" if args.checkpoint else "none"
+    )
     assert args.layers > 0
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.npu.set_device(local_rank)
@@ -62,9 +71,24 @@ def main() -> None:
         w1_cpu = torch.eye(h).bfloat16().repeat(experts, 1, 1)
         w2_cpu = torch.eye(h).bfloat16()[:intermediate].repeat(experts, 1, 1)
     if identity:
-        values = torch.tensor([-4.03125, -4., -0.251953125, -0.25, -0.248046875,
-                               0., 0.248046875, 0.25, 0.251953125,
-                               0.4140625, 0.416015625, 0.41796875, 4., 4.03125]).bfloat16()
+        values = torch.tensor(
+            [
+                -4.03125,
+                -4.0,
+                -0.251953125,
+                -0.25,
+                -0.248046875,
+                0.0,
+                0.248046875,
+                0.25,
+                0.251953125,
+                0.4140625,
+                0.416015625,
+                0.41796875,
+                4.0,
+                4.03125,
+            ]
+        ).bfloat16()
         x_cpu[:14, :intermediate] = values[:, None]
         x_cpu[:14, intermediate:] = values.flip(0)[:, None]
     dy_cpu = (torch.randn(world * t, h) * 0.1).bfloat16()
@@ -73,30 +97,57 @@ def main() -> None:
     x = x_cpu[sl].to(device).requires_grad_()
     probs = probs_cpu[sl].to(device).requires_grad_()
     # Distinct parameters exercise reuse of the same staging pool across layers.
-    all_w1 = [w1_cpu] + [(torch.randn_like(w1_cpu.float()) * .03).bfloat16()
-                         for _ in range(args.layers - 1)]
-    all_w2 = [w2_cpu] + [(torch.randn_like(w2_cpu.float()) * .03).bfloat16()
-                         for _ in range(args.layers - 1)]
-    weights = [(a[es].to(device).requires_grad_(), b[es].to(device).requires_grad_())
-               for a, b in zip(all_w1, all_w2)]
+    all_w1 = [w1_cpu] + [
+        (torch.randn_like(w1_cpu.float()) * 0.03).bfloat16()
+        for _ in range(args.layers - 1)
+    ]
+    all_w2 = [w2_cpu] + [
+        (torch.randn_like(w2_cpu.float()) * 0.03).bfloat16()
+        for _ in range(args.layers - 1)
+    ]
+    weights = [
+        (a[es].to(device).requires_grad_(), b[es].to(device).requires_grad_())
+        for a, b in zip(all_w1, all_w2)
+    ]
     from types import SimpleNamespace
     from torchturbo.models.modules.moe.moe_config import MoEConfig
-    from torchturbo.optimizations.mega_moe.moonep.backend import MoonEPMegaMoeBackend
+    from torchturbo.optimizations.mega_moe.backend import MegaMoeBackend
 
-    config = MoEConfig(hidden_size=h, moe_ffn_hidden_size=intermediate,
-                      num_moe_experts=experts, moe_router_topk=k,
-                      gated_linear_unit=True, activation_func=torch.nn.functional.silu,
-                      moe_swiglu_clamp_gate_after_activation=mode == "post_activation")
-    backend = MoonEPMegaMoeBackend(dist.group.WORLD, t, ((mode, limit),))
+    config = MoEConfig(
+        hidden_size=h,
+        moe_ffn_hidden_size=intermediate,
+        num_moe_experts=experts,
+        moe_router_topk=k,
+        gated_linear_unit=True,
+        activation_func=torch.nn.functional.silu,
+        moe_swiglu_clamp_gate_after_activation=mode == "post_activation",
+    )
+    if args.require_copies:
+        # Accuracy coverage must exercise transfers even for inexpensive test shapes.
+        # Performance tests always retain the unmodified profitability decision.
+        from unittest.mock import patch
+        from hyper_multicore.integrations.mega_moe.execution import MoonEPExecution
+
+        cost_screen = patch.object(
+            MoonEPExecution, "_placement_is_profitable", return_value=True
+        )
+        cost_screen.start()
+    backend = MegaMoeBackend(dist.group.WORLD, t, ((mode, limit),), enable_moonep=True)
 
     def module(hidden, ids, weights, *, expert_weights):
-        owner = SimpleNamespace(config=config, weight1=expert_weights[0],
-                                weight2=expert_weights[1], swiglu_limit=limit)
+        owner = SimpleNamespace(
+            config=config,
+            weight1=expert_weights[0],
+            weight2=expert_weights[1],
+            swiglu_limit=limit,
+            training=True,
+        )
         return backend.execute(owner, hidden, ids, weights)
 
     close = backend.close
     print(f"rank={rank} native_forward_start", flush=True)
     from torch.utils.checkpoint import checkpoint, set_checkpoint_early_stop
+
     ids = ids_cpu[sl].to(device)
 
     def layer(hidden, probabilities, a, b):
@@ -104,7 +155,9 @@ def main() -> None:
 
     def stack(hidden, probabilities, *parameters):
         for index in range(args.layers):
-            hidden = layer(hidden, probabilities, *parameters[2 * index:2 * index + 2])
+            hidden = layer(
+                hidden, probabilities, *parameters[2 * index : 2 * index + 2]
+            )
         return hidden
 
     parameters = tuple(value for pair in weights for value in pair)
@@ -112,13 +165,23 @@ def main() -> None:
         if checkpoint_mode == "none":
             output = stack(x, probs, *parameters)
         elif args.checkpoint_scope == "stack":
-            output = checkpoint(stack, x, probs, *parameters,
-                                use_reentrant=checkpoint_mode == "reentrant")
+            output = checkpoint(
+                stack,
+                x,
+                probs,
+                *parameters,
+                use_reentrant=checkpoint_mode == "reentrant",
+            )
         else:
             output = x
             for pair in weights:
-                output = checkpoint(layer, output, probs, *pair,
-                                    use_reentrant=checkpoint_mode == "reentrant")
+                output = checkpoint(
+                    layer,
+                    output,
+                    probs,
+                    *pair,
+                    use_reentrant=checkpoint_mode == "reentrant",
+                )
     torch.npu.synchronize()
     print(f"rank={rank} native_backward_start", flush=True)
     output.backward(dy_cpu[sl].to(device))
@@ -126,8 +189,10 @@ def main() -> None:
     print(f"rank={rank} reference_start", flush=True)
     xr = x_cpu.to(device).requires_grad_()
     pr = probs_cpu.to(device).requires_grad_()
-    reference_weights = [(a.to(device).requires_grad_(), b.to(device).requires_grad_())
-                         for a, b in zip(all_w1, all_w2)]
+    reference_weights = [
+        (a.to(device).requires_grad_(), b.to(device).requires_grad_())
+        for a, b in zip(all_w1, all_w2)
+    ]
     ref = xr
     for wr1, wr2 in reference_weights:
         next_hidden = torch.zeros_like(ref)
@@ -138,18 +203,28 @@ def main() -> None:
             if limit:
                 gate, up_branch = up.float().chunk(2, dim=-1)
                 if mode == "pre_activation":
-                    act = torch.nn.functional.silu(gate.clamp(max=limit)) * up_branch.clamp(-limit, limit)
+                    act = torch.nn.functional.silu(
+                        gate.clamp(max=limit)
+                    ) * up_branch.clamp(-limit, limit)
                 else:
-                    act = torch.nn.functional.silu(gate).clamp(max=limit) * up_branch.clamp(-limit, limit)
+                    act = torch.nn.functional.silu(gate).clamp(
+                        max=limit
+                    ) * up_branch.clamp(-limit, limit)
             else:
                 act = torch_npu.npu_swiglu(up, dim=-1)
             act = act.to(up.dtype)
+            # Match GroupedMLP.activation_func_with_probs in current TT main:
+            # preserve the BF16 activation, multiply in FP32, then cast before FC2.
+            act = (act * pr[rows, slots, None]).to(act.dtype)
             y = act @ wr2[expert]
-            next_hidden = next_hidden.index_add(0, rows, (y.float() * pr[rows, slots, None]).to(y.dtype))
+            next_hidden = next_hidden.index_add(0, rows, y)
         ref = next_hidden
     ref.backward(dy_cpu.to(device))
     result = {
-        "rank": rank, "mode": mode, "identity": identity, "limit": limit,
+        "rank": rank,
+        "mode": mode,
+        "identity": identity,
+        "limit": limit,
         "output": compare(output, ref[sl]),
         "dx": compare(x.grad, xr.grad[sl]),
         "dprobs": compare(probs.grad, pr.grad[sl]),
@@ -158,28 +233,54 @@ def main() -> None:
         suffix = "" if index == 0 else f"_layer{index}"
         result["dw1" + suffix] = compare(w1.grad, wr1.grad[es])
         result["dw2" + suffix] = compare(w2.grad, wr2.grad[es])
+    snapshots = backend.runtime_statistics()
+    transfers = [
+        snapshot["transfer"]
+        for snapshot in snapshots
+        if snapshot["transfer"] is not None
+    ]
+    assert all(not snapshot["bank_in_use"] for snapshot in snapshots)
     if args.require_copies:
-        assert backend.resources is not None, "Borrowed-expert test requires EP > 1."
-    if backend.resources is not None:
-        assert not backend.resources.in_use
-        if args.require_copies:
-            assert backend.resources.statistics["gradient_returns"] >= args.layers, (
-                "Hot-routing regression did not exercise borrowed experts."
-            )
+        assert transfers, (
+            "Borrowed-expert accuracy test did not allocate an expert bank"
+        )
+        assert (
+            sum(snapshot["placement"]["moonep_calls"] for snapshot in snapshots)
+            >= args.layers
+        )
+        assert (
+            sum(transfer["gradient_returns"] for transfer in transfers) >= args.layers
+        )
     if identity:
-        result["dx_gate"] = compare(x.grad[:, :intermediate], xr.grad[sl, :intermediate])
+        result["dx_gate"] = compare(
+            x.grad[:, :intermediate], xr.grad[sl, :intermediate]
+        )
         result["dx_up"] = compare(x.grad[:, intermediate:], xr.grad[sl, intermediate:])
-    passed = all(value["finite"] and value["relative_l2"] < 0.02
-                 for value in result.values() if isinstance(value, dict))
-    result.update(status="PASS" if passed else "FAIL", routing=args.routing,
-                  checkpoint=checkpoint_mode != "none", checkpoint_mode=checkpoint_mode,
-                  checkpoint_scope=args.checkpoint_scope, layers=args.layers,
-                  early_stop=not args.disable_early_stop, world_size=world)
+    passed = all(
+        value["finite"] and value["relative_l2"] < 0.02
+        for value in result.values()
+        if isinstance(value, dict)
+    )
+    result.update(
+        status="PASS" if passed else "FAIL",
+        routing=args.routing,
+        checkpoint=checkpoint_mode != "none",
+        checkpoint_mode=checkpoint_mode,
+        checkpoint_scope=args.checkpoint_scope,
+        layers=args.layers,
+        early_stop=not args.disable_early_stop,
+        world_size=world,
+    )
     os.write(1, ("PRECISION_RESULT " + json.dumps(result) + "\n").encode())
     close()
+    if args.require_copies:
+        cost_screen.stop()
     dist.destroy_process_group()
-    assert all(v["finite"] and v["relative_l2"] < 0.02
-               for v in result.values() if isinstance(v, dict)), result
+    assert all(
+        v["finite"] and v["relative_l2"] < 0.02
+        for v in result.values()
+        if isinstance(v, dict)
+    ), result
 
 
 if __name__ == "__main__":

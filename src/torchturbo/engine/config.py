@@ -471,12 +471,34 @@ class LossChunkConfig:
 class MoEConfig:
     """MoE training configuration."""
 
+    enable_mega_moe: bool = False
+    """Enable fused MegaMoE expert computation."""
+
+    enable_moonep: bool = False
+    """Balance expert loads with official MoonEP independently of MegaMoE."""
+
+    moonep_grad_reduce_dtype: Literal["fp32", "bf16"] = "fp32"
+    """Expert-gradient return precision; FP32 is the default."""
+
     aux_loss_coeff: float = 0.0
     z_loss_coeff: float = 0.0
+    local_token_capacity: int | None = None
+    """128-aligned source-token capacity per EP rank; Swift derives it if omitted."""
+
     token_dispatcher: str = "alltoall"
     """Expert token dispatcher type."""
 
     def __post_init__(self) -> None:
+        self.enable_mega_moe = string_to_bool(self.enable_mega_moe)
+        self.enable_moonep = string_to_bool(self.enable_moonep)
+        if self.moonep_grad_reduce_dtype not in ("fp32", "bf16"):
+            raise ValueError("moe.moonep_grad_reduce_dtype must be fp32 or bf16")
+        if self.local_token_capacity is not None and (
+            type(self.local_token_capacity) is not int
+            or self.local_token_capacity <= 0
+            or self.local_token_capacity % 128
+        ):
+            raise ValueError("moe.local_token_capacity must be a positive 128-aligned integer.")
         if self.token_dispatcher != "alltoall":
             raise ValueError("moe.token_dispatcher must be 'alltoall'.")
 
@@ -650,9 +672,6 @@ class EngineConfig:
     dspark: DSparkTrainingConfig = field(default_factory=DSparkTrainingConfig)
     """DeepSeek-V4 DSpark training overrides."""
 
-    mega_moe: bool = False
-    """Enable fused MegaMoE execution with dynamic MoonEP expert balancing."""
-
     moe: MoEConfig = field(default_factory=MoEConfig)
     """MoE training settings."""
 
@@ -688,7 +707,6 @@ class EngineConfig:
         self.use_deterministic_algorithms = string_to_bool(
             self.use_deterministic_algorithms
         )
-        self.mega_moe = string_to_bool(self.mega_moe)
         if self.backend_config is None:
             self.backend_config = self._default_backend_config()
         if self.ops is None:
@@ -731,6 +749,13 @@ class EngineConfig:
 
         if "op_policy" in d:
             raise ValueError("op_policy is no longer supported; use ops.policy.")
+
+        if "mega_moe" in d:
+            raise ValueError("mega_moe has been renamed; use moe.enable_mega_moe.")
+
+        for name in ("enable_mega_moe", "enable_moonep", "moonep_grad_reduce_dtype"):
+            if name in d:
+                raise ValueError(f"{name} belongs under moe; use moe.{name}.")
 
         from torchturbo.parallel import FSDPParallelPlan
 
@@ -860,7 +885,6 @@ class EngineConfig:
             "mtp",
             "dspark",
             "moe",
-            "mega_moe",
             "enable_mtp",
             "mtp_loss_scaling_factor",
             "mtp_log_loss",
@@ -891,7 +915,6 @@ class EngineConfig:
             mtp=mtp_config,
             dspark=dspark_config,
             moe=moe_config,
-            mega_moe=d.get("mega_moe", False),
             loss_chunk=loss_chunk_config,
             freeze_policy=freeze_policy,
             diffusion=_build_diffusion_config(d),
@@ -1150,7 +1173,6 @@ def build_from_args(
         mtp=_build_mtp_config(fields),
         dspark=_build_dspark_training_config(fields),
         moe=_build_moe_config(fields),
-        mega_moe=fields.get("mega_moe", False),
         loss_chunk=_build_loss_chunk_config(fields),
         freeze_policy=_build_freeze_policy(fields),
         mfu=_build_mfu_config(fields),
@@ -1197,7 +1219,6 @@ def _validate_config_file(data: Mapping[str, Any], parents: tuple[str, ...] = ()
     # Allow config blocks that do not have corresponding CLI arguments.
     allowed.update(
         {
-            "mega_moe",
             "backend_config.cpu_offload.enabled",
             "backend_config.cpu_offload.mode",
             "backend_config.cpu_offload.optimizer_memory_fraction",
@@ -1321,9 +1342,13 @@ def _build_moe_config(fields: Mapping[str, Any]) -> MoEConfig:
     """MoEConfig from the merged config dict."""
     moe_d = fields.get("moe") or {}
     return MoEConfig(
+        enable_mega_moe=moe_d.get("enable_mega_moe", False),
+        enable_moonep=moe_d.get("enable_moonep", False),
+        moonep_grad_reduce_dtype=moe_d.get("moonep_grad_reduce_dtype", "fp32"),
         aux_loss_coeff=float(moe_d.get("aux_loss_coeff", 0.0)),
         z_loss_coeff=float(moe_d.get("z_loss_coeff", 0.0)),
         token_dispatcher=moe_d.get("token_dispatcher", "alltoall"),
+        local_token_capacity=moe_d.get("local_token_capacity"),
     )
 
 
