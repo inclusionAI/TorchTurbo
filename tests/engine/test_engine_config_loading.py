@@ -176,6 +176,56 @@ def test_build_from_yaml_with_engineconfig_wrapper(tmp_path):
     assert cfg.activation_checkpointing.enabled is False
 
 
+def test_flex_dispatcher_from_yaml(tmp_path):
+    path = _write(
+        tmp_path,
+        "moe.yaml",
+        _engine_config(
+            "moe:\n"
+            "  token_dispatcher: flex\n"
+            "  virtual_expert_load_balance: true\n"
+        ),
+    )
+
+    cfg = _build_from_argv(["--tt_config", path])
+
+    assert cfg.moe.token_dispatcher == "flex"
+    assert cfg.moe.virtual_expert_load_balance is True
+    roundtrip = EngineConfig.from_dict(cfg.to_dict())
+    assert roundtrip.moe.token_dispatcher == "flex"
+    assert roundtrip.moe.virtual_expert_load_balance is True
+
+
+def test_flex_dispatcher_cli_overrides_yaml(tmp_path):
+    path = _write(
+        tmp_path,
+        "moe.yaml",
+        _engine_config(
+            "moe:\n"
+            "  token_dispatcher: alltoall\n"
+            "  virtual_expert_load_balance: false\n"
+        ),
+    )
+
+    cfg = _build_from_argv([
+        "--tt_config", path,
+        "--tt_moe_token_dispatcher", "flex",
+        "--tt_moe_virtual_expert_load_balance", "true",
+    ])
+
+    assert cfg.moe.token_dispatcher == "flex"
+    assert cfg.moe.virtual_expert_load_balance is True
+
+
+def test_flex_dispatcher_from_env(monkeypatch):
+    monkeypatch.setenv("TORCH_TURBO_MOE_TOKEN_DISPATCHER", "flex")
+    monkeypatch.setenv("TORCH_TURBO_MOE_VIRTUAL_EXPERT_LOAD_BALANCE", "true")
+
+    cfg = _build_from_argv([])
+    assert cfg.moe.token_dispatcher == "flex"
+    assert cfg.moe.virtual_expert_load_balance is True
+
+
 def test_build_from_json_with_engineconfig_wrapper(tmp_path):
     data = {
         "engine_config": {

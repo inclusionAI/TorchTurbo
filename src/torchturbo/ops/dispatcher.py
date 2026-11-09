@@ -7,12 +7,13 @@ from types import ModuleType
 from typing import Any
 
 import torch
+import torch.distributed as dist
 
 from torchturbo.logging import get_logger
 from torchturbo.runtime import DeviceRuntime, TurboDevice
 
 from .base import OpImpl, OpImplKind, OpPolicy, OpSpec
-from .moe import MoEPermutation, get_expert_indices
+from .moe import HybridEPHandle, MoEPermutation, VirtualExpertPlan, get_expert_indices
 from .packed_params import get_packed_params
 from .providers import iter_provider_modules
 from .registry import OpRegistry
@@ -527,6 +528,54 @@ class OpDispatcher:
             "lightning_indexer_metadata", *args, impl=impl, **kwargs
         )
 
+    def moe_remap_routes(
+        self, indices: torch.Tensor, route_positions: torch.Tensor,
+        remap_table: torch.Tensor, *, impl: str | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Map exact occurrence quotas to runtime experts and sort each token.
+
+        Args:
+            indices: Int32/int64 [tokens, topk] logical IDs in [0, experts).
+            route_positions: Int32/int64 stable packed positions for indices,
+                shaped [tokens, topk], as returned by moe_route_metadata.
+            remap_table: Int64 [experts, 1 + 2 * ranks] on the indices device.
+                Each row contains an occurrence offset, ranks cumulative
+                allocation ends, then ranks local runtime slots (-1 if absent).
+                The offset is earlier source ranks' count minus this source's
+                packed expert start. Each valid route must lie in an allocated
+                range with a nonnegative slot. Experts divide evenly over ranks;
+                every rank has twice that many native-plus-replica slots.
+            impl: Optional explicit implementation. All inputs may be strided.
+
+        Returns:
+            Sorted runtime IDs with the input shape/dtype and int64 original
+            top-k columns. Ties preserve column order. Empty inputs are supported.
+            Outputs are discrete metadata; gather probabilities using the columns
+            to retain their existing autograd path.
+        """
+        return self._dispatch(
+            "moe_remap_routes", indices, route_positions, remap_table, impl=impl,
+        )
+
+    def moe_route_metadata(
+        self, indices: torch.Tensor, num_experts: int, *, impl: str | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return stable packed positions and counts for logical expert routes.
+
+        Args:
+            indices: Int32/int64 [tokens, topk] expert IDs in [0, num_experts).
+                Equal expert IDs retain flattened route order, including ties
+                within a token. Non-contiguous and empty inputs are supported.
+            num_experts: Number of logical experts, including unused experts.
+            impl: Optional explicit operator implementation.
+
+        Returns:
+            Int32 inverse positions shaped like indices and int64 counts shaped
+            [num_experts], both on the input device. These discrete outputs do
+            not require gradients and do not mutate the input.
+        """
+        return self._dispatch("moe_route_metadata", indices, num_experts, impl=impl)
+
     def moe_permutation(
         self,
         tokens: torch.Tensor,
@@ -656,6 +705,144 @@ class OpDispatcher:
             split_sizes,
             sorted_idxs,
             probs=probs,
+            impl=impl,
+        )
+
+    def plan_virtual_expert_routes(
+        self,
+        top_indices: torch.Tensor,
+        num_experts: int,
+        ep_group: dist.ProcessGroup,
+        *,
+        impl: str | None = None,
+    ) -> VirtualExpertPlan:
+        """Plan global virtual-expert placement and map local routes.
+
+        Args:
+            top_indices: Int32/int64 [num_tokens, topk] logical expert IDs in
+                [0, num_experts).
+            num_experts: Total number of logical experts across ep_group.
+            ep_group: Expert-parallel communication group.
+            impl: Optional explicit implementation name.
+
+        Returns:
+            Per-forward VirtualExpertPlan. Runtime IDs retain input column order
+            in [0, 2 * num_experts). The copy table has shape [ep_size,
+            num_local_experts] with logical IDs (-1 for unused slots). Opaque
+            dispatch/weight contexts are passed unchanged to their matching ops.
+            Context validity depends on the planned routes and EP group, not
+            tensor object identity. All ranks use the same planning mode.
+        """
+        return self._dispatch(
+            "plan_virtual_expert_routes",
+            top_indices,
+            num_experts,
+            ep_group,
+            impl=impl,
+        )
+
+    def hybrid_ep_dispatch(
+        self,
+        hidden_states: torch.Tensor,
+        routing_map: torch.Tensor,
+        probs: torch.Tensor,
+        ep_group: dist.ProcessGroup,
+        num_local_experts: int,
+        router_topk: int,
+        expert_indices: torch.Tensor | None = None,
+        *,
+        dispatch_context: object | None = None,
+        impl: str | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, HybridEPHandle]:
+        """Permute tokens, exchange across EP, and sort by local expert.
+
+        Args:
+            hidden_states: Source token features of shape [num_tokens, hidden_size].
+            routing_map: Boolean mask [num_tokens, num_experts] or compact
+                integer expert IDs [num_tokens, router_topk].
+            probs: Dense probabilities for a boolean routing_map, or matching
+                [num_tokens, router_topk] probabilities for integer route IDs.
+                Compact probabilities follow the input ID column order.
+            ep_group: Expert-parallel communication group.
+            num_local_experts: Number of local expert slots on each EP rank.
+            router_topk: Number of experts selected per token.
+            expert_indices: Optional sorted expert IDs of shape [num_tokens, router_topk].
+            dispatch_context: Optional explicit state returned by route planning.
+                Every EP rank must consistently supply or omit its planned state.
+                It may be reused with equal routes, including cloned tensors.
+            impl: Optional explicit implementation name.
+
+        Returns:
+            A tuple ``(dispatched_hidden, dispatched_probs, tokens_per_expert, handle)``.
+        """
+        return self._dispatch(
+            "hybrid_ep_dispatch",
+            hidden_states,
+            routing_map,
+            probs,
+            ep_group,
+            num_local_experts,
+            router_topk,
+            expert_indices=expert_indices,
+            dispatch_context=dispatch_context,
+            impl=impl,
+        )
+
+    def hybrid_ep_combine(
+        self,
+        hidden_states: torch.Tensor,
+        handle: HybridEPHandle,
+        *,
+        impl: str | None = None,
+    ) -> torch.Tensor:
+        """Restore chunk order, exchange across EP, and unpermute to source rows.
+
+        Args:
+            hidden_states: Expert output features in local expert order.
+            handle: Opaque state returned by ``hybrid_ep_dispatch``.
+            impl: Optional explicit implementation name.
+
+        Returns:
+            Combined features with the source 2D token shape.
+        """
+        return self._dispatch(
+            "hybrid_ep_combine",
+            hidden_states,
+            handle,
+            impl=impl,
+        )
+
+    def virtual_expert_weight_exchange(
+        self,
+        weight1: torch.Tensor,
+        weight2: torch.Tensor,
+        hidden_states: torch.Tensor,
+        probs: torch.Tensor,
+        context: object,
+        *,
+        impl: str | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Exchange selected native expert matrices in rank-major EP order.
+
+        Args:
+            weight1: Local native FC1 weights of shape [num_local_experts, ...].
+            weight2: Local native FC2 weights of shape [num_local_experts, ...].
+            hidden_states: Dispatched token activations.
+            probs: Dispatched routing probabilities.
+            context: Opaque weight_context from the per-forward route plan.
+                The provider owns packet layout, EP group and communication state.
+            impl: Optional explicit implementation name.
+
+        Returns:
+            A tuple ``(replica_weight1, replica_weight2, hidden_states, probs)``.
+        """
+        return self._dispatch(
+            "virtual_expert_weight_exchange",
+            weight1,
+            weight2,
+            hidden_states,
+            probs,
+            context,
             impl=impl,
         )
 

@@ -92,6 +92,102 @@ def test_rms_norm_uses_reference_fallback_on_cpu():
     assert torch.allclose(actual, expected)
 
 
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("empty", [False, True])
+def test_route_metadata_preserves_flattened_occurrence_order(dtype, empty):
+    indices = torch.tensor([[2, 0], [1, 2], [0, 1], [2, 2]], dtype=dtype)
+    if empty:
+        indices = indices[:0]
+    positions, counts = get_ops().moe_route_metadata(indices, 4)
+    expected_positions = torch.tensor([[4, 0], [2, 5], [1, 3], [6, 7]], dtype=torch.int32)
+    expected_counts = torch.tensor([2, 2, 4, 0])
+    if empty:
+        expected_positions = expected_positions[:0]
+        expected_counts.zero_()
+    torch.testing.assert_close(positions, expected_positions)
+    torch.testing.assert_close(counts, expected_counts)
+
+
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("shape", [(2, 2), (0, 2), (3, 0)])
+def test_remap_routes_preserves_quota_ties_and_probability_gradients(dtype, shape):
+    indices = torch.tensor([[3, 0], [0, 0]], dtype=dtype)
+    positions = torch.tensor([[3, 0], [1, 2]], dtype=torch.int32)
+    expected = torch.tensor([[0, 5], [0, 0]], dtype=dtype)
+    expected_order = torch.tensor([[1, 0], [0, 1]])
+    if shape != (2, 2):
+        indices = torch.empty(shape, dtype=dtype)
+        positions = torch.empty(shape, dtype=torch.int32)
+        expected = torch.empty(shape, dtype=dtype)
+        expected_order = torch.empty(shape, dtype=torch.int64)
+    table = torch.tensor([
+        [0, 3, 5, 0, 2], [-3, 0, 0, 1, -1],
+        [-3, 0, 0, -1, 0], [-3, 0, 1, -1, 1],
+    ])
+    actual, order = get_ops().moe_remap_routes(
+        indices.T.contiguous().T, positions.T.contiguous().T,
+        table.T.contiguous().T,
+    )
+    torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(order, expected_order)
+    probs = torch.randn(shape, requires_grad=True)
+    gradient = torch.randn(shape)
+    reordered = probs.gather(1, order)
+    wanted = probs.gather(1, expected_order)
+    torch.testing.assert_close(
+        torch.autograd.grad(reordered, probs, gradient)[0],
+        torch.autograd.grad(wanted, probs, gradient)[0],
+    )
+
+
+def test_remap_routes_keeps_global_occurrence_offsets_in_int64():
+    table = torch.tensor([
+        [2**32, 2**32, 2**32 + 2, 0, 2],
+        [0, 0, 0, 1, -1], [0, 0, 0, -1, 0], [0, 0, 0, -1, 1],
+    ])
+    mapped, order = get_ops().moe_remap_routes(
+        torch.tensor([[0, 0]], dtype=torch.int32), torch.tensor([[0, 1]]), table,
+    )
+    torch.testing.assert_close(mapped, torch.tensor([[6, 6]], dtype=torch.int32))
+    torch.testing.assert_close(order, torch.tensor([[0, 1]]))
+
+
+@pytest.mark.parametrize("available,policy,expected", [
+    (True, OpPolicy.AUTO, "npu_triton_moe_remap_routes"),
+    (False, OpPolicy.AUTO, "torch_moe_remap_routes"),
+    (True, OpPolicy.NATIVE, "torch_moe_remap_routes"),
+    (True, OpPolicy.CUSTOM, "npu_triton_moe_remap_routes"),
+    (False, OpPolicy.CUSTOM, None),
+])
+def test_remap_routes_provider_policy(monkeypatch, available, policy, expected):
+    from torchturbo.ops.providers.native.moe_remap_routes import TorchMoERemapRoutes
+    from torchturbo.ops.providers.npu.moe_remap_routes import NpuTritonMoERemapRoutes
+
+    registry = OpRegistry()
+    for provider in (TorchMoERemapRoutes, NpuTritonMoERemapRoutes):
+        registry.register(provider.op_spec())
+    monkeypatch.setattr(NpuTritonMoERemapRoutes, "available", lambda self: available)
+    dispatcher = OpDispatcher(
+        registry=registry, device_runtime=NpuRuntime(), default_policy=policy,
+    )
+    if expected is None:
+        with pytest.raises(RuntimeError, match="No implementation.*policy=custom"):
+            dispatcher._candidate_impl("moe_remap_routes", TurboDevice.NPU)
+    else:
+        selected = dispatcher._candidate_impl("moe_remap_routes", TurboDevice.NPU)
+        assert selected.op_spec().impl_name == expected
+    if not available:
+        with pytest.raises(RuntimeError, match="No implementation.*impl=npu_triton"):
+            dispatcher._candidate_impl(
+                "moe_remap_routes", TurboDevice.NPU, impl="npu_triton_moe_remap_routes",
+            )
+        with pytest.raises(RuntimeError, match="Invalid override.*moe_remap_routes"):
+            OpDispatcher(
+                registry=registry, device_runtime=NpuRuntime(),
+                overrides={"moe_remap_routes": "npu_triton_moe_remap_routes"},
+            )
+
+
 def test_provider_modules_are_discovered_from_provider_packages():
     cpu_modules = iter_provider_modules(TurboDevice.CPU)
     cuda_modules = iter_provider_modules(TurboDevice.CUDA)
@@ -732,7 +828,9 @@ def test_dispatcher_logs_selected_ops(caplog):
         key[0] for key in dispatcher._candidate_impl_cache
     } >= {
         "attention_with_max_logits", "cross_entropy_loss",
-        "grouped_matmul", "rms_norm", "swiglu",
+        "grouped_matmul", "hybrid_ep_combine", "hybrid_ep_dispatch",
+        "plan_virtual_expert_routes", "rms_norm", "swiglu",
+        "virtual_expert_weight_exchange",
     }
     dispatcher.log_ops_selection()
 

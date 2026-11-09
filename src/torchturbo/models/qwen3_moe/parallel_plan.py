@@ -24,6 +24,9 @@ class QWen3MoeLayerWrapper(MoELayer):
             moe_aux_loss_coeff=engine_config.moe.aux_loss_coeff,
             moe_z_loss_coeff=engine_config.moe.z_loss_coeff,
             moe_token_dispatcher_type=engine_config.moe.token_dispatcher,
+            moe_virtual_expert_load_balance=(
+                engine_config.moe.virtual_expert_load_balance
+            ),
             moe_router_pre_softmax=not hf_config.norm_topk_prob,
         )
         moe_config = MoEConfig(**qwen3_config_kwargs)
