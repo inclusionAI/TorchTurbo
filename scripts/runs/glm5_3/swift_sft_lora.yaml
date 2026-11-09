@@ -5,7 +5,7 @@ engine_config:
 
   activation_checkpointing:
     enabled: true
-    use_reentrant: true
+    use_reentrant: false
 
   backend_config:
     cpu_offload:

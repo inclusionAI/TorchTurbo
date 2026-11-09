@@ -3,4 +3,4 @@ engine_config:
     sp_size: 2
     ep_size: 8
   activation_checkpointing:
-    use_reentrant: true
+    use_reentrant: false
