@@ -176,6 +176,7 @@ class TorchTurboArgs:
     moe_aux_loss_coeff: float = 0.0
     moe_z_loss_coeff: float = 0.0
     moe_token_dispatcher: str | None = None
+    moe_virtual_expert_load_balance: bool | None = None
     mtp_log_loss: bool = False
     enable_dspark: bool = True
     dspark_loss_scaling_factor: float = 0.1
@@ -524,8 +525,18 @@ _TURBO_ARG_SPECS: tuple[TurboArgSpec, ...] = (
         env_name="TORCH_TURBO_MOE_TOKEN_DISPATCHER",
         config_path="moe.token_dispatcher",
         type=str,
-        choices=("alltoall",),
-        help="Expert token dispatcher type: alltoall.",
+        choices=("alltoall", "flex"),
+        help="Expert token dispatcher type: alltoall (default) or flex.",
+    ),
+    TurboArgSpec(
+        name="moe_virtual_expert_load_balance",
+        args_name="moe_virtual_expert_load_balance",
+        cli_name="--tt_moe_virtual_expert_load_balance",
+        env_name="TORCH_TURBO_MOE_VIRTUAL_EXPERT_LOAD_BALANCE",
+        config_path="moe.virtual_expert_load_balance",
+        type=string_to_bool,
+        metavar="BOOL",
+        help="Enable virtual-expert load balancing under the flex dispatcher.",
     ),
     TurboArgSpec(
         name="moe_aux_loss_coeff",
@@ -832,6 +843,7 @@ def parse_torchturbo_args(argv: list[str]) -> tuple[TorchTurboArgs, list[str]]:
             args.moe_aux_loss_coeff,
             args.moe_z_loss_coeff,
             args.moe_token_dispatcher,
+            args.moe_virtual_expert_load_balance,
             args.mtp_log_loss,
             args.enable_dspark,
             args.dspark_loss_scaling_factor,

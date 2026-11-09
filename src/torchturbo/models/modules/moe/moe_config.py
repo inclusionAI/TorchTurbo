@@ -61,6 +61,8 @@ class MoEConfig:
     moe_router_enable_expert_bias: bool = False
     """The type of token dispatcher to use."""
     moe_token_dispatcher_type: str = "alltoall"
+    """Replicate hot experts across EP ranks under the flex token dispatcher."""
+    moe_virtual_expert_load_balance: bool = False
     """Apply probabilities to expert inputs instead of activations before FC2."""
     moe_apply_probs_on_input: bool = False
     """Per-layer swiglu limit for clamping gate/up values in SwiGLU activation."""
@@ -76,6 +78,18 @@ class MoEConfig:
     def __post_init__(self):
         if self.init_method is None:
             self.init_method = init_method_normal(self.init_method_std)
+        if self.moe_token_dispatcher_type not in ("alltoall", "flex"):
+            raise ValueError(
+                "moe_token_dispatcher_type must be 'alltoall' or 'flex'."
+            )
+        if (
+            self.moe_virtual_expert_load_balance
+            and self.moe_token_dispatcher_type != "flex"
+        ):
+            raise ValueError(
+                "moe_virtual_expert_load_balance requires "
+                "moe_token_dispatcher_type='flex'."
+            )
         if (
             self.moe_router_enable_expert_bias
             and self.moe_router_score_function == "softmax"

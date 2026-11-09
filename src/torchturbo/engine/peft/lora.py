@@ -184,6 +184,10 @@ class GroupedMLPLoRA(nn.Module, BaseTunerLayer):
         nn.Module.__init__(self)
 
         # Validate unsupported features early.
+        if base_layer.config.moe_virtual_expert_load_balance:
+            raise ValueError(
+                "Virtual-expert load balancing does not support expert LoRA."
+            )
         if use_dora:
             raise ValueError(
                 "GroupedMLPLoRA does not support DoRA (use_dora=True)."

@@ -119,6 +119,37 @@ Direct model callers must maintain the same contract when enabling balancing.
 For the dense 27B model, use `ep_size: 1`; vision balancing does not require
 expert parallelism and can be combined with `sp_size: 8`.
 
+MoE token dispatch defaults to `alltoall`. Select `flex` with virtual-expert
+load balancing in `engine_config.moe`:
+
+```yaml
+engine_config:
+  moe:
+    token_dispatcher: flex
+    virtual_expert_load_balance: true
+```
+
+The same choice is available through `--tt_moe_token_dispatcher flex
+--tt_moe_virtual_expert_load_balance true` or
+`TORCH_TURBO_MOE_TOKEN_DISPATCHER=flex` with
+`TORCH_TURBO_MOE_VIRTUAL_EXPERT_LOAD_BALANCE=true`. Virtual-expert load
+balancing temporarily replicates selected
+expert weights, redistributes their routes across EP ranks, and sums replica
+gradients back into the original expert parameters. Parameter shapes and
+checkpoint layouts stay compatible with `alltoall`.
+
+Virtual-expert load balancing requires fused-weight `GroupedMLP` experts. Transformer Engine experts and
+expert LoRA are unsupported; attention-only LoRA is supported. Every EP rank
+must run the same forward and backward calls and give its experts the same
+`requires_grad` setting. Checkpoint recomputation must reproduce the original
+router choices.
+
+Each MoE layer forward, including checkpoint recomputation, all-gathers expert
+counts and synchronizes the device with the CPU once to plan replicas; this also
+prevents CUDA graph capture. Replica weights add one all-to-all in forward and,
+for trainable experts, one in backward. Without expert or whole-MoE activation
+checkpointing, received replica weights stay saved until backward.
+
 ### Backend
 
 Currently available backend:
@@ -349,6 +380,8 @@ docs/runs/
 | `TORCH_TURBO_USE_DETERMINISTIC_ALGORITHMS=true` | Require the selected device runtime to use deterministic algorithms |
 | `TORCH_TURBO_SP_SIZE=2` | Set the sequence-parallel size |
 | `TORCH_TURBO_EP_SIZE=8` | Set the expert-parallel size |
+| `TORCH_TURBO_MOE_TOKEN_DISPATCHER=flex` | Select the MoE token dispatcher: `alltoall` (default) or `flex` |
+| `TORCH_TURBO_MOE_VIRTUAL_EXPERT_LOAD_BALANCE=true` | Enable virtual-expert load balancing under the `flex` token dispatcher |
 | `TORCH_TURBO_GBS=64` | Set the global batch size in micro-batch units; the engine derives gradient accumulation from GBS, SP size, and world size |
 | `TORCH_TURBO_RESHARD_AFTER_FWD=0` | Control whether parameters are resharded after the forward pass |
 | `TORCH_TURBO_PREFETCH_STRATEGY=auto` | Set the FSDP prefetch topology: `native`, `auto` (default), `expert_lookahead`, or `expert_with_layer` |
@@ -364,6 +397,7 @@ Most environment variables have corresponding higher-priority `--tt_*` CLI argum
 | --- | --- |
 | Basic configuration | `--tt_config` / `--tt_backend` / `--tt_mixed_precision` / `--tt_op_policy` / `--tt_use_deterministic_algorithms` |
 | Parallelism | `--tt_sp_size` / `--tt_ep_size` |
+| MoE token dispatch | `--tt_moe_token_dispatcher` (`alltoall` or `flex`), `--tt_moe_virtual_expert_load_balance` |
 | Batch size | `--tt_gbs` |
 | Memory | `--tt_gradient_checkpointing` / `--tt_ac_use_reentrant` / `--tt_cpu_offload` |
 | Prefetching | `--tt_prefetch_strategy` / `--tt_prefetch_direction` / `--tt_forward_prefetch_depth` / `--tt_backward_prefetch_depth` |

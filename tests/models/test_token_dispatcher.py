@@ -38,22 +38,35 @@ def cpu_dispatch(monkeypatch):
     get_or_create_ops(device_runtime=runtime, default_policy=OpPolicy.NATIVE)
 
 
-def test_six_stages_restore_token_order_and_gradients():
-    dispatcher = dispatch_module.MoEAlltoAllTokenDispatcher(
+@pytest.mark.parametrize(
+    "dispatcher_cls,dispatcher_type",
+    [
+        (dispatch_module.MoEAlltoAllTokenDispatcher, "alltoall"),
+        (dispatch_module.MoEFlexTokenDispatcher, "flex"),
+    ],
+)
+def test_six_stages_restore_token_order_and_gradients(dispatcher_cls, dispatcher_type):
+    dispatcher = dispatcher_cls(
         2, [0, 1], MoEConfig(
-            num_moe_experts=2, moe_router_topk=1,
+            num_moe_experts=2,
+            moe_router_topk=1,
+            moe_token_dispatcher_type=dispatcher_type,
         ), object(),
     )
+    assert not isinstance(dispatcher, dispatch_module._DispatchManager)
+    assert dispatcher.get_expert_kwargs() == {}
     x = torch.tensor([[10.0], [20.0], [30.0]], requires_grad=True)
     probs = torch.tensor([[0.0, 0.5], [0.25, 0.0], [0.0, 0.75]], requires_grad=True)
     routing = RoutingResult(probs, probs.detach().bool(), torch.tensor([[1], [0], [1]]))
     packed, packed_probs = dispatcher.dispatch_preprocess(x, routing)
-    torch.testing.assert_close(packed, torch.tensor([[20.0], [10.0], [30.0]]))
+    if dispatcher_type == "alltoall":
+        torch.testing.assert_close(packed, torch.tensor([[20.0], [10.0], [30.0]]))
     received, received_probs = dispatcher.token_dispatch(packed, packed_probs)
+    torch.testing.assert_close(received, torch.tensor([[20.0], [10.0], [30.0]]))
+    torch.testing.assert_close(received_probs, torch.tensor([.25, .5, .75]))
     local, counts, local_probs = dispatcher.dispatch_postprocess(received, received_probs)
     torch.testing.assert_close(counts, torch.tensor([1, 2]))
-    torch.testing.assert_close(packed_probs, torch.tensor([.25, .5, .75]))
-    torch.testing.assert_close(local_probs, packed_probs)
+    torch.testing.assert_close(local_probs, received_probs)
     local = local * local_probs.unsqueeze(-1)
     returned = dispatcher.token_combine(dispatcher.combine_preprocess(local))
     output = dispatcher.combine_postprocess(returned)
@@ -61,14 +74,19 @@ def test_six_stages_restore_token_order_and_gradients():
     output.sum().backward()
     torch.testing.assert_close(x.grad, torch.tensor([[0.5], [0.25], [0.75]]))
     torch.testing.assert_close(probs.grad, torch.tensor([[0.0, 10.0], [20.0, 0.0], [0.0, 30.0]]))
-    assert dispatcher.permutation_row_indices is None
-    assert dispatcher.permutation_expert_indices is None
+    if isinstance(dispatcher, dispatch_module.MoEFlexTokenDispatcher):
+        assert dispatcher._comm_manager.handle is None
+    else:
+        assert dispatcher.permutation_row_indices is None
+        assert dispatcher.permutation_expert_indices is None
 
     other = torch.tensor([[40.0], [50.0]])
     other_probs = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
     other_routing = RoutingResult(other_probs, other_probs.bool(), torch.tensor([[0], [1]]))
-    other_packed, _ = dispatcher.dispatch_preprocess(other, other_routing)
-    torch.testing.assert_close(dispatcher.combine_postprocess(other_packed), other)
+    other_packed, other_packed_probs = dispatcher.dispatch_preprocess(other, other_routing)
+    other_received, _ = dispatcher.token_dispatch(other_packed, other_packed_probs)
+    other_returned = dispatcher.token_combine(dispatcher.combine_preprocess(other_received))
+    torch.testing.assert_close(dispatcher.combine_postprocess(other_returned), other)
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])

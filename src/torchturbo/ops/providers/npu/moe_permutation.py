@@ -11,6 +11,13 @@ from ...moe import MoEPermutation
 from ...registry import register_op
 
 
+class _ProbabilityPacking:
+    def _pack_probabilities(
+        self, probs: torch.Tensor, inverse: torch.Tensor,
+    ) -> torch.Tensor:
+        return torch.empty_like(probs).index_put((inverse.long(),), probs)
+
+
 class _TokenPermutation(torch.autograd.Function):
     @staticmethod
     def forward(ctx, tokens, expert_indices):
@@ -59,7 +66,7 @@ class _UnweightedUnpermutation(torch.autograd.Function):
     priority=100,
     devices=(TurboDevice.NPU,),
 )
-class NpuMoEMaskPermutation(OpImpl):
+class NpuMoEMaskPermutation(_ProbabilityPacking, OpImpl):
     def available(self) -> bool:
         try:
             from torch_npu import npu_moe_token_permute  # noqa: F401
@@ -85,9 +92,7 @@ class NpuMoEMaskPermutation(OpImpl):
         if probs is not None:
             selected_probs = probs.gather(1, expert_indices).flatten()
             # Each token/top-k slot maps to its row in the packed tensor.
-            permuted_probs = torch.empty_like(selected_probs).index_put(
-                (inverse.long(),), selected_probs,
-            )
+            permuted_probs = self._pack_probabilities(selected_probs, inverse)
         return MoEPermutation(
             output,
             permuted_probs,
@@ -154,7 +159,7 @@ class NpuMoEMaskUnpermutation(OpImpl):
     priority=100,
     devices=(TurboDevice.NPU,),
 )
-class NpuMoESortChunks(OpImpl):
+class NpuMoESortChunks(_ProbabilityPacking, OpImpl):
     def available(self) -> bool:
         try:
             from torch_npu import npu_moe_token_permute  # noqa: F401
@@ -191,5 +196,5 @@ class NpuMoESortChunks(OpImpl):
         output, inverse = _TokenPermutation.apply(input, indices)
         permuted_probs = None
         if probs is not None:
-            permuted_probs = torch.empty_like(probs).index_put((inverse.long(),), probs)
+            permuted_probs = self._pack_probabilities(probs, inverse)
         return output, permuted_probs

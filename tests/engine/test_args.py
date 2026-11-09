@@ -115,17 +115,60 @@ def test_parse_torchturbo_args_moe_aux_loss():
     assert config.moe.aux_loss_coeff == 0.01
 
 
-def test_moe_dispatcher_config():
+@pytest.mark.parametrize("dispatcher", ["alltoall", "flex"])
+def test_moe_dispatcher_config(dispatcher):
     from torchturbo.engine.args import parse_torchturbo_args
     from torchturbo.engine.config import EngineConfig, build_from_args
 
-    args, remaining = parse_torchturbo_args(["--tt_moe_token_dispatcher", "alltoall"])
+    args, remaining = parse_torchturbo_args(["--tt_moe_token_dispatcher", dispatcher])
     assert remaining == []
+    assert args.moe_token_dispatcher == dispatcher
     config = build_from_args(args)
-    assert config.moe.token_dispatcher == "alltoall"
-    assert EngineConfig.from_dict(config.to_dict()).moe.token_dispatcher == "alltoall"
+    assert config.moe.token_dispatcher == dispatcher
+    assert config.moe.virtual_expert_load_balance is False
+    assert EngineConfig.from_dict(config.to_dict()).moe.token_dispatcher == dispatcher
     with pytest.raises(ValueError, match="moe.token_dispatcher"):
         EngineConfig.from_dict({"moe": {"token_dispatcher": "invalid"}})
+    with pytest.raises(ValueError, match="moe.virtual_expert_load_balance"):
+        EngineConfig.from_dict({
+            "moe": {
+                "token_dispatcher": "alltoall",
+                "virtual_expert_load_balance": True,
+            },
+        })
+
+
+def test_moe_virtual_expert_load_balance_cli():
+    from torchturbo.engine.args import parse_torchturbo_args
+    from torchturbo.engine.config import EngineConfig, build_from_args
+
+    args, remaining = parse_torchturbo_args([
+        "--tt_moe_token_dispatcher", "flex",
+        "--tt_moe_virtual_expert_load_balance", "true",
+    ])
+    assert remaining == []
+    assert args.moe_token_dispatcher == "flex"
+    assert args.moe_virtual_expert_load_balance is True
+    config = build_from_args(args)
+    assert config.moe.token_dispatcher == "flex"
+    assert config.moe.virtual_expert_load_balance is True
+    roundtrip = EngineConfig.from_dict(config.to_dict())
+    assert roundtrip.moe.token_dispatcher == "flex"
+    assert roundtrip.moe.virtual_expert_load_balance is True
+
+
+def test_moe_dispatcher_defaults_to_alltoall(monkeypatch):
+    from torchturbo.engine.args import parse_torchturbo_args
+    from torchturbo.engine.config import build_from_args
+
+    monkeypatch.delenv("TORCH_TURBO_MOE_TOKEN_DISPATCHER", raising=False)
+    monkeypatch.delenv("TORCH_TURBO_MOE_VIRTUAL_EXPERT_LOAD_BALANCE", raising=False)
+    args, _ = parse_torchturbo_args([])
+    assert args.moe_token_dispatcher is None
+    assert args.moe_virtual_expert_load_balance is None
+    cfg = build_from_args(args)
+    assert cfg.moe.token_dispatcher == "alltoall"
+    assert cfg.moe.virtual_expert_load_balance is False
 
 
 def test_parse_torchturbo_args_moe_z_loss():

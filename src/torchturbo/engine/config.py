@@ -474,11 +474,26 @@ class MoEConfig:
     aux_loss_coeff: float = 0.0
     z_loss_coeff: float = 0.0
     token_dispatcher: str = "alltoall"
-    """Expert token dispatcher type."""
+    """Expert token dispatcher type: alltoall or flex."""
+    virtual_expert_load_balance: bool = False
+    """Replicate hot experts across EP ranks under the flex dispatcher."""
 
     def __post_init__(self) -> None:
-        if self.token_dispatcher != "alltoall":
-            raise ValueError("moe.token_dispatcher must be 'alltoall'.")
+        if isinstance(self.virtual_expert_load_balance, str):
+            self.virtual_expert_load_balance = string_to_bool(
+                self.virtual_expert_load_balance
+            )
+        else:
+            self.virtual_expert_load_balance = bool(
+                self.virtual_expert_load_balance
+            )
+        if self.token_dispatcher not in ("alltoall", "flex"):
+            raise ValueError("moe.token_dispatcher must be 'alltoall' or 'flex'.")
+        if self.virtual_expert_load_balance and self.token_dispatcher != "flex":
+            raise ValueError(
+                "moe.virtual_expert_load_balance requires "
+                "moe.token_dispatcher='flex'."
+            )
 
 
 @dataclass
@@ -1316,6 +1331,9 @@ def _build_moe_config(fields: Mapping[str, Any]) -> MoEConfig:
         aux_loss_coeff=float(moe_d.get("aux_loss_coeff", 0.0)),
         z_loss_coeff=float(moe_d.get("z_loss_coeff", 0.0)),
         token_dispatcher=moe_d.get("token_dispatcher", "alltoall"),
+        virtual_expert_load_balance=string_to_bool(
+            moe_d.get("virtual_expert_load_balance", False)
+        ),
     )
 
 

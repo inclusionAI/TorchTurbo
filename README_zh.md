@@ -97,6 +97,31 @@ Qwen3.5 会同时恢复 `last_hidden_state` 和 `pooler_output`。其 ms-swift �
 直接调用模型时，开启均衡也必须遵守这个约定。27B 是 Dense 模型，建议使用
 `ep_size: 1`；视觉均衡不依赖专家并行，可以配合 `sp_size: 8` 使用。
 
+MoE token dispatcher 默认使用 `alltoall`。通过 `flex` dispatcher 配合
+`virtual_expert_load_balance` 可以开启虚拟专家负载均衡：
+
+```yaml
+engine_config:
+  moe:
+    token_dispatcher: flex
+    virtual_expert_load_balance: true
+```
+
+也可以使用 `--tt_moe_token_dispatcher flex --tt_moe_virtual_expert_load_balance true`
+或环境变量 `TORCH_TURBO_MOE_TOKEN_DISPATCHER=flex` 与
+`TORCH_TURBO_MOE_VIRTUAL_EXPERT_LOAD_BALANCE=true`。
+虚拟专家负载均衡会临时复制部分专家的权重，把这些专家的路由重新分配到各 EP rank，并把副本梯度
+累加回原专家参数。参数形状和 checkpoint 布局与 `alltoall` 保持兼容。
+
+虚拟专家负载均衡要求使用融合权重的 `GroupedMLP` 专家，不支持 Transformer Engine 专家和专家 LoRA，
+支持只作用于 attention 的 LoRA。所有 EP rank 必须执行相同的 forward 和 backward 调用，
+专家参数的 `requires_grad` 设置也必须一致。Checkpoint 重计算必须复现原来的路由选择。
+
+每个 MoE 层的 forward（包括 checkpoint 重计算）都会 all-gather 专家计数，并让 device
+与 CPU 同步一次来规划副本，因此也无法进行 CUDA graph capture。副本权重在 forward 中
+增加一次 all-to-all，专家可训练时 backward 中再增加一次。专家或整个 MoE 没有开启
+activation checkpointing 时，收到的副本权重会一直保存到 backward。
+
 ### Backend
 当前 backend：
 
@@ -298,6 +323,8 @@ docs/runs/
 | `TORCH_TURBO_USE_DETERMINISTIC_ALGORITHMS=true` | 要求所选 device runtime 使用确定性算法 |
 | `TORCH_TURBO_SP_SIZE=2` | Sequence Parallel size |
 | `TORCH_TURBO_EP_SIZE=8` | Expert Parallel size |
+| `TORCH_TURBO_MOE_TOKEN_DISPATCHER=flex` | MoE token dispatcher：`alltoall`（默认）/ `flex` |
+| `TORCH_TURBO_MOE_VIRTUAL_EXPERT_LOAD_BALANCE=true` | 在 `flex` dispatcher 下开启虚拟专家负载均衡 |
 | `TORCH_TURBO_GBS=64` | 以 micro-batch 为单位设置全局 batch size；引擎根据 GBS、SP size 和 world size 推导梯度累积步数 |
 | `TORCH_TURBO_RESHARD_AFTER_FWD=0` | forward 后是否 reshard |
 | `TORCH_TURBO_PREFETCH_STRATEGY=auto` | FSDP prefetch 拓扑：`native` / `auto`（默认）/ `expert_lookahead` / `expert_with_layer` |
@@ -314,6 +341,7 @@ docs/runs/
 | --- | --- |
 | 基础配置 | `--tt_config` / `--tt_backend` / `--tt_mixed_precision` / `--tt_op_policy` / `--tt_use_deterministic_algorithms` |
 | 并行 | `--tt_sp_size` / `--tt_ep_size` |
+| MoE token 分发 | `--tt_moe_token_dispatcher`（`alltoall` / `flex`）、`--tt_moe_virtual_expert_load_balance` |
 | Batch size | `--tt_gbs` |
 | 显存 | `--tt_gradient_checkpointing` / `--tt_ac_use_reentrant` / `--tt_cpu_offload` |
 | 预取 | `--tt_prefetch_strategy` / `--tt_prefetch_direction` / `--tt_forward_prefetch_depth` / `--tt_backward_prefetch_depth` |
