@@ -1,0 +1,15 @@
+Metadata-Version: 2.4
+Name: cann-shmem
+Version: 1.6.0
+Summary: CANN SHMEM - shared memory communication library for Ascend NPU
+Author: 
+Author-email: 
+License: Apache License Version 2.0
+Requires-Python: >=3.7
+License-File: LICENSE
+Requires-Dist: torch-npu
+Dynamic: license
+Dynamic: license-file
+Dynamic: requires-dist
+Dynamic: requires-python
+Dynamic: summary

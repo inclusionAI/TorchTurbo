@@ -1,13 +1,3 @@
-  # Adapted from NVIDIA Megatron-LM:
-  # https://github.com/NVIDIA/Megatron-LM
-  #
-  # Copyright (c) 2019-2025, NVIDIA CORPORATION. All rights reserved.
-  # Licensed under the BSD 3-Clause License.
-  #
-  # Modified by the TorchTurbo contributors.
-
-from typing import TYPE_CHECKING
-
 import torch
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter
@@ -15,9 +5,6 @@ from torch.nn.parameter import Parameter
 from .moe_config import MoEConfig
 from torchturbo.ops import ops
 from torchturbo.logging import get_logger
-
-if TYPE_CHECKING:
-    from torchturbo.engine.optimizers import MuonParameterSpec
 
 logger = get_logger(__name__)
 
@@ -47,6 +34,7 @@ class GroupedMLP(torch.nn.Module):
     ):
         super().__init__()
         self.config = config
+        self._execution_backend = None
         self.num_local_experts = num_local_experts
         self.layer_number = layer_number
         limit_list = getattr(config, "moe_swiglu_limit", None)
@@ -78,9 +66,6 @@ class GroupedMLP(torch.nn.Module):
                     x,
                     activation_func=self.config.activation_func,
                     limit=self.swiglu_limit,
-                    clamp_gate_after_activation=(
-                        self.config.moe_swiglu_clamp_gate_after_activation
-                    ),
                 )
 
             self.activation_func = glu
@@ -141,45 +126,6 @@ class GroupedMLP(torch.nn.Module):
                 )
             )
 
-    def get_muon_parameter_specs(self) -> dict[str, "MuonParameterSpec"]:
-        """Describe the independent matrices packed into fused expert storage."""
-        from torch.distributed.tensor import Shard
-
-        from torchturbo.engine.optimizers import (
-            ExpertDownComputeView,
-            ExpertUpComputeView,
-            MuonParameterSpec,
-        )
-
-        if transformer_engine_is_available() and self.use_te:
-            # GroupedLinear owns separate weights instead of fused expert tensors.
-            return {}
-
-        for name, parameter, matrix_rows in (
-            ("weight1", self.weight1, self.config.hidden_size),
-            ("weight2", self.weight2, self.config.moe_ffn_hidden_size),
-        ):
-            if parameter.shape[0] % matrix_rows:
-                raise ValueError(
-                    f"GroupedMLP parameter {name!r} has invalid shape "
-                    f"{tuple(parameter.shape)}"
-                )
-        return {
-            "weight1": MuonParameterSpec(
-                compute_placement=Shard(0),
-                compute_view=ExpertUpComputeView(
-                    num_experts=self.weight1.shape[0] // self.config.hidden_size,
-                    fused_gate_up=self.config.gated_linear_unit,
-                ),
-            ),
-            "weight2": MuonParameterSpec(
-                compute_placement=Shard(0),
-                compute_view=ExpertDownComputeView(
-                    num_experts=self.weight2.shape[0] // self.config.moe_ffn_hidden_size,
-                ),
-            ),
-        }
-
     def forward(
         self,
         permuted_local_hidden_states: torch.Tensor,
@@ -187,6 +133,10 @@ class GroupedMLP(torch.nn.Module):
         permuted_probs: torch.Tensor,
     ):
         """Forward step of the GroupedMLP."""
+        if self._execution_backend is not None:
+            return self._execution_backend.execute(
+                self, permuted_local_hidden_states, tokens_per_expert, permuted_probs
+            ), None
         if self.config.moe_apply_probs_on_input:
             assert (
                 self.config.moe_router_topk == 1

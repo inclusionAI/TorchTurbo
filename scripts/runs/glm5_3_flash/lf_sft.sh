@@ -4,6 +4,7 @@
 # Usage:
 #   bash scripts/runs/glm5_3_flash/install_lf_deps.sh
 #   bash scripts/runs/glm5_3_flash/lf_sft.sh
+# MEGAMOE_RUNTIME optionally selects a runtime with python/tt_megamoe.
 
 set -o pipefail
 set -eux
@@ -52,7 +53,22 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 RUN_LF="${REPO_ROOT}/scripts/runs/run_lf.py"
 DATASET_DIR="${REPO_ROOT}/dataset"
-export PYTHONPATH=$REPO_ROOT/src:$PYTHONPATH
+export PYTHONPATH="${REPO_ROOT}/src:${PYTHONPATH:-}"
+
+# Use the bundled MegaMoE and SHMEM runtime unless another installation is selected.
+if [[ -z "${MEGAMOE_RUNTIME:-}" && -d "${REPO_ROOT}/src/torchturbo/models/glm5_3_flash/runtime/python/tt_megamoe" ]]; then
+    MEGAMOE_RUNTIME="${REPO_ROOT}/src/torchturbo/models/glm5_3_flash/runtime"
+fi
+if [[ -n "${MEGAMOE_RUNTIME:-}" ]]; then
+    if [[ ! -d "${MEGAMOE_RUNTIME}/python/tt_megamoe" ]]; then
+        echo "MEGAMOE_RUNTIME must contain python/tt_megamoe: ${MEGAMOE_RUNTIME}" >&2
+        exit 1
+    fi
+    export MEGAMOE_RUNTIME
+    export PYTHONPATH="${MEGAMOE_RUNTIME}/python:${PYTHONPATH}"
+fi
+# Check native dependencies before spawning workers.
+python "${REPO_ROOT}/src/torchturbo/optimizations/mega_moe/bootstrap.py" --tt_mega_moe true
 
 DISTRIBUTED_ARGS="
     --nproc_per_node $NPUS_PER_NODE \
@@ -67,6 +83,7 @@ echo $CUR_TIME >> $LOG_FILE
 echo $OUTPUT_DIR >> $LOG_FILE
 
 torchrun $DISTRIBUTED_ARGS $RUN_LF \
+    --tt_mega_moe true \
     --tt_config ${TT_CONFIG} \
     --report_to tensorboard \
     --disable_shuffling \

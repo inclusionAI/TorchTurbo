@@ -374,6 +374,12 @@ def _absorb_weight(proj):
     return weight
 
 
+def _compress_kpools(indexer, keys, gate):
+    """Compress [..., pool, dim], preserving the reference rounding boundaries."""
+    logits = gate.float() + indexer.index_kpool_compress_ape.float()
+    return (logits.softmax(-2).to(keys.dtype) * keys).sum(-2)
+
+
 @torch.no_grad()
 def kpool_indices(
     indexer,
@@ -385,15 +391,18 @@ def kpool_indices(
     pool_chunk=2048,
     projected_keys=None,
     projected_gate=None,
+    projected_pools=None,
 ):
     """Select k-pools in bounded causal tiles for one contiguous valid segment.
 
     Queries with at most ``topk // pool`` complete visible pools need no scores:
     every complete pool is selected. Preserve the incomplete tail separately.
-    The output is a set of token indices; callers may sort it for sparse kernels.
+    Valid token indices are sorted before the -1 padding for sparse kernels.
     """
     if projected_keys is not None and projected_gate is None:
         raise ValueError("Projected indexer keys require projected gates")
+    if projected_pools is not None and projected_keys is not None:
+        raise ValueError("Supply pooled keys or token keys, not both")
     b, nq = hidden_q.shape[:2]
     pool, topk = indexer.index_kpool, indexer.index_topk
     tail = indexer.index_kpool_always_select_tail
@@ -417,29 +426,36 @@ def kpool_indices(
     if prefix == nq:
         return result
 
-    length = (hidden_kv if projected_keys is None else projected_keys).shape[1]
-    npools = min(length // pool, (query_start + nq) // pool)
-    if projected_keys is None:
-        projected_keys = indexer.k_norm(indexer.wk(hidden_kv))
-        projected_gate = F.linear(hidden_kv, indexer.index_kpool_compress_gate)
-    keys = projected_keys[:, : npools * pool]
-    gate = projected_gate[:, : npools * pool]
-    logits = (
-        gate.reshape(b, npools, pool, indexer.head_dim).float()
-        + indexer.index_kpool_compress_ape.float()
-    )
-    pooled = (
-        logits.softmax(2).to(keys.dtype)
-        * keys.reshape(b, npools, pool, indexer.head_dim)
-    ).sum(2).float()
+    if projected_pools is not None:
+        npools = min(projected_pools.shape[1], (query_start + nq) // pool)
+        pooled = projected_pools[:, :npools].float()
+    else:
+        length = (hidden_kv if projected_keys is None else projected_keys).shape[1]
+        npools = min(length // pool, (query_start + nq) // pool)
+        if projected_keys is None:
+            projected_keys = indexer.k_norm(indexer.wk(hidden_kv))
+            projected_gate = F.linear(hidden_kv, indexer.index_kpool_compress_gate)
+        pooled = _compress_kpools(
+            indexer,
+            projected_keys[:, :npools * pool].reshape(b, npools, pool, indexer.head_dim),
+            projected_gate[:, :npools * pool].reshape(b, npools, pool, indexer.head_dim),
+        ).float()
     q = indexer.wq_b(q_resid).view(b, nq, indexer.n_heads, indexer.head_dim)
     weights = indexer.weights_proj(hidden_q).float() * indexer.n_heads**-0.5
     select = min(topk // pool, npools)
-    pool_offsets = torch.arange(pool, device=q.device)
-    tail_offsets = torch.arange(pool - 1, device=q.device) if tail else None
+    selected_pools = torch.empty(
+        (b, nq - prefix, select), device=q.device, dtype=torch.int32
+    )
+    pool_offsets = torch.arange(pool, device=q.device, dtype=torch.int32)
+    tail_offsets = (
+        torch.arange(pool - 1, device=q.device, dtype=torch.int32) if tail else None
+    )
+    scored_positions = torch.arange(
+        query_start + prefix, query_start + nq, device=q.device, dtype=torch.int32
+    )
     for qs in range(prefix, nq, query_chunk):
         qe = min(qs + query_chunk, nq)
-        positions = torch.arange(query_start + qs, query_start + qe, device=q.device)
+        positions = scored_positions[qs - prefix:qe - prefix]
         # Reuse one FP32 query tile for every pool tile. A single larger GEMM
         # also reuses the shared pooled keys across all queries and heads.
         q_tile = q[:, qs:qe].float().reshape(b, -1, indexer.head_dim)
@@ -472,6 +488,14 @@ def kpool_indices(
                 candidates = torch.cat((best_pool, candidates), -1)
             best_score, slots = score.topk(min(select, score.shape[-1]), -1)
             best_pool = candidates.gather(-1, slots)
+        selected_pools[:, qs - prefix:qe - prefix] = best_pool
+    # One AI Core sort over K/p pool IDs instead of K token IDs. Sorting a
+    # query tile at a time would add many small launches on long sequences.
+    selected_pools = selected_pools.float().sort(-1).values.to(torch.int32)
+    for qs in range(prefix, nq, query_chunk):
+        qe = min(qs + query_chunk, nq)
+        positions = scored_positions[qs - prefix:qe - prefix]
+        best_pool = selected_pools[:, qs - prefix:qe - prefix]
         indices = best_pool[..., None] * pool + pool_offsets
         valid = (best_pool + 1) * pool - 1 <= positions[None, :, None]
         indices = indices.masked_fill(~valid[..., None], -1).flatten(-2)
@@ -627,6 +651,113 @@ def _gather_sp_index_tensor(self, tensor):
     return torch.cat(pieces, dim=1)
 
 
+@lru_cache(maxsize=8)
+def _kpool_sp_metadata(runs, total_t, sp_size, sp_rank, pool, topk, device):
+    """Immutable layout for pool owners and the few raw tokens crossing ranks.
+
+    The rank containing a pool's last token owns that complete pool. Pooling
+    starts at each segment's start, including when it is not SP/pool aligned.
+    All collective sizes/branches follow global metadata, even on empty ranks.
+    """
+    local_t = total_t // sp_size
+    owned = [[] for _ in range(sp_size)]
+    boundary = [[] for _ in range(sp_size)]
+    order, ranges = [], {}
+    for row, row_runs in enumerate(runs):
+        for start, end in row_runs:
+            count = (end - start) // pool
+            if count <= topk // pool:
+                continue
+            ranges[row, start, end] = (len(order), count)
+            for pi in range(count):
+                first = start + pi * pool
+                owner = (first + pool - 1) // local_t
+                order.append((owner, len(owned[owner]) // pool))
+                for position in range(first, first + pool):
+                    location = row * total_t + position
+                    owned[owner].append(location)
+                    source = position // local_t
+                    if source != owner:
+                        boundary[source].append(location)
+    max_pools = max(len(tokens) // pool for tokens in owned)
+    max_boundary = max(map(len, boundary))
+    boundary_slots = {
+        location: rank * max_boundary + slot
+        for rank, tokens in enumerate(boundary)
+        for slot, location in enumerate(tokens)
+    }
+    offset = sp_rank * local_t
+    local_size = len(runs) * local_t
+    sources = []
+    for location in owned[sp_rank]:
+        row, position = divmod(location, total_t)
+        sources.append(
+            row * local_t + position - offset
+            if offset <= position < offset + local_t
+            else local_size + boundary_slots[location]
+        )
+    boundary_sources = [
+        (location // total_t) * local_t + location % total_t - offset
+        for location in boundary[sp_rank]
+    ]
+    # CPU metadata and device index vectors are shared by layers/checkpoint
+    # replay, but no hidden-state-dependent values are cached.
+    def to_device(values):
+        return torch.tensor(values, dtype=torch.long, device=device)
+
+    return (
+        to_device(sources),
+        to_device(boundary_sources),
+        to_device([rank * max_pools + slot for rank, slot in order]),
+        ranges,
+        max_pools,
+        max_boundary,
+    )
+
+
+@torch.no_grad()
+def _gather_sp_pooled_keys(self, hidden_states, runs):
+    """Compress each complete pool once, before its SP all-gather.
+
+    Only crossing-pool raw K/Gate records use the small boundary collective.
+    The main collective sends pooled keys in their original rounded dtype.
+    """
+    indexer = self.indexer
+    b, local_t = hidden_states.shape[:2]
+    p, d = indexer.index_kpool, indexer.head_dim
+    sources, boundary_sources, order, ranges, max_pools, max_boundary = (
+        _kpool_sp_metadata(
+            tuple(tuple(tuple(pair) for pair in row) for row in runs),
+            local_t * self.sp_size,
+            self.sp_size,
+            self.sp_rank,
+            p,
+            indexer.index_topk,
+            hidden_states.device,
+        )
+    )
+    keys = indexer.k_norm(indexer.wk(hidden_states))
+    gate = F.linear(hidden_states, indexer.index_kpool_compress_gate)
+    packed = torch.cat((keys, gate), dim=-1).reshape(b * local_t, 2 * d)
+    if max_boundary:
+        edge = packed.new_zeros((max_boundary, 2 * d))
+        if boundary_sources.numel():
+            edge[:boundary_sources.numel()] = packed.index_select(0, boundary_sources)
+        gathered_edge = _gather_sp_index_tensor(self, edge.unsqueeze(0)).squeeze(0)
+        packed = torch.cat((packed, gathered_edge), dim=0)
+    local_pools = keys.new_zeros((max_pools, d))
+    if sources.numel():
+        grouped = packed.index_select(0, sources).reshape(1, -1, p, 2 * d)
+        # cat may promote mixed input dtypes. Restore K's dtype before the
+        # probability cast/product/reduction to preserve the reference result.
+        value = _compress_kpools(
+            indexer, grouped[..., :d].to(keys.dtype), grouped[..., d:]
+        ).squeeze(0)
+        local_pools[:value.shape[0]] = value
+    pooled = _gather_sp_index_tensor(self, local_pools.unsqueeze(0)).squeeze(0)
+    return pooled.index_select(0, order), ranges
+
+
 def npu_dsa_forward(
     self, hidden_states, segments=None, prev_topk_indices=None, **kwargs
 ):
@@ -668,7 +799,8 @@ def npu_dsa_forward(
     latent = self.gather(
         self.kv_a_layernorm(self.kv_a_proj_with_mqa(hidden_states))
     )
-    index_keys = index_gate = None
+    index_keys = index_gate = pooled_keys = None
+    pool_ranges = None
     # runs is global metadata shared by every SP rank. All ranks must make
     # the same decision before skipping either of the two indexer all-gathers.
     needs_index_scores = self.indexer is not None and any(
@@ -680,12 +812,16 @@ def npu_dsa_forward(
     if needs_index_scores:
         with torch.no_grad():
             hidden_index = hidden_states.detach()
-            index_keys = _gather_sp_index_tensor(
-                self, self.indexer.k_norm(self.indexer.wk(hidden_index))
-            )
-            index_gate = _gather_sp_index_tensor(
-                self, F.linear(hidden_index, self.indexer.index_kpool_compress_gate)
-            )
+            if os.environ.get("TORCHTURBO_GLM5_KPOOL_EXCHANGE", "pooled") == "tokens":
+                # Explicit A/B and rollback path; all ranks must use one mode.
+                index_keys = _gather_sp_index_tensor(
+                    self, self.indexer.k_norm(self.indexer.wk(hidden_index))
+                )
+                index_gate = _gather_sp_index_tensor(
+                    self, F.linear(hidden_index, self.indexer.index_kpool_compress_gate)
+                )
+            else:
+                pooled_keys, pool_ranges = _gather_sp_pooled_keys(self, hidden_index, runs)
     width = self.config.index_topk + (
         self.config.index_kpool - 1 if self.config.index_kpool_always_select_tail else 0
     )
@@ -708,6 +844,12 @@ def npu_dsa_forward(
                 continue
             ls, le = qs - offset, qe - offset
             if self.indexer is not None:
+                projected_pools = None
+                if pool_ranges is not None and (row, start, end) in pool_ranges:
+                    pool_start, pool_count = pool_ranges[row, start, end]
+                    projected_pools = pooled_keys[
+                        None, pool_start:pool_start + pool_count
+                    ]
                 selected = kpool_indices(
                     self.indexer,
                     None,
@@ -724,20 +866,22 @@ def npu_dsa_forward(
                         if index_gate is not None
                         else None
                     ),
+                    projected_pools=projected_pools,
                 )
                 indices[row : row + 1, ls:le] = torch.where(
                     selected >= 0, selected + start, selected
                 )
-            selected = indices[row, ls:le]
-            selected = torch.where(selected >= 0, selected - start, selected)
-            # Compact valid tokens before -1 padding. Only the forward honors
-            # the sentinel; the backward wrapper limits its fused prefix.
-            # INT32 Sort uses AICPU on the tested NPU stack. FP32 token IDs
-            # are exact for this context and select the AI Core sort path.
-            selected = selected.masked_fill(
-                selected < 0, qe - start
-            ).float().sort(-1).values.to(selected.dtype)
-            selected = selected.masked_fill(selected == qe - start, -1)
+                # kpool_indices already returns sorted, segment-local IDs.
+                selected = selected.squeeze(0)
+            else:
+                selected = indices[row, ls:le]
+                selected = torch.where(selected >= 0, selected - start, selected)
+                # A shared layer may receive unsorted reference-fallback IDs.
+                # Keep this compatibility path; full layers sort only K/p IDs.
+                selected = selected.masked_fill(
+                    selected < 0, qe - start
+                ).float().sort(-1).values.to(selected.dtype)
+                selected = selected.masked_fill(selected == qe - start, -1)
             selected = selected.unsqueeze(1).contiguous()
             # Match the right-aligned causal offset to this rank's Q slice.
             kv = latent[row, start:qe, None].contiguous()

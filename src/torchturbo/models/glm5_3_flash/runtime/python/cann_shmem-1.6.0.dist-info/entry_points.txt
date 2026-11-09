@@ -1,0 +1,2 @@
+[console_scripts]
+shmem-config = shmem.shmem_config:main

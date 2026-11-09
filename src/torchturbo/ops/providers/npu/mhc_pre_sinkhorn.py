@@ -1,8 +1,11 @@
-"""Training-only BSND mHC pre + Sinkhorn, using the wheel's autograd API.
+"""Training-only BSND mHC pre + Sinkhorn, using dsv41exp's autograd API.
 
 The Python wheel and the ACLNN forward/backward libraries are separate
 dependencies. Probe both before selecting this optional provider. Kernel
 execution errors are deliberately allowed to propagate.
+
+The Premix kernel implements the current layer's ordinary mHC pre when
+premix=None. Its extra h_pre output is not connected across decoder layers.
 """
 
 from __future__ import annotations
@@ -38,10 +41,10 @@ def _check_aclnn_libraries():
         libraries.extend(str(Path(home) / "lib64" / name) for name in names[1:])
     libraries.extend(str(path / "op_api/lib/libcust_opapi.so") for path in vendors)
     required = {
-        "aclnnMhcPreSinkhorn",
-        "aclnnMhcPreSinkhornGetWorkspaceSize",
-        "aclnnMhcPreSinkhornBackward",
-        "aclnnMhcPreSinkhornBackwardGetWorkspaceSize",
+        "aclnnMhcPreSinkhornPremix",
+        "aclnnMhcPreSinkhornPremixGetWorkspaceSize",
+        "aclnnMhcPreSinkhornPremixBackward",
+        "aclnnMhcPreSinkhornPremixBackwardGetWorkspaceSize",
     }
     for library in dict.fromkeys(libraries):
         try:
@@ -58,17 +61,33 @@ def _check_aclnn_libraries():
 def _mhc_runtime():
     try:
         _check_aclnn_libraries()
-        # Do not use the package's top-level torch.ops handle (eight outputs,
-        # no autograd). This submodule exports the three-output Python wrapper.
+        # Use the Python autograd wrapper, not the raw eight-output binding.
+        # Preload backward as well before advertising training availability.
         forward = importlib.import_module(
-            "cann_ops_transformer.ops.mhc.mhc_pre_sinkhorn.mhc_pre_sinkhorn"
+            "cann_ops_transformer_dsv41exp.ops.mhc.mhc_pre_sinkhorn_premix.mhc_pre_sinkhorn_premix"
         )
         backward = importlib.import_module(
-            "cann_ops_transformer.ops.mhc.mhc_pre_sinkhorn_backward.mhc_pre_sinkhorn_backward"
+            "cann_ops_transformer_dsv41exp.ops.mhc.mhc_pre_sinkhorn_premix_backward.mhc_pre_sinkhorn_premix_backward"
         )
-        forward.mhc_pre_sinkhorn_op_builder.load(verbose=False)
-        backward.mhc_pre_sinkhorn_backward_op_builder.load(verbose=False)
-        return forward.mhc_pre_sinkhorn, None
+        forward.mhc_pre_sinkhorn_premix_op_builder.load(verbose=False)
+        backward.mhc_pre_sinkhorn_premix_backward_op_builder.load(verbose=False)
+
+        def mhc_pre_sinkhorn(x, phi, alpha, bias, hc_mult, num_iters, *, hc_eps, norm_eps):
+            # None keeps pre weights local to this call. The model consumes
+            # hin, h_post and h_res; h_pre is only needed for cross-layer premix.
+            return forward.mhc_pre_sinkhorn_premix(
+                x,
+                phi,
+                alpha,
+                bias,
+                premix=None,
+                hc_mult=hc_mult,
+                num_iters=num_iters,
+                hc_eps=hc_eps,
+                norm_eps=norm_eps,
+            )[:3]
+
+        return mhc_pre_sinkhorn, None
     except (ImportError, AttributeError, OSError, RuntimeError) as error:
         return None, f"{type(error).__name__}: {error}"
 

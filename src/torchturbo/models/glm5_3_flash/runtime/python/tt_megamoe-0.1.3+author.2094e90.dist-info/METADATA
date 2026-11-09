@@ -1,0 +1,8 @@
+Metadata-Version: 2.1
+Name: tt-megamoe
+Version: 0.1.3+author.2094e90
+Summary: Author 2094e90 routing; compile allocator before use
+Requires-Python: >=3.11,<3.12
+Requires-Dist: cann-shmem==1.6.0
+Requires-Dist: torch==2.10.0
+Requires-Dist: torch-npu==2.10.0.post4

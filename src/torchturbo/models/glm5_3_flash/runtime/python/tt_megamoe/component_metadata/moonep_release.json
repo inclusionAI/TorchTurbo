@@ -1,0 +1,50 @@
+{
+  "source_commit": "2094e90519b7efe77825306abf34d17a0b8de31b",
+  "prebuilt_commit": "587b96daff767b864f6b67ed5c16a1d0b120363f",
+  "build_required": "moonep/_a3_allocator.so",
+  "source_wheel_sha256": "30c41d766791c04fbb59be813b38ce68ca266aafbfa1aaf3a49d780c2095d2fd",
+  "native_payloads": {
+    "_moonep_shared_bridge.so": {
+      "source_sha256": "807b6394c00f5c216a93b072b53eb55e846a086e9202bca2220e716a3d87d63d",
+      "sha256": "736357f00243bf289b9d1a98fb7fbbaa12c14af01c29deb4389ab498cca9039b"
+    },
+    "libmoonep_shared_kernels.so": {
+      "source_sha256": "c0e17265b82981b6a1f07d810f62378fc1527d55cd5eaa301dc7e088e21cd241",
+      "sha256": "c4b6f183f5219b1e745148ce69e8f2b17be38188de81f9a9e3f195bf68138242"
+    }
+  },
+  "all_native_payloads": {
+    "lib/framework/torch/libmega_moe_torch.so": {
+      "source_sha256": "d67a2294301f4a43b96c1a93e37bb1d758466bb70b7ca45ad01620529c379dce",
+      "sha256": "d67a2294301f4a43b96c1a93e37bb1d758466bb70b7ca45ad01620529c379dce"
+    },
+    "lib/vendors/mega_moe/op_api/lib/libcust_opapi.so": {
+      "source_sha256": "99d494ebf8a677dfbb4c49ca302ea2668fa5255e227b723a92a6c1513874c4bb",
+      "sha256": "99d494ebf8a677dfbb4c49ca302ea2668fa5255e227b723a92a6c1513874c4bb"
+    },
+    "lib/vendors/mega_moe/op_impl/ai_core/tbe/op_tiling/liboptiling.so": {
+      "source_sha256": "288255042e28129901b2c008e30c8fc0247851712b4a6717721bddb9ee1e8408",
+      "sha256": "288255042e28129901b2c008e30c8fc0247851712b4a6717721bddb9ee1e8408"
+    },
+    "lib/vendors/mega_moe/op_impl/ai_core/tbe/op_tiling/lib/linux/aarch64/libcust_opmaster_rt2.0.so": {
+      "source_sha256": "288255042e28129901b2c008e30c8fc0247851712b4a6717721bddb9ee1e8408",
+      "sha256": "288255042e28129901b2c008e30c8fc0247851712b4a6717721bddb9ee1e8408"
+    },
+    "lib/vendors/mega_moe/op_proto/lib/linux/aarch64/libcust_opsproto_rt2.0.so": {
+      "source_sha256": "c7212dfeea89311a818d1ea047d171ecd55a922bd24ce85e72eb75a4945e268e",
+      "sha256": "c7212dfeea89311a818d1ea047d171ecd55a922bd24ce85e72eb75a4945e268e"
+    },
+    "moonep/_moonep_shared_bridge.so": {
+      "source_sha256": "807b6394c00f5c216a93b072b53eb55e846a086e9202bca2220e716a3d87d63d",
+      "sha256": "736357f00243bf289b9d1a98fb7fbbaa12c14af01c29deb4389ab498cca9039b"
+    },
+    "moonep/libmoonep_shared_kernels.so": {
+      "source_sha256": "c0e17265b82981b6a1f07d810f62378fc1527d55cd5eaa301dc7e088e21cd241",
+      "sha256": "c4b6f183f5219b1e745148ce69e8f2b17be38188de81f9a9e3f195bf68138242"
+    }
+  },
+  "routing_sources": {
+    "a3_allocator.asc": "328c9b8ea94a9bf753c4e2854bfe49c4f87a1cdaa22497b1b82767c915b79628",
+    "routing_kernels.h": "ab9d132d827f0ad48d2c7df10610d47b22daa9fc2a98c7a536863193bb01e598"
+  }
+}

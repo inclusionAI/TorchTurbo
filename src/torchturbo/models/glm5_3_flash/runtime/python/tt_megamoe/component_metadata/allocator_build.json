@@ -1,0 +1,14 @@
+{
+  "source_commit": "2094e90519b7efe77825306abf34d17a0b8de31b",
+  "routing_sources": {
+    "a3_allocator.asc": "328c9b8ea94a9bf753c4e2854bfe49c4f87a1cdaa22497b1b82767c915b79628",
+    "routing_kernels.h": "ab9d132d827f0ad48d2c7df10610d47b22daa9fc2a98c7a536863193bb01e598"
+  },
+  "cann": "/usr/local/Ascend/cann-9.1.0",
+  "compiler": "/usr/local/Ascend/ascend-toolkit/latest/bin/bisheng",
+  "versions": {
+    "torch": "2.10.0",
+    "torch-npu": "2.10.0.post4"
+  },
+  "sha256": "56bbc6249d24b80ddeecc2114a6df0f26392ffeafa780cfe14c09300c6844684"
+}

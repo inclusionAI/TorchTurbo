@@ -1,0 +1,502 @@
+{
+  "MegaMoe": {
+    "dynamicRankSupport": true,
+    "simplifiedKeyMode": 0,
+    "optionalInputMode": "gen_placeholder",
+    "optionalOutputMode": "gen_placeholder",
+    "params": {
+      "inputs": [
+        {
+          "name": "dispatch_target",
+          "index": 0,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "dispatch_target_off",
+          "index": 1,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "dispatch_src",
+          "index": 2,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "dispatch_src_off",
+          "index": 3,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "dispatch_size",
+          "index": 4,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "weight",
+          "index": 5,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "up_proj_glist",
+          "index": 6,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "y",
+          "index": 7,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "swiglu_out",
+          "index": 8,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "down_proj_weight",
+          "index": 9,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "down_proj_glist",
+          "index": 10,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "down_proj_y",
+          "index": 11,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "combine_target",
+          "index": 12,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "combine_target_off",
+          "index": 13,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "combine_src_off",
+          "index": 14,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "combine_size",
+          "index": 15,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "gmm_workspace",
+          "index": 16,
+          "paramType": "optional",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "up_proj_tiling",
+          "index": 17,
+          "paramType": "optional",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "swiglu_tiling",
+          "index": 18,
+          "paramType": "optional",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "down_proj_tiling",
+          "index": 19,
+          "paramType": "optional",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "runtime_config",
+          "index": 20,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "all_event_counters",
+          "index": 21,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "profile_buffer",
+          "index": 22,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "dispatch_target",
+          "index": 0,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "y",
+          "index": 1,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "swiglu_out",
+          "index": 2,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "down_proj_y",
+          "index": 3,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "combine_target",
+          "index": 4,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        }
+      ],
+      "attrs": [
+        {
+          "name": "rank_id"
+        },
+        {
+          "name": "ep"
+        },
+        {
+          "name": "expert_num"
+        },
+        {
+          "name": "hidden_size"
+        },
+        {
+          "name": "seq_size"
+        }
+      ]
+    },
+    "binaryList": [
+      {
+        "coreType": 0,
+        "simplifiedKey": [
+          "MegaMoe/d=0,p=1/1,2/9,2/1,2/9,2/3,2/1,2/9,2/1,2/1,2/1,2/9,2/1,2/1,2/9,2/9,2/3,2/4,2/4,2/4,2/1,2/1,2/1,2/1,2/1,2",
+          "MegaMoe/d=0,p=0/1,2/9,2/1,2/9,2/3,2/1,2/9,2/1,2/1,2/1,2/9,2/1,2/1,2/9,2/9,2/3,2/4,2/4,2/4,2/1,2/1,2/1,2/1,2/1,2",
+          "MegaMoe/d=1,p=1/1,2/9,2/1,2/9,2/3,2/1,2/9,2/1,2/1,2/1,2/9,2/1,2/1,2/9,2/9,2/3,2/4,2/4,2/4,2/1,2/1,2/1,2/1,2/1,2",
+          "MegaMoe/d=1,p=0/1,2/9,2/1,2/9,2/3,2/1,2/9,2/1,2/1,2/1,2/9,2/1,2/1,2/9,2/9,2/3,2/4,2/4,2/4,2/1,2/1,2/1,2/1,2/1,2"
+        ],
+        "multiKernelType": 1,
+        "binPath": "ascend910_93/mega_moe/MegaMoe_1429a246f224b9661bab67dea75d68ec.o",
+        "jsonPath": "ascend910_93/mega_moe/MegaMoe_1429a246f224b9661bab67dea75d68ec.json"
+      },
+      {
+        "coreType": 0,
+        "simplifiedKey": [
+          "MegaMoe/d=0,p=1/27,2/9,2/27,2/9,2/3,2/27,2/9,2/27,2/27,2/27,2/9,2/27,2/27,2/9,2/9,2/3,2/4,2/4,2/4,2/27,2/27,2/27,2/27,2/27,2",
+          "MegaMoe/d=0,p=0/27,2/9,2/27,2/9,2/3,2/27,2/9,2/27,2/27,2/27,2/9,2/27,2/27,2/9,2/9,2/3,2/4,2/4,2/4,2/27,2/27,2/27,2/27,2/27,2",
+          "MegaMoe/d=1,p=1/27,2/9,2/27,2/9,2/3,2/27,2/9,2/27,2/27,2/27,2/9,2/27,2/27,2/9,2/9,2/3,2/4,2/4,2/4,2/27,2/27,2/27,2/27,2/27,2",
+          "MegaMoe/d=1,p=0/27,2/9,2/27,2/9,2/3,2/27,2/9,2/27,2/27,2/27,2/9,2/27,2/27,2/9,2/9,2/3,2/4,2/4,2/4,2/27,2/27,2/27,2/27,2/27,2"
+        ],
+        "multiKernelType": 1,
+        "binPath": "ascend910_93/mega_moe/MegaMoe_97e6cd425ff741083663d424e114cf99.o",
+        "jsonPath": "ascend910_93/mega_moe/MegaMoe_97e6cd425ff741083663d424e114cf99.json"
+      }
+    ]
+  },
+  "MegaMoeGrad": {
+    "dynamicRankSupport": true,
+    "simplifiedKeyMode": 0,
+    "optionalInputMode": "gen_placeholder",
+    "optionalOutputMode": "gen_placeholder",
+    "params": {
+      "inputs": [
+        {
+          "name": "dispatch_target",
+          "index": 0,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "dispatch_target_off",
+          "index": 1,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "dy",
+          "index": 2,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "dispatch_src_off",
+          "index": 3,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "dispatch_size",
+          "index": 4,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "hidden",
+          "index": 5,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "hidden_dw",
+          "index": 6,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "weight",
+          "index": 7,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "y",
+          "index": 8,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "gate",
+          "index": 9,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "grad_gate",
+          "index": 10,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "w1",
+          "index": 11,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "gate_dx",
+          "index": 12,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "grad_x",
+          "index": 13,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "combine_target_off",
+          "index": 14,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "combine_src_off",
+          "index": 15,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "combine_size",
+          "index": 16,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "permute_out",
+          "index": 17,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "gate_dw",
+          "index": 18,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "group_list",
+          "index": 19,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "act_grad_tiling",
+          "index": 20,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "gate_grad_tiling",
+          "index": 21,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "w1_grad_tiling",
+          "index": 22,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "w2_grad_tiling",
+          "index": 23,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "swiglu_grad_tiling",
+          "index": 24,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "gmm_workspace",
+          "index": 25,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "swiglu_grad_workspace",
+          "index": 26,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "runtime_config",
+          "index": 27,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "all_event_counters",
+          "index": 28,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "profile_buffer",
+          "index": 29,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "dispatch_target",
+          "index": 0,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "hidden_dw",
+          "index": 1,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "y",
+          "index": 2,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "grad_gate",
+          "index": 3,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "gate_dx",
+          "index": 4,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "grad_x",
+          "index": 5,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "gate_dw",
+          "index": 6,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        }
+      ],
+      "attrs": [
+        {
+          "name": "rank_id"
+        },
+        {
+          "name": "ep"
+        },
+        {
+          "name": "expert_num"
+        },
+        {
+          "name": "hidden_size"
+        },
+        {
+          "name": "seq_size"
+        }
+      ]
+    },
+    "binaryList": [
+      {
+        "coreType": 0,
+        "simplifiedKey": [
+          "MegaMoeGrad/d=0,p=1/27,2/9,2/27,2/9,2/3,2/27,2/27,2/27,2/27,2/27,2/27,2/27,2/27,2/27,2/9,2/9,2/3,2/27,2/27,2/9,2/4,2/4,2/4,2/4,2/4,2/4,2/4,2/4,2/4,2/4,2/27,2/27,2/27,2/27,2/27,2/27,2/27,2",
+          "MegaMoeGrad/d=0,p=0/27,2/9,2/27,2/9,2/3,2/27,2/27,2/27,2/27,2/27,2/27,2/27,2/27,2/27,2/9,2/9,2/3,2/27,2/27,2/9,2/4,2/4,2/4,2/4,2/4,2/4,2/4,2/4,2/4,2/4,2/27,2/27,2/27,2/27,2/27,2/27,2/27,2",
+          "MegaMoeGrad/d=1,p=1/27,2/9,2/27,2/9,2/3,2/27,2/27,2/27,2/27,2/27,2/27,2/27,2/27,2/27,2/9,2/9,2/3,2/27,2/27,2/9,2/4,2/4,2/4,2/4,2/4,2/4,2/4,2/4,2/4,2/4,2/27,2/27,2/27,2/27,2/27,2/27,2/27,2",
+          "MegaMoeGrad/d=1,p=0/27,2/9,2/27,2/9,2/3,2/27,2/27,2/27,2/27,2/27,2/27,2/27,2/27,2/27,2/9,2/9,2/3,2/27,2/27,2/9,2/4,2/4,2/4,2/4,2/4,2/4,2/4,2/4,2/4,2/4,2/27,2/27,2/27,2/27,2/27,2/27,2/27,2"
+        ],
+        "multiKernelType": 1,
+        "binPath": "ascend910_93/mega_moe_grad/MegaMoeGrad_aa37a4f70bf4515add87b301a34652a0.o",
+        "jsonPath": "ascend910_93/mega_moe_grad/MegaMoeGrad_aa37a4f70bf4515add87b301a34652a0.json"
+      },
+      {
+        "coreType": 0,
+        "simplifiedKey": [
+          "MegaMoeGrad/d=0,p=1/1,2/9,2/1,2/9,2/3,2/1,2/1,2/1,2/1,2/1,2/1,2/1,2/1,2/1,2/9,2/9,2/3,2/1,2/1,2/9,2/4,2/4,2/4,2/4,2/4,2/4,2/4,2/4,2/4,2/4,2/1,2/1,2/1,2/1,2/1,2/1,2/1,2",
+          "MegaMoeGrad/d=0,p=0/1,2/9,2/1,2/9,2/3,2/1,2/1,2/1,2/1,2/1,2/1,2/1,2/1,2/1,2/9,2/9,2/3,2/1,2/1,2/9,2/4,2/4,2/4,2/4,2/4,2/4,2/4,2/4,2/4,2/4,2/1,2/1,2/1,2/1,2/1,2/1,2/1,2",
+          "MegaMoeGrad/d=1,p=1/1,2/9,2/1,2/9,2/3,2/1,2/1,2/1,2/1,2/1,2/1,2/1,2/1,2/1,2/9,2/9,2/3,2/1,2/1,2/9,2/4,2/4,2/4,2/4,2/4,2/4,2/4,2/4,2/4,2/4,2/1,2/1,2/1,2/1,2/1,2/1,2/1,2",
+          "MegaMoeGrad/d=1,p=0/1,2/9,2/1,2/9,2/3,2/1,2/1,2/1,2/1,2/1,2/1,2/1,2/1,2/1,2/9,2/9,2/3,2/1,2/1,2/9,2/4,2/4,2/4,2/4,2/4,2/4,2/4,2/4,2/4,2/4,2/1,2/1,2/1,2/1,2/1,2/1,2/1,2"
+        ],
+        "multiKernelType": 1,
+        "binPath": "ascend910_93/mega_moe_grad/MegaMoeGrad_e11f418c134db668c7b9a09e34a38391.o",
+        "jsonPath": "ascend910_93/mega_moe_grad/MegaMoeGrad_e11f418c134db668c7b9a09e34a38391.json"
+      }
+    ]
+  }
+}

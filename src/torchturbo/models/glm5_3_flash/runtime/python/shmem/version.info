@@ -1,0 +1,11 @@
+SHMEM Version : 1.6.0
+Platform : aarch64
+branch : master
+commit id : aee374a396b389626f68fab74ec8c555e18978a7
+Build Timestamp : 2026-07-31 03:25:22
+Build Type : RELEASE
+SOC Type : Ascend910B
+CANN Version : 9.0.0
+RDMA Backend : XSCALE, HNS_1825
+Root Info Generate Tool : 是
+UDMA Support : 是
