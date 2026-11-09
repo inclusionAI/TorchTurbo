@@ -74,7 +74,7 @@ LOG_FILE=$OUTPUT_DIR/log-$NODE_RANK.txt
 if [ "${NODE_RANK:-0}" -eq 0 ]; then
     cp -f "$0" $OUTPUT_DIR/
 fi
-{ date "+%Y%m%d-%H%M%S"; echo "$OUTPUT_DIR"; } >> $LOG_FILE
+{ date "+%Y%m%d-%H%M%S"; echo "$OUTPUT_DIR"; } > $LOG_FILE
 
 torchrun $DISTRIBUTED_ARGS $RUN_LF \
     --tt_config ${TT_CONFIG} \
@@ -116,4 +116,4 @@ torchrun $DISTRIBUTED_ARGS $RUN_LF \
     --seed 42 \
     --bf16 \
     --ddp_timeout 1800000000 \
-    2>&1 | tee "$LOG_FILE"
+    2>&1 | tee -a "$LOG_FILE"
