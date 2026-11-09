@@ -3,7 +3,7 @@
 # Copyright (c) 2019-2025, NVIDIA CORPORATION. All rights reserved.
 # Licensed under the BSD 3-Clause License.
 
-"""PyTorch mask permutation and expert chunk sorting."""
+"""PyTorch compact permutation and expert chunk sorting."""
 
 from __future__ import annotations
 
@@ -25,34 +25,22 @@ class TorchMoEMaskPermutation(OpImpl):
     def __call__(
         self,
         tokens: torch.Tensor,
-        routing_map: torch.Tensor,
+        expert_indices: torch.Tensor,
         probs: torch.Tensor | None = None,
         num_out_tokens: int | None = None,
-        expert_indices: torch.Tensor | None = None,
     ) -> MoEPermutation:
-        """Group tokens by expert and retain the packed row of every assignment."""
-        num_tokens = tokens.shape[0]
-        num_experts = routing_map.shape[1]
-        routing_map = routing_map.bool().T.contiguous()
-        token_indices = (
-            torch.arange(num_tokens, device=routing_map.device)
-            .unsqueeze(0)
-            .expand(num_experts, -1)
-        )
-        sorted_indices = token_indices.masked_select(routing_map)
-        permuted_input = tokens.index_select(0, sorted_indices)
-        permuted_probs = None
-        if probs is not None:
-            permuted_probs = probs.T.contiguous().masked_select(routing_map)
-        packed_rows = torch.empty_like(routing_map, dtype=torch.int32)
-        packed_rows.masked_scatter_(
-            routing_map,
-            torch.arange(sorted_indices.numel(), device=tokens.device, dtype=torch.int32),
+        """Group compact assignments stably by expert, then source token."""
+        topk = expert_indices.shape[1]
+        order = expert_indices.flatten().argsort(stable=True)
+        permuted_input = tokens.index_select(0, order // topk)
+        permuted_probs = None if probs is None else probs.flatten().index_select(0, order)
+        packed_rows = torch.empty_like(order, dtype=torch.int32).scatter_(
+            0, order, torch.arange(order.numel(), device=tokens.device, dtype=torch.int32),
         )
         return MoEPermutation(
             permuted_input,
             permuted_probs,
-            packed_rows.T.gather(1, expert_indices),
+            packed_rows.view_as(expert_indices),
             expert_indices,
         )
 

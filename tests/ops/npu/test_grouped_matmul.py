@@ -6,6 +6,19 @@ import torch
 pytest.importorskip("torch_npu")
 
 from torchturbo.ops.providers.npu.grouped_matmul import TorchNpuGroupedMatmul
+from torchturbo.ops.providers.npu.matmul_add import TorchNpuMatmulAdd
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_low_precision_wgrad_preserves_fp32_accumulation(dtype):
+    generator = torch.Generator().manual_seed(73)
+    x = torch.randn(128, 32, generator=generator).to(dtype)
+    dy = torch.randn(128, 48, generator=generator).to(dtype)
+    accumulator = torch.zeros(32, 48, dtype=torch.float32, device="npu")
+    TorchNpuMatmulAdd()(accumulator, x.to("npu"), dy.to("npu"), transpose_lhs=True)
+    expected = (x.double().T @ dy.double()).float()
+    torch.testing.assert_close(accumulator.cpu(), expected, atol=2e-4, rtol=1e-5)
+    assert (accumulator.cpu() - expected.to(dtype).float()).abs().max() > 1e-3
 
 
 def _reference_forward(

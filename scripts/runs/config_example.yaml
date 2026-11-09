@@ -116,7 +116,10 @@ engine_config:
   moe:
     aux_loss_coeff: 0.0
     z_loss_coeff: 0.0
+    # alltoall (default) or flex.
     token_dispatcher: alltoall
+    # Replicate hot experts across EP ranks when token_dispatcher is flex.
+    virtual_expert_load_balance: false
 
   mtp:
     enabled: false

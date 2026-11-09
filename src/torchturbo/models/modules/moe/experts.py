@@ -6,6 +6,7 @@
   #
   # Modified by the TorchTurbo contributors.
 
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 import torch
@@ -18,6 +19,7 @@ from torchturbo.logging import get_logger
 
 if TYPE_CHECKING:
     from torchturbo.engine.optimizers import MuonParameterSpec
+    from .virtual_expert_load_balancer import VirtualExpertLoadBalancer
 
 logger = get_logger(__name__)
 
@@ -30,6 +32,49 @@ except ImportError:
 def transformer_engine_is_available():
     """Check if transformer_engine is available."""
     return GroupedLinear is not None
+
+
+class _VirtualExpertLinear(torch.autograd.Function):
+    """Deliver unrounded weight gradients to this execution's FC readiness gate."""
+
+    @staticmethod
+    def forward(ctx, hidden, weight, counts, weight_grads, fc_layer):
+        ctx.save_for_backward(hidden, weight)
+        ctx.counts, ctx.weight_grads, ctx.fc_layer = counts, weight_grads, fc_layer
+        if hidden.shape[0] == 0:
+            return hidden.new_empty((0, weight.shape[-1]))
+        return ops.grouped_matmul(hidden, weight, counts, trans_b=False)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        hidden, weight = ctx.saved_tensors
+        grad_hidden = None
+        # Autograd supplies the forward output dtype in grad_output. Recreate
+        # its AMP operands here without retaining copies of shared weight slots.
+        with torch.autocast(device_type=grad_output.device.type, enabled=False):
+            if ctx.needs_input_grad[0]:
+                grad_hidden = (
+                    ops.grouped_matmul(
+                        grad_output, weight.to(grad_output.dtype), ctx.counts, trans_b=True,
+                    )
+                    if hidden.shape[0] else torch.empty_like(hidden)
+                )
+            if ctx.needs_input_grad[1]:
+                dtype = torch.float32 if weight.dtype in (torch.float16, torch.bfloat16) else weight.dtype
+                grad_weight = torch.zeros(weight.shape, dtype=dtype, device=weight.device)
+                start = 0
+                for expert, count in enumerate(ctx.counts.tolist()):
+                    end = start + count
+                    if count:
+                        ops.matmul_add(
+                            grad_weight[expert], hidden[start:end].to(grad_output.dtype),
+                            grad_output[start:end], transpose_lhs=True,
+                        )
+                    start = end
+                ctx.weight_grads[ctx.fc_layer] = grad_weight
+        # Returning wgrad through the BF16 weight input would round it before
+        # replica reduction. The FC gate consumes the recorded tensor instead.
+        return grad_hidden, None, None, None, None
 
 
 class GroupedMLP(torch.nn.Module):
@@ -46,7 +91,22 @@ class GroupedMLP(torch.nn.Module):
         layer_number: int = None,
     ):
         super().__init__()
+        if config.moe_virtual_expert_load_balance and use_te:
+            raise ValueError(
+                "Virtual-expert load balancing does not support TE experts; "
+                "use fused-weight GroupedMLP."
+            )
         self.config = config
+        self._runtime_weights: tuple[
+            tuple[torch.Tensor, torch.Tensor | None], ...
+        ] | None = None
+        self._runtime_weight_grads: tuple[
+            list[torch.Tensor | None], list[torch.Tensor | None],
+        ] | None = None
+        self._runtime_weight_hook: Callable[
+            [int, torch.Tensor, torch.Tensor],
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+        ] | None = None
         self.num_local_experts = num_local_experts
         self.layer_number = layer_number
         limit_list = getattr(config, "moe_swiglu_limit", None)
@@ -185,6 +245,15 @@ class GroupedMLP(torch.nn.Module):
         hidden_states = self.activation_func(hidden_states)
         return (hidden_states * probs).to(hidden_states.dtype)
 
+    def bind_virtual_experts(self, load_balancer: "VirtualExpertLoadBalancer") -> None:
+        """Bind native and replica FC weights without registering new parameters."""
+        self._runtime_weights = (
+            load_balancer.runtime_weights(0),
+            load_balancer.runtime_weights(1),
+        )
+        self._runtime_weight_grads = load_balancer.runtime_weight_grads()
+        self._runtime_weight_hook = load_balancer.prepare_fc_weights
+
     def forward(
         self,
         permuted_local_hidden_states: torch.Tensor,
@@ -192,6 +261,13 @@ class GroupedMLP(torch.nn.Module):
         permuted_probs: torch.Tensor,
     ) -> tuple[torch.Tensor, None]:
         """Apply routing probabilities inside each expert before its second linear."""
+        replica1 = replica2 = None
+        if not (transformer_engine_is_available() and self.use_te):
+            if self._runtime_weights is not None:
+                (w1, replica1), (w2, replica2) = self._runtime_weights
+            else:
+                w1 = self.weight1.view(self.num_local_experts, self.config.hidden_size, -1)
+                w2 = self.weight2.view(self.num_local_experts, -1, self.config.hidden_size)
         if self.config.moe_apply_probs_on_input:
             assert (
                 self.config.moe_router_topk == 1
@@ -233,34 +309,77 @@ class GroupedMLP(torch.nn.Module):
 
             # Second grouped linear: fc2_input_size -> hidden_size
             fc2_output = self.fc2_linear(intermediate_parallel, m_splits)
-        elif permuted_local_hidden_states.nelement() != 0:
-            # Fall back to the grouped_matmul op registry.
-            # Reshape the weights for the grouped GEMMs.
-            w1 = self.weight1.view(
-                self.num_local_experts, self.config.hidden_size, -1
-            )
-            w2 = self.weight2.view(
-                self.num_local_experts, -1, self.config.hidden_size
-            )
-
-            fc1_output = ops.grouped_matmul(
-                permuted_local_hidden_states, w1, tokens_per_expert, trans_b=False
-            )
-            intermediate_parallel = self.activation_func_with_probs(
-                fc1_output, activation_probs
-            )
-            fc2_output = ops.grouped_matmul(
-                intermediate_parallel, w2, tokens_per_expert, trans_b=False
+        elif replica1 is not None:
+            fc2_output = self._forward_virtual_experts(
+                permuted_local_hidden_states, tokens_per_expert, activation_probs,
             )
         else:
-            # No token is allocated for local experts.
-            assert torch.count_nonzero(tokens_per_expert) == 0
-
-            # Make sure params of experts still have gradients even given zero tokens.
-            w1 = self.weight1.view(self.config.hidden_size, -1)
-            w2 = self.weight2.view(-1, self.config.hidden_size)
-            h = torch.matmul(permuted_local_hidden_states, w1)
-            h = self.activation_func_with_probs(h, activation_probs)
-            fc2_output = torch.matmul(h, w2)
+            fc2_output = self._forward_grouped(
+                permuted_local_hidden_states, w1, w2,
+                tokens_per_expert, activation_probs,
+            )
 
         return fc2_output, None
+
+    def _forward_virtual_experts(
+        self, hidden_states: torch.Tensor, tokens_per_expert: torch.Tensor,
+        probs: torch.Tensor,
+    ) -> torch.Tensor:
+        """Stage both expert partitions by FC to overlap FC2 reduction with FC1."""
+        native_counts = tokens_per_expert[:self.num_local_experts]
+        num_native_tokens = int(native_counts.sum())
+        hidden_states, probs, native, replica = self._runtime_weight_hook(0, hidden_states, probs)
+        replica_counts = tokens_per_expert[
+            self.num_local_experts:self.num_local_experts + replica.shape[0]
+        ]
+        fc1 = torch.cat((
+            self._forward_linear(hidden_states[:num_native_tokens], native, native_counts,
+                                 self._runtime_weight_grads[0], 0),
+            self._forward_linear(hidden_states[num_native_tokens:], replica, replica_counts,
+                                 self._runtime_weight_grads[1], 0),
+        ), dim=0)
+        intermediate = self.activation_func_with_probs(fc1, probs)
+        intermediate, _, native, replica = self._runtime_weight_hook(1, intermediate, probs)
+        return torch.cat((
+            self._forward_linear(intermediate[:num_native_tokens], native, native_counts,
+                                 self._runtime_weight_grads[0], 1),
+            self._forward_linear(intermediate[num_native_tokens:], replica, replica_counts,
+                                 self._runtime_weight_grads[1], 1),
+        ), dim=0)
+
+    def _forward_linear(
+        self, hidden_states: torch.Tensor, weights: torch.Tensor, counts: torch.Tensor,
+        weight_grads: list[torch.Tensor | None], fc_layer: int,
+    ) -> torch.Tensor:
+        """Apply one FC, retaining native zero gradients for an empty partition."""
+        return _VirtualExpertLinear.apply(hidden_states, weights, counts, weight_grads, fc_layer)
+
+    def _forward_grouped(
+        self, hidden_states: torch.Tensor,
+        weight1: torch.Tensor, weight2: torch.Tensor,
+        tokens_per_expert: torch.Tensor, probs: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute native or compact replica experts through the shared ops."""
+        if weight1.shape[0] == 0:
+            # No replica slots means no replica tokens. Skip kernels with zero
+            # experts; weight exchange already links these hidden states
+            # to the weight-exchange backward.
+            return hidden_states
+        if hidden_states.nelement() != 0:
+            fc1_output = ops.grouped_matmul(
+                hidden_states, weight1, tokens_per_expert, trans_b=False
+            )
+            intermediate_parallel = self.activation_func_with_probs(
+                fc1_output, probs
+            )
+            return ops.grouped_matmul(
+                intermediate_parallel, weight2, tokens_per_expert, trans_b=False
+            )
+
+        assert torch.count_nonzero(tokens_per_expert) == 0
+        # Preserve parameter gradients when no token is allocated to this group.
+        weight1 = weight1.reshape(self.config.hidden_size, -1)
+        weight2 = weight2.reshape(-1, self.config.hidden_size)
+        hidden_states = torch.matmul(hidden_states, weight1)
+        hidden_states = self.activation_func_with_probs(hidden_states, probs)
+        return torch.matmul(hidden_states, weight2)

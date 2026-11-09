@@ -97,6 +97,17 @@ class DeviceRuntime(ABC):
             f"{type(self).__name__} does not implement memory_allocated()."
         )
 
+    def allocate_communication_buffer(
+        self,
+        numel: int,
+        *,
+        dtype: torch.dtype,
+        device: torch.device,
+        group: torch.distributed.ProcessGroup | None,
+    ) -> tuple[torch.Tensor, object | None]:
+        """Allocate an arena and optional peer mapping; default to local memory."""
+        return torch.empty(numel, dtype=dtype, device=device), None
+
     @abstractmethod
     def stream(self, stream=None):
         ...

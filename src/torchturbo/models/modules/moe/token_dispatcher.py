@@ -13,12 +13,13 @@ import torch
 import torch.distributed as dist
 
 from torchturbo.ops import ops
-from torchturbo.ops.moe import MoEPermutation
+from torchturbo.ops.moe import HybridEPHandle, HybridEPMetadata, MoEPermutation, get_expert_indices
 from torchturbo.runtime import get_device_runtime
 
 from ..comm.comm import all_to_all, gather_from_sequence_parallel_region
 from .moe_config import MoEConfig
 from .utils import maybe_move_tensor_to_cpu
+from .virtual_expert_load_balancer import VirtualExpertLoadBalancer
 
 
 class MoETokenDispatcher(ABC):
@@ -28,6 +29,17 @@ class MoETokenDispatcher(ABC):
         self.config = config
         self.ep_size = config.expert_model_parallel_size or 1
         self.ep_group = ep_group
+
+    def wrap_layer_input(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Return the layer input unchanged."""
+        return hidden_states
+
+    def finalize_layer_output(self, output: torch.Tensor) -> torch.Tensor:
+        """Return the layer output unchanged."""
+        return output
+
+    def release_routing_state(self) -> None:
+        """Release per-forward routing tensors after combine or recompute early exit."""
 
     @abstractmethod
     def dispatch_preprocess(
@@ -122,10 +134,14 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         self.input_splits: torch.Tensor | np.ndarray | None = None
         self.output_splits: torch.Tensor | np.ndarray | None = None
 
-    def preprocess(self, routing_map: torch.Tensor) -> torch.Tensor:
+    def preprocess(self, expert_indices: torch.Tensor) -> torch.Tensor:
         """Compute device counts and split sizes without copying them to CPU."""
         # Source counts are ordered by destination rank, then expert.
-        local_counts = routing_map.sum(dim=0).long()
+        local_counts = torch.zeros(
+            self.num_experts, device=expert_indices.device, dtype=torch.long,
+        ).scatter_add_(
+            0, expert_indices.flatten(), torch.ones_like(expert_indices).flatten(),
+        )
         self.input_splits = None
         self.output_splits = None
         if self.ep_size > 1:
@@ -155,18 +171,18 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         expert_indices: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Group source tokens and probabilities for weighting inside the experts."""
+        if expert_indices is None:
+            expert_indices = get_expert_indices(routing_map).view(
+                routing_map.shape[0], self.config.moe_router_topk,
+            )
+        probs = probs.gather(1, expert_indices)
         self.hidden_shape = hidden_states.shape
-        assert probs.dim() == 2, "Expected 2D tensor for probs"
-        assert routing_map.dim() == 2, "Expected 2D tensor for token2expert mask"
-        assert routing_map.dtype == torch.bool, "Expected bool tensor for mask"
-        self.tokens_per_expert = self.preprocess(routing_map)
+        self.tokens_per_expert = self.preprocess(expert_indices)
         hidden_states = hidden_states.view(-1, self.hidden_shape[-1])
         self.hidden_shape_before_permute = hidden_states.shape
         self._maybe_dtoh_and_synchronize("before_permutation_1")
         permutation = ops.moe_permutation(
-            hidden_states, routing_map, probs=probs,
-            num_out_tokens=routing_map.size(0) * self.config.moe_router_topk,
-            expert_indices=expert_indices,
+            hidden_states, expert_indices, probs=probs,
         )
         # Retain only inverse metadata across expert communication; the source
         # packed activations and weights need not stay alive until combine.
@@ -231,9 +247,13 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             permutation, restore_shape=self.hidden_shape_before_permute,
         )
         output = output.view(self.hidden_shape)
+        self.release_routing_state()
+        return output
+
+    def release_routing_state(self) -> None:
         self.permutation_row_indices = None
         self.permutation_expert_indices = None
-        return output
+        self.num_global_tokens_per_local_expert = None
 
     def _maybe_dtoh_and_synchronize(self, point: str) -> None:
         if point == "before_permutation_1":
@@ -257,3 +277,296 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
                 )
         if point == self.sync_point:
             self.device_runtime.synchronize_stream(self.dtoh_stream)
+
+
+class _DispatchManager(ABC):
+    """A manager class to handle dispatch and combine processes for MoEFlexTokenDispatcher."""
+
+    @abstractmethod
+    def setup_metadata(
+        self,
+        routing_map: torch.Tensor,
+        probs: torch.Tensor,
+    ) -> None:
+        """Set up metadata of routing_map and probs."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def dispatch(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Permute hidden_states and dispatch according to the routing metadata."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_permuted_hidden_states_by_experts(
+        self, hidden_states: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Get the permuted hidden states and probabilities by local experts."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_restored_hidden_states_by_experts(
+        self, hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        """Restore the hidden states by local experts."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def combine(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Combine and unpermute the hidden states after expert processing."""
+        raise NotImplementedError
+
+    def wrap_layer_input(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Return the layer input unchanged."""
+        return hidden_states
+
+    def finalize_layer_output(self, output: torch.Tensor) -> torch.Tensor:
+        """Return the layer output unchanged."""
+        return output
+
+    def release_routing_state(self) -> None:
+        """Release per-forward routing tensors after combine or recompute early exit."""
+
+
+class _HybridEPManager(_DispatchManager):
+    """Manager class for token distribution using HybridEP backend."""
+
+    def __init__(
+        self,
+        group: dist.ProcessGroup,
+        num_local_experts: int,
+        num_experts: int,
+        router_topk: int,
+        config: MoEConfig,
+    ) -> None:
+        self.group = group
+        self.num_local_experts = num_local_experts
+        self.num_experts = num_experts
+        self.router_topk = router_topk
+        self.config = config
+
+        self.routing_map: torch.Tensor | None = None
+        self.token_probs: torch.Tensor | None = None
+        self.dispatched_probs: torch.Tensor | None = None
+        self.tokens_per_expert: torch.Tensor | None = None
+        self.handle: HybridEPHandle | None = None
+
+    def setup_metadata(
+        self,
+        routing_map: torch.Tensor,
+        probs: torch.Tensor,
+    ) -> None:
+        self.routing_map = routing_map
+        self.token_probs = probs
+
+    def dispatch(
+        self, hidden_states: torch.Tensor, *,
+        dispatch_context: HybridEPMetadata | None = None,
+    ) -> torch.Tensor:
+        routing_map, self.routing_map = self.routing_map, None
+        token_probs, self.token_probs = self.token_probs, None
+        (
+            dispatched_hidden,
+            self.dispatched_probs,
+            self.tokens_per_expert,
+            self.handle,
+        ) = ops.hybrid_ep_dispatch(
+            hidden_states,
+            routing_map,
+            token_probs,
+            self.group,
+            self.num_local_experts,
+            self.router_topk,
+            dispatch_context=dispatch_context,
+        )
+        return dispatched_hidden
+
+    def combine(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        hidden_states = ops.hybrid_ep_combine(hidden_states, self.handle)
+        # Layer finalization still needs the virtual-expert execution state.
+        _HybridEPManager.release_routing_state(self)
+        return hidden_states
+
+    def release_routing_state(self) -> None:
+        self.routing_map = None
+        self.token_probs = None
+        self.dispatched_probs = None
+        self.handle = None
+
+    def get_permuted_hidden_states_by_experts(
+        self, hidden_states: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return hidden_states, self.dispatched_probs
+
+    def get_restored_hidden_states_by_experts(
+        self, hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        return hidden_states
+
+    def get_number_of_tokens_per_expert(self) -> torch.Tensor:
+        return self.tokens_per_expert
+
+
+class _VirtualExpertHybridEPManager(VirtualExpertLoadBalancer, _HybridEPManager):
+    """Glue virtual-expert load balancing onto the HybridEP transport."""
+
+    def __init__(
+        self,
+        group: dist.ProcessGroup,
+        num_local_experts: int,
+        num_experts: int,
+        config: MoEConfig,
+        router_topk: int | None = None,
+    ) -> None:
+        router_topk = router_topk if router_topk is not None else config.moe_router_topk
+        self.initialize_virtual_expert_load_balancer(
+            group=group,
+            num_local_experts=num_local_experts,
+            router_topk=router_topk,
+            num_experts=num_experts,
+            config=config,
+        )
+        super().__init__(
+            group=group,
+            num_local_experts=self.num_runtime_experts,
+            num_experts=self.ep_size * self.num_runtime_experts,
+            router_topk=router_topk,
+            config=config,
+        )
+
+    def setup_metadata(
+        self,
+        routing_map: torch.Tensor,
+        probs: torch.Tensor,
+        padding_mask: torch.Tensor | None = None,
+    ) -> None:
+        """Mask batch-major compact probabilities and start the virtual-expert planner."""
+        if (
+            routing_map.dtype not in (torch.int16, torch.int32, torch.int64)
+            or routing_map.ndim != 2
+            or routing_map.shape[1] != self.router_topk
+            or probs.shape != routing_map.shape
+        ):
+            raise ValueError(
+                "MoonEP requires expert IDs and probabilities shaped [tokens, topk]."
+            )
+        if padding_mask is not None:
+            if padding_mask.numel() != routing_map.shape[0]:
+                raise ValueError("MoonEP padding_mask must contain one entry per token.")
+            probs = probs.masked_fill(padding_mask.reshape(-1, 1).bool(), 0)
+        top_indices = routing_map.long()
+        self.token_probs = probs
+        self.plan_dispatch(top_indices)
+
+    def dispatch(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        hidden_states, runtime_experts = self.prepare_virtual_expert_dispatch(
+            hidden_states
+        )
+        super().setup_metadata(runtime_experts, self.token_probs)
+        return super().dispatch(
+            hidden_states, dispatch_context=self._plan.dispatch_context,
+        )
+
+    def combine(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        hidden_states = self.prepare_virtual_expert_combine(hidden_states)
+        return super().combine(hidden_states)
+
+    def release_routing_state(self) -> None:
+        super().release_routing_state()
+        if self._plan is not None:
+            self._plan.virtual_experts = None
+        self._release_virtual_experts()
+
+
+class MoEFlexTokenDispatcher(MoETokenDispatcher):
+    """Flexible token dispatcher delegating communication to _DispatchManager."""
+
+    def __init__(
+        self,
+        num_local_experts: int,
+        local_expert_indices: list[int],
+        config: MoEConfig,
+        ep_group: dist.ProcessGroup,
+    ) -> None:
+        super().__init__(config=config, ep_group=ep_group)
+        assert config.num_moe_experts is not None
+        self.num_local_experts = num_local_experts
+        self.local_expert_indices = local_expert_indices
+        self.hidden_shape: torch.Size | None = None
+        manager_cls = (
+            _VirtualExpertHybridEPManager
+            if self.config.moe_virtual_expert_load_balance
+            else _HybridEPManager
+        )
+        self._comm_manager: _DispatchManager = manager_cls(
+            group=ep_group,
+            num_local_experts=num_local_experts,
+            num_experts=config.num_moe_experts,
+            router_topk=config.moe_router_topk,
+            config=config,
+        )
+
+    def wrap_layer_input(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Wrap the layer input through the communication manager."""
+        return self._comm_manager.wrap_layer_input(hidden_states)
+
+    def finalize_layer_output(self, output: torch.Tensor) -> torch.Tensor:
+        """Finalize the layer output through the communication manager."""
+        return self._comm_manager.finalize_layer_output(output)
+
+    def release_routing_state(self) -> None:
+        self._comm_manager.release_routing_state()
+
+    def dispatch_preprocess(
+        self,
+        hidden_states: torch.Tensor,
+        routing_map: torch.Tensor,
+        probs: torch.Tensor,
+        *,
+        expert_indices: torch.Tensor | None = None,
+        padding_mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        self.hidden_shape = hidden_states.shape
+        hidden_states = hidden_states.view(-1, self.hidden_shape[-1])
+        if expert_indices is None:
+            expert_indices = get_expert_indices(routing_map).view(
+                routing_map.shape[0], self.config.moe_router_topk,
+            )
+        compact_probs = probs.gather(1, expert_indices)
+        if self.config.moe_virtual_expert_load_balance:
+            self._comm_manager.setup_metadata(
+                expert_indices, compact_probs, padding_mask=padding_mask,
+            )
+        else:
+            self._comm_manager.setup_metadata(expert_indices, compact_probs)
+        return hidden_states, self._comm_manager.token_probs
+
+    def token_dispatch(
+        self, hidden_states: torch.Tensor, probs: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        dispatched_hidden = self._comm_manager.dispatch(hidden_states)
+        return dispatched_hidden, self._comm_manager.dispatched_probs
+
+    def dispatch_postprocess(
+        self, hidden_states: torch.Tensor, probs: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        global_input_tokens, permuted_probs = (
+            self._comm_manager.get_permuted_hidden_states_by_experts(hidden_states)
+        )
+        self._comm_manager.dispatched_probs = None
+        tokens_per_expert = self._comm_manager.get_number_of_tokens_per_expert()
+        return global_input_tokens, tokens_per_expert, permuted_probs
+
+    def combine_preprocess(
+        self, hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        return self._comm_manager.get_restored_hidden_states_by_experts(hidden_states)
+
+    def token_combine(
+        self, hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        return self._comm_manager.combine(hidden_states)
+
+    def combine_postprocess(
+        self, hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        return hidden_states.view(self.hidden_shape)

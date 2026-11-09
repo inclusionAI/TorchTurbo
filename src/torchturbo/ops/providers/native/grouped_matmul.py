@@ -26,6 +26,8 @@ class TorchGroupedMatmul(OpImpl):
             raise ValueError(
                 "grouped_matmul expects weight with shape (experts, in_features, out_features)."
             )
+        if not weight.is_contiguous():
+            raise ValueError("grouped_matmul expects contiguous weight.")
 
         if isinstance(tokens_per_expert, torch.Tensor):
             counts = [int(item) for item in tokens_per_expert.tolist()]

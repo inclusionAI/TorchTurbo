@@ -17,6 +17,7 @@ def get_base_moe_config(
         moe_router_load_balancing_type="none",
         moe_router_topk=hf_config.num_experts_per_tok,
         moe_token_dispatcher_type="alltoall",
+        moe_virtual_expert_load_balance=False,
     )
     base_config_kwargs.update(**override_config_kwargs)
     return base_config_kwargs

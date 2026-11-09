@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import ctypes
 import os
 from contextlib import nullcontext
+from functools import lru_cache
+from typing import ClassVar
 
 import torch
 
@@ -29,6 +32,32 @@ _NPU_DETERMINISTIC_ENV = {
     "ATB_MATMUL_SHUFFLE_K_ENABLE": "0",
     "ATB_LLM_LCOC_ENABLE": "0",
 }
+
+
+class _ShmemHandle:
+    """Keep the symmetric allocation, EP team, and device pointer table alive."""
+
+    def __init__(self, symmetric_memory, team: int, device: torch.device) -> None:
+        self.symmetric_memory = symmetric_memory
+        self.team = team
+        self.peer_ptrs = torch.tensor(symmetric_memory.buffer_ptrs, dtype=torch.int64, device=device)
+
+    @property
+    def world_size(self) -> int:
+        return self.symmetric_memory.world_size
+
+    @property
+    def buffer_ptrs(self) -> list[int]:
+        return self.symmetric_memory.buffer_ptrs
+
+    def get_buffer(self, rank: int, shape: torch.Size, dtype: torch.dtype) -> torch.Tensor:
+        return self.symmetric_memory.get_buffer(rank, shape, dtype)
+
+    def barrier(self) -> None:
+        """Order prior peer accesses and wait for this EP team on the current stream."""
+        NpuRuntime.shmem_library().aclshmemx_barrier_on_stream(
+            self.team, torch.npu.current_stream().npu_stream,
+        )
 
 
 class _NpuProfiler(BaseProfiler):
@@ -111,6 +140,7 @@ class _NpuProfiler(BaseProfiler):
 class NpuRuntime(DeviceRuntime):
     turbo_device = TurboDevice.NPU
     dist_backend = "hccl"
+    _shmem_teams: ClassVar[dict[tuple[int, ...], int]] = {}
 
     def __init__(self) -> None:
         self._initialized = False
@@ -171,6 +201,81 @@ class NpuRuntime(DeviceRuntime):
 
     def memory_allocated(self) -> int:
         return self._npu.memory_allocated()
+
+    @staticmethod
+    @lru_cache(maxsize=1)
+    def shmem_library() -> ctypes.CDLL:
+        """Load the Ascend SHMEM library and configure its team and barrier APIs."""
+        library = ctypes.CDLL("libshmem.so")
+        library.aclshmem_team_split_strided.argtypes = [ctypes.c_int] * 4 + [ctypes.POINTER(ctypes.c_int)]
+        library.aclshmem_team_split_strided.restype = ctypes.c_int
+        library.aclshmemx_barrier_on_stream.argtypes = [ctypes.c_int, ctypes.c_void_p]
+        library.aclshmemx_barrier_on_stream.restype = None
+        return library
+
+    @classmethod
+    def _initialize_shmem_teams(cls, groups: list[tuple[int, ...]], world_size: int) -> None:
+        """Create EP teams in the same order on every WORLD rank."""
+        library = cls.shmem_library()
+        world = tuple(range(world_size))
+        cls._shmem_teams[world] = 0
+        for members in sorted(set(groups)):
+            if members in cls._shmem_teams:
+                continue
+            stride = members[1] - members[0] if len(members) > 1 else 1
+            if members != tuple(range(members[0], members[-1] + 1, stride)):
+                raise ValueError("NPU SHMEM EP groups must have evenly spaced WORLD ranks.")
+            team = ctypes.c_int(-1)
+            result = library.aclshmem_team_split_strided(
+                0, members[0], stride, len(members), ctypes.byref(team),
+            )
+            if result != 0:
+                raise RuntimeError(f"SHMEM EP team creation failed with error {result}.")
+            cls._shmem_teams[members] = team.value
+
+    def allocate_communication_buffer(
+        self,
+        numel: int,
+        *,
+        dtype: torch.dtype,
+        device: torch.device,
+        group: torch.distributed.ProcessGroup | None,
+    ) -> tuple[torch.Tensor, object]:
+        """Allocate SHMEM on single-host WORLD and map peers in the given group.
+
+        Every WORLD rank must allocate the same layouts in the same order.
+        The installed NPUSHMEM allocator initializes WORLD even for EP subgroups.
+        """
+        import socket
+
+        import torch.distributed as dist
+        import torch.distributed._symmetric_memory as symm_mem
+        import torch_npu
+
+        layouts = [None] * dist.get_world_size()
+        ep_group = dist.group.WORLD if group is None else group
+        members = tuple(dist.get_process_group_ranks(ep_group))
+        layout = (socket.gethostname(), numel, dtype, members)
+        dist.all_gather_object(layouts, layout)
+        if any(peer[:3] != layout[:3] for peer in layouts):
+            raise RuntimeError(
+                "NPU SHMEM requires a single-host WORLD with identical buffer sizes and dtypes "
+                "on every rank."
+            )
+        symm_mem.enable_symm_mem_for_group(dist.group.WORLD.group_name)
+        # NPUSHMEM alloc rejects a group argument; rendezvous selects the EP peers.
+        allocation = symm_mem.empty(numel, dtype=dtype, device=device)
+        symmetric_memory = symm_mem.rendezvous(allocation, ep_group)
+        self._initialize_shmem_teams([peer[3] for peer in layouts], len(layouts))
+        handle = _ShmemHandle(symmetric_memory, self._shmem_teams[members], device)
+        # PyTorch from_blob creates generic storage, which HCCL cannot inspect.
+        # Borrow the same address through NPUStorageImpl and initialize its ND
+        # descriptor with set_. The handle owns the underlying SHMEM allocation.
+        storage = torch_npu._C._construct_storage_from_data_pointer(
+            allocation.data_ptr(), device, allocation.numel() * allocation.element_size(),
+        )
+        arena = torch.empty(0, dtype=dtype, device=device).set_(storage, 0, (numel,), (1,))
+        return arena, handle
 
     def stream(self, stream=None):
         if stream is None:
