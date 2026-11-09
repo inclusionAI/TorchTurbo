@@ -167,6 +167,24 @@ engine_config:
 """
 
 
+@pytest.mark.parametrize("enable_mega_moe,enable_moonep", [(False, False), (True, False), (False, True), (True, True)])
+def test_independent_expert_optimization_configuration(tmp_path, enable_mega_moe, enable_moonep):
+    """Load the four independent compute and placement policies without extra keys."""
+    switches = {"enable_mega_moe": enable_mega_moe, "enable_moonep": enable_moonep}
+    content = json.dumps({"engine_config": {"moe": switches}})
+    path = _write(tmp_path, "expert-policy.json", content)
+    config = _build_from_argv(["--tt_config", path])
+    assert config.moe.enable_mega_moe is enable_mega_moe
+    assert config.moe.enable_moonep is enable_moonep
+    assert "enable_moonep" not in config.extra
+    serialized = config.to_dict()
+    assert serialized["moe"]["enable_mega_moe"] is enable_mega_moe
+    assert serialized["moe"]["enable_moonep"] is enable_moonep
+    assert "enable_mega_moe" not in serialized and "enable_moonep" not in serialized
+    restored = EngineConfig.from_dict(serialized)
+    assert (restored.moe.enable_mega_moe, restored.moe.enable_moonep) == (enable_mega_moe, enable_moonep)
+
+
 def test_build_from_yaml_with_engineconfig_wrapper(tmp_path):
     cfg = _build_from_argv(["--tt_config", _write(tmp_path, "cfg.yaml", YAML_CFG)])
 
@@ -1429,3 +1447,51 @@ def test_gbs_negative_raises():
 def test_gbs_zero_raises():
     with pytest.raises(ValueError):
         build_from_args(TorchTurboArgs(gbs=0))
+
+
+def test_expert_backend_cli_overrides_file(tmp_path):
+    path = _write(tmp_path, "experts.yaml", _engine_config(
+        "moe:\n  enable_mega_moe: true\n  enable_moonep: false\n  moonep_grad_reduce_dtype: fp32\n"
+    ))
+    config = _build_from_argv([
+        "--tt_config", path,
+        "--tt_enable_mega_moe", "false", "--tt_enable_moonep", "true",
+        "--tt_moonep_grad_reduce_dtype", "bf16",
+    ])
+    assert config.moe.enable_mega_moe is False
+    assert config.moe.enable_moonep is True
+    assert config.moe.moonep_grad_reduce_dtype == "bf16"
+
+
+def test_renamed_mega_moe_key_has_migration_error():
+    with pytest.raises(ValueError, match="use moe.enable_mega_moe"):
+        EngineConfig.from_dict({"mega_moe": True})
+
+
+def test_local_token_capacity_file_and_cli_override(tmp_path):
+    path = _write(tmp_path, "capacity.yaml", _engine_config(
+        "moe:\n  enable_mega_moe: true\n  local_token_capacity: 4096\n"
+    ))
+    config = _build_from_argv(["--tt_config", path])
+    assert config.moe.local_token_capacity == 4096
+    config = _build_from_argv([
+        "--tt_config", path, "--tt_moe_local_token_capacity", "8192"
+    ])
+    assert config.moe.local_token_capacity == 8192
+    assert EngineConfig.from_dict(config.to_dict()).moe.local_token_capacity == 8192
+
+
+@pytest.mark.parametrize("capacity", [0, -128, 127, True, "128"])
+def test_local_token_capacity_rejects_invalid_config(capacity):
+    with pytest.raises(ValueError, match="moe.local_token_capacity"):
+        EngineConfig.from_dict({"moe": {"local_token_capacity": capacity}})
+
+
+@pytest.mark.parametrize("name", ["enable_mega_moe", "enable_moonep", "moonep_grad_reduce_dtype"])
+def test_expert_backend_root_keys_rejected(tmp_path, name):
+    value = "fp32" if name == "moonep_grad_reduce_dtype" else True
+    with pytest.raises(ValueError, match=f"use moe.{name}"):
+        EngineConfig.from_dict({name: value})
+    path = _write(tmp_path, "root-key.json", json.dumps({"engine_config": {name: value}}))
+    with pytest.raises(ValueError, match=name):
+        _build_from_argv(["--tt_config", path])

@@ -148,12 +148,12 @@ Adapter 激活时会扫描已注册模型并自动调用对应 `register()`。
 ### 构建Docker
 
 ```bash
-cd docker/npu/
+# Run from the repository root.
 
 docker build \
 --platform linux/arm64 \
--f Dockerfile_aarch64 \
--t torchturbo:aarch64 \
+-f docker/npu/Dockerfile_aarch64 \
+-t torchturbo:aarch64 .
 ```
 平台依赖脚本位于 `scripts/runs/deps/`，模型特有的依赖安装脚本位于 `scripts/runs/<model>/`。
 
@@ -183,6 +183,91 @@ torchrun --nproc_per_node=8 scripts/runs/run_lf.py \
 ```
 
 `--tt_*` 参数在转发给训练框架前会被剥离，不会污染原框架的参数解析。
+
+#### MegaMoE and MoonEP (Ascend NPU)
+
+TorchTurbo keeps the router, shared experts, expert parameters and FSDP ownership in the model. Optional backends receive the current parameter views through the normal `GroupedMLP.forward` call.
+
+| `enable_mega_moe` | `enable_moonep` | Execution |
+| --- | --- | --- |
+| false | false | Native MoE |
+| true | false | HyperMulticore MegaMoE |
+| false | true | Native MoE dispatch/compute with official MoonEP expert placement |
+| true | true | HyperMulticore MegaMoE with official MoonEP expert placement |
+
+##### Build dependencies once
+
+Use the matching source changes from the TorchTurbo, [HyperMulticore](https://github.com/mindspore-ai/hyper-multicore) and [official Ascend/MoonEP](https://gitcode.com/Ascend/MoonEP/tree/dev_npu) PR series. The original public base revisions alone do not contain these adapters. Build scripts consume explicit source checkouts; they never rewrite dependency Git history or patch sources during installation.
+
+The optional backends have been validated on Ascend A3 with CANN toolkit/ops 9.1 and the matching Torch/PTA ABI. Activate that environment for these processes. Native TorchTurbo does not require changing the default CANN installation.
+
+```bash
+export HYPER_MULTICORE_SOURCE=/path/to/hyper-multicore
+export MOONEP_SOURCE=/path/to/MoonEP
+bash scripts/runs/deps/mega_moe.sh
+bash scripts/runs/deps/moonep.sh
+```
+
+`mega_moe.sh` builds and installs the HMC wheel. `moonep.sh` reuses its SHMEM SDK and installed private runtime to build the official MoonEP external-runtime wheel. Set `SHMEM_HOME_PATH` explicitly if the HMC checkout contains multiple SDK builds. No separate cann-shmem wheel or second SHMEM runtime is used.
+
+Before running, activate the installed HMC environment (also required for noninteractive launchers):
+
+```bash
+source "$(python -c 'import importlib.util; from pathlib import Path; print(Path(importlib.util.find_spec("hyper_multicore").origin).parent / "lib/set_env.bash")')"
+```
+
+Training imports the installed backends and never installs or builds a wheel. Docker supports the same one-time build with `INSTALL_HYPER_MULTICORE`, `INSTALL_MOONEP`, explicit matching full 40-digit commit SHAs in `HYPER_MULTICORE_REF`/`MOONEP_REF`, and a compatible `BASE_IMAGE`. Keep these flags disabled for the default CANN 9.0 image.
+
+##### Enable in training
+
+```yaml
+engine_config:
+  moe:
+    enable_mega_moe: true
+    enable_moonep: true
+    moonep_grad_reduce_dtype: fp32  # default; bf16 is optional
+    local_token_capacity: 16384  # per rank; positive and 128-aligned
+```
+
+The equivalent launcher options are `--tt_enable_mega_moe true`,
+`--tt_enable_moonep true` and `--tt_moonep_grad_reduce_dtype fp32`.
+Both switches default to false and can be selected independently.
+Expert optimization settings belong under `engine_config.moe`. Move previous
+root-level switches into this block; rename the old `mega_moe` key to `enable_mega_moe`.
+Python module paths are unchanged. Set `moe.local_token_capacity` for non-Swift launchers,
+or pass `--tt_moe_local_token_capacity 16384`. Swift derives this value when omitted.
+
+BF16 return quantizes partial expert gradients before FP32 owner accumulation. It can fail strict gradient comparisons that pass with FP32 return; evaluate the two modes separately.
+
+Swift derives per-rank token capacity from sequence length, batch size and SP. Direct engine callers set the same `config.moe.local_token_capacity` before model construction.
+
+MoonEP uses the existing route-count agreement to decide whether expert movement is profitable; balanced or small calls keep the ordinary executor. Native MoE reuses the gathered count table when placement is declined. Placements belong to each invocation; expert parameters, optimizer state and checkpoints retain their original owners. When source geometry is unsupported by the official planner, the native adapter warns and uses native MoE; the fused adapter retains ordinary MegaMoE without expert movement. LoRA falls back to native MoE with a warning.
+
+The TT adapter selects `apply_probs_before_fc2=True` in HyperMulticore, matching current `GroupedMLP.activation_func_with_probs`: SwiGLU produces BF16 features, probabilities multiply them in FP32, and the result is cast back to BF16 before FC2. Output restoration only sums the selected expert rows. Backward computes probability gradients at this multiplication and returns them through the existing combine tasks. Selected zero probabilities remain routed and differentiable. HyperMulticore keeps its existing post-FC2 default for other callers. Matching this placement does not remove BF16 partial-gradient return quantization; that limitation must be evaluated separately.
+
+
+
+
+The optional expert backends require an explicit EP group with EP size greater than
+one, BF16 NPU activations and BF16 forward-time expert weights, and TorchTurbo
+SwiGLU GroupedMLP experts without Transformer Engine. Invalid requested combinations
+fail explicitly; the existing LoRA warning and native fallback are retained.
+For Docker dependency builds, use trusted matching full commit SHAs; mutable branch names and PR refs are rejected. Each resolved commit
+is printed in the build log. INSTALL_MOONEP=1 also installs HyperMulticore because the
+native MoonEP adapter shares its SHMEM runtime.
+
+
+The numerical scripts expose different gates: `mega_moe_precision.py` requires
+finite outputs and relative L2 error below 2%. The combined offload/optimizer script
+uses a 5% parameter-gradient relative-L2 compatibility gate by default;
+`--strict-gradients` additionally enforces elementwise `rtol=0.01, atol=1e-7`.
+Its reported 1% relative-L2 diagnostic is not the default pass criterion.
+These gates are distinct; report the selected gate with every result.
+
+Run framework checks with `python tests/npu/run_mega_moe_tests.py --unit-only`.
+Use `--checkpoint-only` or `--compatibility-only` for focused NPU regressions;
+the default runs the full precision matrix. Performance runs are separate in
+`tests/npu/benchmark_mega_moe_moonep.py` and do not participate in the precision gate.
 
 ### 运行脚本
 常用训练脚本按模型分目录放在 `scripts/runs/`（`run_lf.py` / `run_swift.py` 为共享入口）：

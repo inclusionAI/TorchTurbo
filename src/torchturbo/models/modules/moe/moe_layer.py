@@ -8,7 +8,7 @@
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Optional, Union
+from typing import Optional, Union, TYPE_CHECKING
 
 import torch
 import torch.distributed as dist
@@ -18,6 +18,10 @@ from .moe_config import MoEConfig
 from .router import TopKRouter
 from .token_dispatcher import MoETokenDispatcher, MoEAlltoAllTokenDispatcher
 from .module import ModuleSpec, build_module
+from .utils import RoutingResult
+
+if TYPE_CHECKING:
+    from ....optimizations.routed_experts import RoutedExpertsBackend
 
 
 @dataclass
@@ -107,6 +111,7 @@ class MoELayer(BaseMoELayer):
     ) -> None:
         self.use_te = use_te
         self.submodules = submodules
+        self._routed_experts_backend: "RoutedExpertsBackend | None" = None
         super(MoELayer, self).__init__(
             config=config, ep_group=ep_group, layer_number=layer_number
         )
@@ -146,6 +151,40 @@ class MoELayer(BaseMoELayer):
                 self.submodules.shared_experts, config=self.config
             )
 
+    def _compute_experts(
+        self, hidden_states: torch.Tensor, routing: RoutingResult,
+    ) -> torch.Tensor:
+        """Execute routed experts without changing router or shared-expert behavior."""
+        if self._routed_experts_backend is not None:
+            output = self._routed_experts_backend.route(self, hidden_states, routing)
+            if output is not None:
+                return output
+        return self.compute_native_experts(hidden_states, routing)
+
+    def compute_native_experts(
+        self, hidden_states: torch.Tensor, routing: RoutingResult,
+        *, global_token_counts: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Use the model's ordinary dispatcher and expert parameter hooks."""
+        dispatcher = self.token_dispatcher
+        # Reuse stage variables so completed layouts are not kept alive here.
+        if global_token_counts is None:
+            expert_tokens, expert_probs = dispatcher.dispatch_preprocess(hidden_states, routing)
+        else:
+            expert_tokens, expert_probs = dispatcher.dispatch_preprocess(
+                hidden_states, routing, global_token_counts=global_token_counts,
+            )
+        expert_tokens, expert_probs = dispatcher.token_dispatch(expert_tokens, expert_probs)
+        expert_tokens, tokens_per_expert, expert_probs = dispatcher.dispatch_postprocess(
+            expert_tokens, expert_probs,
+        )
+        expert_tokens, bias = self.experts(expert_tokens, tokens_per_expert, expert_probs)
+        assert bias is None, "Bias is not supported in MoEAlltoAllTokenDispatcher"
+        expert_tokens = dispatcher.combine_preprocess(expert_tokens)
+        expert_tokens = dispatcher.token_combine(expert_tokens)
+        expert_tokens = dispatcher.combine_postprocess(expert_tokens)
+        return expert_tokens
+
     def forward(
         self, hidden_states: torch.Tensor, input_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -156,18 +195,7 @@ class MoELayer(BaseMoELayer):
         )
         logits = logits.view(-1, logits.shape[-1])
 
-        dispatcher = self.token_dispatcher
-        # Reuse stage variables so completed layouts are not kept alive here.
-        expert_tokens, expert_probs = dispatcher.dispatch_preprocess(hidden_states, routing)
-        expert_tokens, expert_probs = dispatcher.token_dispatch(expert_tokens, expert_probs)
-        expert_tokens, tokens_per_expert, expert_probs = dispatcher.dispatch_postprocess(
-            expert_tokens, expert_probs,
-        )
-        expert_tokens, bias = self.experts(expert_tokens, tokens_per_expert, expert_probs)
-        assert bias is None, "Bias is not supported in MoEAlltoAllTokenDispatcher"
-        expert_tokens = dispatcher.combine_preprocess(expert_tokens)
-        expert_tokens = dispatcher.token_combine(expert_tokens)
-        expert_tokens = dispatcher.combine_postprocess(expert_tokens)
+        expert_tokens = self._compute_experts(hidden_states, routing)
         output = expert_tokens.to(hidden_states.dtype)
 
         if self.shared_expert is not None:

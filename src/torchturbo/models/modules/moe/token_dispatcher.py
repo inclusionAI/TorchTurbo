@@ -7,6 +7,7 @@
 # Modified by the TorchTurbo contributors.
 
 from abc import ABC, abstractmethod
+from typing import Any
 
 import numpy as np
 import torch
@@ -77,7 +78,8 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
 
     def __init__(
         self, num_local_experts: int, local_expert_indices: list[int],
-        config: MoEConfig, ep_group: dist.ProcessGroup,
+        config: MoEConfig, ep_group: dist.ProcessGroup, *,
+        dtoh_stream: Any = None,
     ) -> None:
         super().__init__(config=config, ep_group=ep_group)
         self.num_local_experts = num_local_experts
@@ -106,7 +108,11 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             self.sync_point = "before_ep_alltoall"
         else:
             self.sync_point = "before_finish"
-        self.dtoh_stream = self.device_runtime.new_stream()
+        # Virtual expert layouts can share this layer's count-copy stream while
+        # retaining independent routing and backward metadata.
+        self.dtoh_stream = (
+            dtoh_stream if dtoh_stream is not None else self.device_runtime.new_stream()
+        )
 
         self.hidden_shape: torch.Size | None = None
         self.hidden_shape_before_permute: torch.Size | None = None
@@ -117,7 +123,9 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         self.input_splits: torch.Tensor | np.ndarray | None = None
         self.output_splits: torch.Tensor | np.ndarray | None = None
 
-    def preprocess(self, routing_map: torch.Tensor) -> torch.Tensor:
+    def preprocess(
+        self, routing_map: torch.Tensor, global_token_counts: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """Compute device counts and split sizes without copying them to CPU."""
         # Source counts are ordered by destination rank, then expert.
         local_counts = routing_map.sum(dim=0).long()
@@ -127,9 +135,11 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             self.input_splits = local_counts.reshape(
                 self.ep_size, self.num_local_experts
             ).sum(axis=1)
-            global_counts = gather_from_sequence_parallel_region(
-                local_counts, group=self.ep_group
-            ).reshape(self.ep_size, self.num_experts)
+            global_counts = global_token_counts
+            if global_counts is None:
+                global_counts = gather_from_sequence_parallel_region(
+                    local_counts, group=self.ep_group
+                ).reshape(self.ep_size, self.num_experts)
             received_counts = global_counts[
                 :, self.local_expert_indices[0] : self.local_expert_indices[-1] + 1
             ].contiguous()
@@ -143,6 +153,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
 
     def dispatch_preprocess(
         self, hidden_states: torch.Tensor, routing: RoutingResult,
+        *, global_token_counts: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Group source tokens and probabilities for weighting inside the experts."""
         probs = routing.probs
@@ -151,7 +162,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         assert probs.dim() == 2, "Expected 2D tensor for probs"
         assert routing_map.dim() == 2, "Expected 2D tensor for token2expert mask"
         assert routing_map.dtype == torch.bool, "Expected bool tensor for mask"
-        self.tokens_per_expert = self.preprocess(routing_map)
+        self.tokens_per_expert = self.preprocess(routing_map, global_token_counts)
         hidden_states = hidden_states.view(-1, self.hidden_shape[-1])
         self.hidden_shape_before_permute = hidden_states.shape
         self._maybe_dtoh_and_synchronize("before_permutation_1")

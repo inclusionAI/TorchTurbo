@@ -147,6 +147,10 @@ class TorchTurboArgs:
         LLaDA2 block-diffusion block size (the BD block-diagonal attention
         granularity and the unit ``cutoff_len`` is ceil-aligned to). Defaults to
         ``32`` (dFactory/LLaDA2 default). Only affects the BD dataset path.
+    enable_mega_moe:
+        Enable HyperMulticore MegaMoE execution. None preserves file configuration.
+    enable_moonep:
+        Enable MoonEP placement independently of MegaMoE. None preserves file configuration.
     enable_chunk_loss:
         Enable chunked fused ``lm_head`` + cross-entropy during training.
     loss_chunk_size:
@@ -171,6 +175,10 @@ class TorchTurboArgs:
     ac_use_reentrant: bool = False
     cpu_offload: CPUOffloadConfig = field(default_factory=CPUOffloadConfig)
     cpu_offload_enabled: bool | None = None
+    enable_mega_moe: bool | None = None
+    enable_moonep: bool | None = None
+    moe_local_token_capacity: int | None = None
+    moonep_grad_reduce_dtype: str = "fp32"
     enable_mtp: bool = False
     mtp_loss_scaling_factor: float | None = 0.1
     moe_aux_loss_coeff: float = 0.0
@@ -277,6 +285,39 @@ _TURBO_ARG_SPECS: tuple[TurboArgSpec, ...] = (
         metavar="POLICY",
         help="Mixed precision policy (bf16, fp32). "
         "Replaces TORCH_TURBO_MIXED_PRECISION.",
+    ),
+    TurboArgSpec(
+        name="enable_mega_moe",
+        args_name="enable_mega_moe",
+        cli_name="--tt_enable_mega_moe",
+        config_path="moe.enable_mega_moe",
+        type=string_to_bool,
+        help="Enable HyperMulticore MegaMoE execution (default false).",
+    ),
+    TurboArgSpec(
+        name="enable_moonep",
+        args_name="enable_moonep",
+        cli_name="--tt_enable_moonep",
+        config_path="moe.enable_moonep",
+        type=string_to_bool,
+        help="Enable MoonEP expert placement with native MoE or MegaMoE (default false).",
+    ),
+    TurboArgSpec(
+        name="moe_local_token_capacity",
+        args_name="moe_local_token_capacity",
+        cli_name="--tt_moe_local_token_capacity",
+        config_path="moe.local_token_capacity",
+        type=int,
+        help="Maximum source tokens per EP rank, positive and 128-aligned. Swift derives it if omitted.",
+    ),
+    TurboArgSpec(
+        name="moonep_grad_reduce_dtype",
+        args_name="moonep_grad_reduce_dtype",
+        cli_name="--tt_moonep_grad_reduce_dtype",
+        config_path="moe.moonep_grad_reduce_dtype",
+        choices=("fp32", "bf16"),
+        help="MoonEP expert-gradient return precision (default fp32). "
+        "BF16 reduces communication volume but quantizes partial gradients.",
     ),
     TurboArgSpec(
         name="op_policy",
