@@ -293,7 +293,6 @@ class CollatorPatch(BasePatch):
     - Text-only batch: skip fake image/audio injection.
     - block_diag_attn (neat_packing): skip get_rope_func, backend handles position_ids.
     - No block_diag_attn: let get_rope_func run, then prepend text_position_ids → [4, bsz, seq].
-    - GLM5 Next neat packing: keep 2D integer masks for recurrent state resets.
     """
 
     name = "collator"
@@ -304,15 +303,10 @@ class CollatorPatch(BasePatch):
     def __init__(self) -> None:
         self._original_call = None
         self._cls = None
-        self._original_sft_call = None
-        self._sft_cls = None
 
     def patch(self, engine: "TorchTurboEngine | None" = None) -> None:
         try:
-            from llamafactory.data.collator import (
-                MultiModalDataCollatorForSeq2Seq,
-                SFTDataCollatorWith4DAttentionMask,
-            )
+            from llamafactory.data.collator import MultiModalDataCollatorForSeq2Seq
         except ImportError:
             return
 
@@ -320,9 +314,6 @@ class CollatorPatch(BasePatch):
         self._original_call = MultiModalDataCollatorForSeq2Seq.__call__
         patched_types = self._PATCHED_MODEL_TYPES
         original_call = self._original_call
-        self._sft_cls = SFTDataCollatorWith4DAttentionMask
-        self._original_sft_call = SFTDataCollatorWith4DAttentionMask.__call__
-        original_sft_call = self._original_sft_call
 
         def _patched_call(collator_self, features):
             import torch
@@ -419,36 +410,9 @@ class CollatorPatch(BasePatch):
             return result
 
         MultiModalDataCollatorForSeq2Seq.__call__ = _patched_call
-
-        def _patched_sft_call(collator_self, features):
-            config = getattr(getattr(collator_self, "model", None), "config", None)
-            if (
-                getattr(config, "model_type", None) == "glm5_next"
-                and getattr(collator_self, "block_diag_attn", False)
-            ):
-                import torch
-
-                # The model uses integer packing labels to reset convolution,
-                # KDA state and sparse-attention pools for each sample. Keep
-                # these labels instead of expanding them to an additive 4D mask.
-                batch = MultiModalDataCollatorForSeq2Seq.__call__(collator_self, features)
-                for key, value in batch.items():
-                    if torch.is_tensor(value) and torch.is_floating_point(value):
-                        batch[key] = value.to(collator_self.compute_dtype)
-                return batch
-            return original_sft_call(collator_self, features)
-
-        SFTDataCollatorWith4DAttentionMask.__call__ = _patched_sft_call
-        logger.info_rank0(
-            "CollatorPatch applied for %s; glm5_next preserves 2D packing masks",
-            patched_types,
-        )
+        logger.info_rank0("CollatorPatch applied for %s", patched_types)
 
     def revert(self) -> None:
-        if self._sft_cls and self._original_sft_call:
-            self._sft_cls.__call__ = self._original_sft_call
-            self._original_sft_call = None
-            self._sft_cls = None
         if self._cls and self._original_call:
             self._cls.__call__ = self._original_call
             self._original_call = None
