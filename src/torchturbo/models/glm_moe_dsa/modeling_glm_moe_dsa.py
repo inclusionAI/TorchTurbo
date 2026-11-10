@@ -562,6 +562,7 @@ class GlmMoeDsaPreTrainedModel(PreTrainedModel):
     config_class = GlmMoeDsaConfig
     base_model_prefix = "model"
     supports_gradient_checkpointing = True
+    _supports_flash_attn = True
     _no_split_modules = ["GlmMoeDsaDecoderLayer"]
     _skip_keys_device_placement = "past_key_values"
 
@@ -652,6 +653,7 @@ class GlmMoeDsaModel(GlmMoeDsaPreTrainedModel):
         self.rotary_emb = GlmMoeDsaRotaryEmbedding(config=config)
         self.gradient_checkpointing = False
         self._use_flash_attention_2 = config._attn_implementation == "flash_attention_2"
+        self._sp_size = 1
 
         self.post_init()
 
@@ -672,6 +674,7 @@ class GlmMoeDsaModel(GlmMoeDsaPreTrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        cu_seq_lens: Optional[torch.Tensor] = None,
     ):
         output_attentions = (
             output_attentions if output_attentions is not None else False
@@ -710,20 +713,22 @@ class GlmMoeDsaModel(GlmMoeDsaPreTrainedModel):
             )
             position_ids = position_ids.unsqueeze(0).expand(batch_size, -1)
 
-        if attention_mask is None:
-            attention_mask = torch.ones(
-                (batch_size, seq_length + past_key_values_length),
-                dtype=torch.bool,
-                device=inputs_embeds.device,
-            )
-
         if self._use_flash_attention_2:
-            # 2d mask is passed through the layers
-            attention_mask = (
-                attention_mask
-                if (attention_mask is not None and 0 in attention_mask)
-                else None
-            )
+            # NPU indexers consume global segment IDs even when hidden states
+            # have already been sliced for sequence parallelism. The ids are
+            # derived inline from the cu boundaries (1..n per packed sample,
+            # 0 beyond the last boundary), mirroring
+            # torchturbo.utils.flash_attn_utils.cu_seqlens_to_segment_ids
+            # while keeping this file torchturbo-free.
+            if attention_mask is None and cu_seq_lens is not None:
+                total = seq_length * self._sp_size + past_key_values_length
+                token_positions = torch.arange(total, device=cu_seq_lens.device)
+                segment_ids = torch.bucketize(token_positions, cu_seq_lens[1:], right=True) + 1
+                attention_mask = segment_ids.masked_fill(
+                    token_positions >= cu_seq_lens[-1], 0
+                ).unsqueeze(0)
+            elif attention_mask is not None and torch.all(attention_mask == 1):
+                attention_mask = None
         else:
             # 4d mask is passed through the layers
             attention_mask = _prepare_4d_causal_attention_mask(
@@ -884,6 +889,8 @@ class GlmMoeDsaForCausalLM(GlmMoeDsaPreTrainedModel, GenerationMixin):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        cu_seq_lens_q: Optional[torch.Tensor] = None,
+        **kwargs,
     ):
         return_dict = (
             return_dict if return_dict is not None else self.config.use_return_dict
@@ -899,6 +906,7 @@ class GlmMoeDsaForCausalLM(GlmMoeDsaPreTrainedModel, GenerationMixin):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
+            cu_seq_lens=cu_seq_lens_q,
         )
 
         hidden_states = outputs[0] if not return_dict else outputs.last_hidden_state
