@@ -12,6 +12,8 @@ from torch.distributed import ProcessGroup
 from torch.utils.checkpoint import checkpoint
 from transformers.integrations.flash_attention import get_target_dtype
 
+from torchturbo.utils.functools import cache
+
 from ..modules.attention.interface import attention_forward
 from ..modules.attention.ulysses import all_gather_sp_with_grad_reduce
 from ..modules.comm.comm import gather_from_sequence_parallel_region
@@ -29,6 +31,42 @@ _QSA_ATTENTION_MAX_KV_BYTES = 1 << 30
 
 # Set TORCHTURBO_ENABLE_NPU_LI=0 to force the torch small-op indexer path.
 _ENABLE_NPU_LI = os.environ.get("TORCHTURBO_ENABLE_NPU_LI", "1") == "1"
+
+
+@cache
+def _cached_rank_segments(
+    cu_seq_lens: torch.Tensor,
+    local_length: int,
+    sp_size: int,
+    sp_rank: int,
+    _version: int | None,
+) -> list[tuple[int, int, int]]:
+    """Cache host segment metadata shared by all QSA layers in a forward."""
+    rank_start = sp_rank * local_length
+    rank_stop = rank_start + local_length
+    segments = []
+    for segment_start, segment_stop in itertools.pairwise(cu_seq_lens.tolist()):
+        query_start = max(segment_start, rank_start)
+        query_stop = min(segment_stop, rank_stop)
+        if query_start < query_stop:
+            segments.append((segment_start, query_start, query_stop))
+    return segments
+
+
+def rank_segments_for_call(
+    cu_seq_lens: torch.Tensor,
+    local_length: int,
+    sp_size: int,
+    sp_rank: int,
+) -> list[tuple[int, int, int]]:
+    """Return local query segments without repeatedly synchronizing each layer."""
+    if torch.is_inference_mode_enabled() or cu_seq_lens.is_inference():
+        return _cached_rank_segments.__wrapped__(
+            cu_seq_lens, local_length, sp_size, sp_rank, None
+        )
+    return _cached_rank_segments(
+        cu_seq_lens, local_length, sp_size, sp_rank, cu_seq_lens._version
+    )
 
 
 def qsa_indexer_forward(
@@ -99,12 +137,9 @@ def qsa_indexer_forward(
     block_offsets = torch.arange(ratio, device=hidden_states.device)
     tail_offsets = block_offsets[:-1]
 
-    for segment_start, segment_stop in itertools.pairwise(cu_seq_lens.tolist()):
-        query_start = max(segment_start, query_offset)
-        query_stop = min(segment_stop, query_offset + local_length)
-        if query_start >= query_stop:
-            continue
-
+    for segment_start, query_start, query_stop in rank_segments_for_call(
+        cu_seq_lens, local_length, sp_size, sp_rank
+    ):
         # Later blocks cannot be visible to any query owned by this rank.
         num_blocks = (query_stop - segment_start) // ratio
         if num_blocks:

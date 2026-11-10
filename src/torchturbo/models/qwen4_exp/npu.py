@@ -7,12 +7,11 @@ segment-local causal prefixes.
 
 from __future__ import annotations
 
-from itertools import pairwise
-
 import torch
 
 from ..modules.comm.comm import gather_from_sequence_parallel_region
 from .modeling_qwen4_exp import apply_rotary_pos_emb
+from .qsa import rank_segments_for_call
 
 
 def _import_cann_ops():
@@ -64,6 +63,7 @@ def _blocks_to_token_ids(
     query_positions: torch.Tensor,
     ratio: int,
     budget: int,
+    block_offsets: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Match the torch dense-prefix and causal-tail output contract."""
     local_positions = query_positions - segment_start
@@ -75,7 +75,8 @@ def _blocks_to_token_ids(
         dtype=torch.int32,
         device=block_ids.device,
     )
-    block_offsets = torch.arange(ratio, device=block_ids.device)
+    if block_offsets is None:
+        block_offsets = torch.arange(ratio, device=block_ids.device, dtype=torch.int32)
     token_ids = (
         segment_start + block_ids.unsqueeze(-1) * ratio + block_offsets
     ).to(torch.int32)
@@ -96,20 +97,6 @@ def _blocks_to_token_ids(
     ).to(torch.int32)
     output[0].scatter_(1, destinations, tail_ids)
     return output
-
-
-def _rank_segments(cu_seq_lens, local_length: int, sp_size: int, sp_rank: int):
-    """Build local queries and their causal KV prefixes for each packed sample."""
-    rank_start = sp_rank * local_length
-    rank_stop = rank_start + local_length
-    segments = []
-    for segment_start, segment_stop in pairwise(cu_seq_lens.tolist()):
-        query_start = max(segment_start, rank_start)
-        query_stop = min(segment_stop, rank_stop)
-        if query_start >= query_stop:
-            continue
-        segments.append((segment_start, query_start, query_stop))
-    return segments
 
 
 @torch.no_grad()
@@ -151,9 +138,20 @@ def qsa_indexer_forward_cann(
         raw_keys, cos, sin = selection_state.split(widths, dim=-1)
         raw_keys = raw_keys.to(raw_key_dtype)
 
-    segments = _rank_segments(cu_seq_lens, local_length, sp_size, sp_rank)
+    segments = rank_segments_for_call(cu_seq_lens, local_length, sp_size, sp_rank)
     query_offset = sp_rank * local_length
     device = hidden_states.device
+    block_offsets = torch.arange(ratio, device=device, dtype=torch.int32)
+    tail_offsets = block_offsets[:-1]
+    global_positions = torch.arange(
+        query_offset, query_offset + local_length, device=device, dtype=torch.int32
+    )
+    weights = torch.full(
+        (1, local_length, indexer.index_n_heads),
+        head_dim ** -0.5,
+        dtype=torch.float32,
+        device=device,
+    )
     result = torch.full(
         (1, local_length, indexer.token_budget + ratio - 1),
         -1,
@@ -163,15 +161,10 @@ def qsa_indexer_forward_cann(
     for segment_start, query_start, query_stop in segments:
         local_start = query_start - query_offset
         local_stop = query_stop - query_offset
-        positions = torch.arange(
-            query_start,
-            query_stop,
-            device=device,
-            dtype=torch.int32,
-        )
+        positions = global_positions[local_start:local_stop]
         compressed_length = (query_stop - segment_start) // ratio * ratio
         if compressed_length == 0:
-            offsets = torch.arange(ratio - 1, device=device)[None, :]
+            offsets = tail_offsets[None, :]
             tail_ids = segment_start + offsets
             tail_ids = torch.where(
                 offsets <= (positions - segment_start)[:, None], tail_ids, -1
@@ -186,18 +179,12 @@ def qsa_indexer_forward_cann(
             indexer.k_layernorm,
             ratio,
         )
-        kv_length = query_stop - segment_start
-        residual_k = torch.tensor([kv_length % ratio], dtype=torch.int32, device=device)
-        weights = torch.full(
-            (local_stop - local_start, indexer.index_n_heads),
-            head_dim ** -0.5,
-            dtype=torch.float32,
-            device=device,
-        )
-        selected_blocks, _ = ops.lightning_indexer(
+        residual_k = positions[-1] + 1 - segment_start
+        residual_k = residual_k.remainder(ratio).reshape(1)
+        selected_blocks, _, _, _ = ops.lightning_indexer(
             segment_query.contiguous(),
             segment_keys.unsqueeze(2).contiguous(),
-            weights.unsqueeze(0),
+            weights[:, local_start:local_stop],
             indexer.block_topk,
             cmp_residual_k=residual_k,
             metadata=None,
@@ -207,8 +194,15 @@ def qsa_indexer_forward_cann(
             mask_mode=3,
             cmp_ratio=ratio,
             return_value=0,
+            candidate_topk_blocks=-1,
+            candidate_block_size=8,
         )
         result[0, local_start:local_stop] = _blocks_to_token_ids(
-            selected_blocks[0, :, 0], segment_start, positions, ratio, indexer.token_budget
+            selected_blocks[0, :, 0],
+            segment_start,
+            positions,
+            ratio,
+            indexer.token_budget,
+            block_offsets,
         )
     return result
