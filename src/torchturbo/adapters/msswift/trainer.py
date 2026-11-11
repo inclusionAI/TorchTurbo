@@ -28,6 +28,8 @@ so this module stays swift-free until a concrete trainer is actually built.
 from __future__ import annotations
 
 import os
+from collections.abc import Iterator
+from contextlib import contextmanager
 from functools import partial
 
 import torch
@@ -406,7 +408,7 @@ class TurboTrainerMixin:
             collate_fn=self.data_collator,
             num_workers=self.args.dataloader_num_workers,
             pin_memory=self.args.dataloader_pin_memory,
-            drop_last=True,
+            drop_last=self.args.dataloader_drop_last,
         )
 
 
@@ -459,6 +461,19 @@ class TurboDPOTrainerMixin(TurboTrainerMixin):
     def _prepare_inputs(self, inputs):
         """Use Swift's preference-input preparation, not the SFT override."""
         return super(TurboTrainerMixin, self)._prepare_inputs(inputs)
+
+    @contextmanager
+    def null_ref_context(self) -> Iterator[None]:
+        """Evaluate the frozen base, then restore the model's training mode."""
+        # Swift only disables the adapters. Left in training mode, the
+        # reference forward would be recorded as a training micro-batch (MFU).
+        was_training = self.model.training
+        self.model.eval()
+        try:
+            with super().null_ref_context():
+                yield
+        finally:
+            self.model.train(was_training)
 
     def get_train_dataloader(self, *args, **kwargs):
         """Use Swift's preference sampler at sp=1 and Turbo's sampler for SP."""

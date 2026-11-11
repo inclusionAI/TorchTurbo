@@ -147,6 +147,7 @@ def test_native_derived_eval_settings_are_checked_during_config_build(tmp_path, 
         val_dataset=["validation-data"] if validation_dataset else [],
         output_dir=str(tmp_path / "output"), add_version=False,
         tuner_type="full", report_to=[], use_cpu=True, check_model=False,
+        fp16=False, bf16=False,
     )
     _set_tt()
     expected_strategy = "steps" if validation_dataset else "no"
@@ -172,7 +173,7 @@ def test_native_dpo_args_build_config(tmp_path, padding_free):
         router_aux_loss_coef=0.02,
         attn_impl="flash_attn", output_dir=str(tmp_path / "output"),
         add_version=False, tuner_type="full", report_to=[], use_cpu=True,
-        check_model=False,
+        check_model=False, fp16=False, bf16=False,
     )
     # The layout stays the user's choice; the collator flattens either one.
     assert args.padding_free is padding_free
@@ -709,10 +710,19 @@ def test_dpo_with_sp_is_accepted():
     assert cfg.parallel_plan.sp_size == 2
 
 
-def test_dpo_rejects_lora():
+@pytest.mark.parametrize("sp_size", [1, 8])
+def test_dpo_accepts_lora(sp_size):
+    _set_tt(sp_size=sp_size)
+    cfg = build_config_from_swift_args(_base_args(rlhf_type="dpo", tuner_type="lora"))
+    assert cfg.parallel_plan.sp_size == sp_size
+
+
+def test_lora_dpo_rejects_a_separate_reference_adapter():
     _set_tt()
-    with pytest.raises(NotImplementedError, match="DPO with tuner_type!=full"):
-        build_config_from_swift_args(_base_args(rlhf_type="dpo", tuner_type="lora"))
+    with pytest.raises(NotImplementedError, match="LoRA DPO with ref_adapters"):
+        build_config_from_swift_args(
+            _base_args(rlhf_type="dpo", tuner_type="lora", ref_adapters=["reference"])
+        )
 
 
 def test_dpo_rejects_mtp():
