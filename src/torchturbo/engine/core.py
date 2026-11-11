@@ -2,29 +2,20 @@
 
 from __future__ import annotations
 
-import dataclasses
-import json
 import os
 import socket
-from collections.abc import Callable, Iterable
-from typing import Any, Iterator, Optional
+from typing import Any, Callable, Iterable, Optional
 
 import math
 import torch
 import torch.nn as nn
 import torch.distributed as dist
-from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
 
 from ..logging import get_logger
 from .backend_registry import get_available_backends, get_backend
 from .backends.base import BaseBackend
-from .checkpoint import CheckpointFormat
-from .checkpoint.coordinator import CheckpointCoordinator, CheckpointExportPluginConsumer
 from .config import EngineConfig, FreezePolicy
-from .metrics import MetricTracker
-from .optimizers import MuonPlan, OptimizerClassPlan
-from .optimizers.lr_scheduler import create_lr_scheduler
 from .utils import has_meta_tensor
 from torchturbo.adapters.rl.packed import (
     gather_logprobs_entropy,
@@ -39,26 +30,36 @@ from ..runtime import BaseProfiler, get_device_runtime
 logger = get_logger(__name__)
 
 
-class DPBlockDistributedSampler(DistributedSampler):
-    """DistributedSampler that parcels contiguous blocks over DP groups.
+class GatherAndInnerLoopSPDistributedSampler(DistributedSampler):
+    """DistributedSampler subclass that gives each SP group contiguous index blocks.
 
-    Each block covers ``dp_size * rank_block`` indices: every DP group gets
-    a disjoint contiguous ``rank_block`` slice, and ranks sharing a
-    ``dp_rank`` (e.g. an SP group) yield the identical sequence. The
-    sampler only knows the dp info and the block size; the engine picks
-    ``rank_block`` as ``ga * batch_size`` with ``tt_gbs`` (whole optimizer
-    steps) or ``sp_size`` (legacy full-world sweep).
+    All ranks sharing the same ``dp_rank`` yield the identical sequence
+    of ``sp_size`` indices per iteration block.
+
+    Parameters
+    ----------
+    dataset:
+        Dataset to sample from.
+    sp_size:
+        Sequence-parallel group size.  ``1`` = standard DistributedSampler.
+    num_replicas:
+        Total world size.  Defaults to ``dist.get_world_size()``.
+    rank:
+        Global rank.  Defaults to ``dist.get_rank()``.
+    shuffle:
+        Whether to shuffle indices each epoch.
+    seed:
+        Random seed used when *shuffle* is True.
+    drop_last:
+        Drop the tail to make the dataset evenly divisible.
     """
 
     def __init__(
         self,
         dataset: Dataset,
+        sp_size: int = 1,
         num_replicas: Optional[int] = None,
         rank: Optional[int] = None,
-        *,
-        dp_size: int,
-        dp_rank: int,
-        rank_block: int,
         shuffle: bool = True,
         seed: int = 0,
         drop_last: bool = True,
@@ -73,34 +74,35 @@ class DPBlockDistributedSampler(DistributedSampler):
             drop_last=drop_last,
         )
 
-        self.dp_size = dp_size
-        self.dp_rank = dp_rank
-        self.rank_block = rank_block
+        if self.num_replicas % sp_size != 0:
+            raise ValueError(
+                f"world_size ({self.num_replicas}) must be divisible by sp_size ({sp_size})"
+            )
 
-        # Recompute sizing: the epoch covers whole blocks of dp_size * rank_block.
+        self.sp_size = sp_size
+        self.dp_size = self.num_replicas // sp_size
+        self.dp_rank = self.rank // sp_size
+
+        # Recompute sizing: each DP group consumes sp_size samples per
+        # iteration, so total iterations = dataset / (dp_size * sp_size).
         total = len(self.dataset)  # type: ignore[arg-type]
-        block = self.dp_size * self.rank_block
         if self.drop_last:
-            self.num_iterations = total // block
+            self.num_iterations = total // (self.dp_size * self.sp_size)
         else:
-            self.num_iterations = math.ceil(total / block)
-        self.total_size = self.num_iterations * block
+            self.num_iterations = math.ceil(total / (self.dp_size * self.sp_size))
+        self.total_size = self.num_iterations * self.dp_size * self.sp_size
         # Override parent's num_samples (used by __len__ in parent)
-        self.num_samples = self.num_iterations * self.rank_block
+        self.num_samples = self.num_iterations * self.sp_size
 
         logger.info_rank0(
-            "DPBlockDistributedSampler: seed=%d, world=%d, rank=%d, "
-            "dp_size=%d, dp_rank=%d, rank_block=%d, num_iterations=%d, "
-            "total_samples=%d, num_samples_per_rank=%d",
-            self.seed,
+            "SPDistributedSampler: world=%d, rank=%d, sp_size=%d, "
+            "dp_size=%d, dp_rank=%d, iterations=%d",
             self.num_replicas,
             self.rank,
+            self.sp_size,
             self.dp_size,
             self.dp_rank,
-            self.rank_block,
             self.num_iterations,
-            self.total_size,
-            self.num_samples,
         )
 
     def __iter__(self) -> Iterator[int]:
@@ -119,57 +121,28 @@ class DPBlockDistributedSampler(DistributedSampler):
         else:
             indices = indices[: self.total_size]
 
-        # Each block is consecutive per-group slices; DP rank d takes
-        # [d*rank_block, (d+1)*rank_block). Ranks sharing a dp_rank yield
-        # the identical list.
+        # Each iteration block has dp_size * sp_size indices laid out as:
+        #   [dp0_s0, dp0_s1, ..., dp0_sp-1, dp1_s0, ..., dpN_sp-1]
+        #
+        # DP rank d gets indices at offsets [d*sp_size .. d*sp_size+sp_size-1]
+        # within each block.  All ranks in the same SP group (same dp_rank)
+        # yield the identical list.
         rank_indices = []
         for i in range(self.num_iterations):
-            base = i * self.dp_size * self.rank_block + self.dp_rank * self.rank_block
-            rank_indices.extend(indices[base : base + self.rank_block])
-
-        if self.shuffle:
-            g2 = torch.Generator()
-            g2.manual_seed(self.seed + self.epoch + self.dp_rank)
-            perm = torch.randperm(len(rank_indices), generator=g2)
-            rank_indices = [rank_indices[i] for i in perm.tolist()]
+            base = i * self.dp_size * self.sp_size + self.dp_rank * self.sp_size
+            for s in range(self.sp_size):
+                rank_indices.append(indices[base + s])
 
         return iter(rank_indices)
 
     def __len__(self) -> int:
         return self.num_samples
 
-class EpochDrivenDataLoader(DataLoader):
-    """DataLoader that forwards set_epoch to the sampler
-    """
-    def set_epoch(self, epoch: int) -> None:
-        self.sampler.set_epoch(epoch)
-
 
 class TorchTurboEngine:
-    """One-stop-shop engine for distributed training.
+    """Facade for model preparation, parallelism, optimization, and metrics.
 
-    Owns model preparation, distributed sharding, optimizer setup, loss
-    computation, profiling, and checkpoint I/O.
-
-    Parameters
-    ----------
-    config:
-        An :class:`EngineConfig`, a raw ``dict``, or ``None`` (defaults).
-
-    Example::
-
-        engine = TorchTurboEngine({"backend": "fsdp2", "mixed_precision": "bf16"})
-
-        # Setup
-        engine.prepare_optimizer(
-            optimizer_cls=torch.optim.AdamW,
-            lr=1e-4,
-            weight_decay=1e-2,
-        )
-        engine.prepare_lr_scheduler(
-            scheduler_cls=CosineAnnealingLR,
-            T_max=1000,
-        )
+    Training loops are driven by the framework adapter or the caller.
     """
 
     def __init__(self, config: EngineConfig | dict[str, Any] | None = None) -> None:
@@ -180,12 +153,6 @@ class TorchTurboEngine:
             self.config = EngineConfig.from_dict(config)
         else:
             self.config = config
-
-        from .plugins import PluginManager
-
-        self.plugin_manager = PluginManager(list(self.config.plugin_paths))
-        self.metric_tracker = MetricTracker()
-        self._mfu_estimator: Any = None
 
         # Select distributed backend before configuring process-wide state.
         backend_name = self.config.backend.value
@@ -198,23 +165,22 @@ class TorchTurboEngine:
 
         # Resolve the process-wide device runtime before backend construction.
         self.device_runtime = get_device_runtime()
-        if self.config.use_deterministic_algorithms:
-            self.device_runtime.use_deterministic_algorithms()
         self.backend: BaseBackend = backend_cls(self.config, self.device_runtime)
-        self._checkpoint: CheckpointCoordinator | None = None
         self._profiler: BaseProfiler | None = None
+        self._mfu_estimator = None
         self.ops = get_or_create_ops(
             device_runtime=self.device_runtime,
             default_policy=self.config.ops.policy,
-            overrides=self.config.ops.overrides,
         )
+        self.ops.log_ops_selection()
 
         # These are set by setup()
         self.model: nn.Module | None = None
         self.model_name_or_path: str | None = None
-        self.optimizer: torch.optim.Optimizer | None = None
+        self.optimizer: Any = None
         self.lr_scheduler: Any = None
-        self.parallel_plan: Any = None
+
+        # Hooks (can be added before or after setup)
 
         logger.info_rank0(
             "TorchTurboEngine initialized: backend=%s, device=%s",
@@ -225,18 +191,6 @@ class TorchTurboEngine:
     # ------------------------------------------------------------------
     # Model preparation (meta device → shard → load weights)
     # ------------------------------------------------------------------
-
-    def _patch_transformers(self) -> None:
-        """Connect Transformers attention and packing to TorchTurbo."""
-        import transformers.integrations.flash_attention as flash_integration
-        import transformers.modeling_flash_attention_utils as flash_utils
-
-        from ..models.modules.attention.interface import attention_forward
-        from ..utils.flash_attn_utils import get_unpad_data
-
-        flash_integration._flash_attention_forward = attention_forward
-        # Support packed sequence IDs as well as binary padding masks.
-        flash_utils._get_unpad_data = get_unpad_data
 
     def build_model(
         self,
@@ -293,6 +247,26 @@ class TorchTurboEngine:
                 trust_remote_code=trust_remote_code,
             )
 
+        if self.config.mtp.enabled:
+            n_mtp = getattr(config, "num_nextn_predict_layers", 0)
+            if n_mtp > 0:
+                logger.info_rank0("MTP enabled: %d MTP layer(s) will be built", n_mtp)
+            else:
+                logger.warning_rank0(
+                    "--tt_enable_mtp passed but model config has "
+                    "num_nextn_predict_layers=0 — nothing to enable."
+                )
+        else:
+            if hasattr(config, "num_nextn_predict_layers"):
+                if config.num_nextn_predict_layers > 0:
+                    logger.info_rank0(
+                        "MTP off (default): stripping %d MTP layer(s) — "
+                        "their checkpoint weights will be skipped. "
+                        "Pass --tt_enable_mtp to enable.",
+                        config.num_nextn_predict_layers,
+                    )
+                config.num_nextn_predict_layers = 0
+
         if model_cls is None:
             model_cls = AutoModelForCausalLM
 
@@ -302,10 +276,9 @@ class TorchTurboEngine:
         # This bypasses AutoModelForCausalLM.from_config entirely, avoiding
         # the type(config) mismatch that occurs when the config object was
         # created from a remote config class (e.g. via trust_remote_code).
-        from transformers import PreTrainedModel
-
         from ..models.base import TurboModel
         from ..models.registry import get_model
+        from transformers import PreTrainedModel
 
         model_type = getattr(config, "model_type", None)
         turbo_cls = get_model(model_type) if model_type else None
@@ -324,7 +297,8 @@ class TorchTurboEngine:
                 "TorchTurboModel classes must also inherit transformers.PreTrainedModel. "
                 f"Got {turbo_model_cls.__name__}."
             )
-        with turbo_model_cls.init_context(config, engine_config=self.config):
+
+        with turbo_model_cls.init_context(config):
             logger.info_rank0("Building model on meta device: %s", model_name_or_path)
             with torch.device("meta"):
                 logger.info_rank0(
@@ -334,7 +308,6 @@ class TorchTurboEngine:
 
                 # Resolve parallel plan
                 parallel_plan = self._resolve_parallel_plan(model)
-                self.parallel_plan = parallel_plan
 
                 # Prepare model via backend (module replacement → LoRA → sharding).
                 logger.info_rank0("Sharding model via %s backend", self.config.backend.value)
@@ -342,29 +315,20 @@ class TorchTurboEngine:
                     model, parallel_plan=parallel_plan, peft_config=peft_config
                 )
 
-                self._patch_transformers()
                 parallel_context = self._get_parallel_context()
                 model.on_parallelized(parallel_context)
-
-        if self._checkpoint is None:
-            export_plugin_consumer = CheckpointExportPluginConsumer()
-            self.plugin_manager.try_consume(export_plugin_consumer)
-            self._checkpoint = CheckpointCoordinator(
-                self.config, self.backend.create_checkpoint_manager(),
-                parallel_context=parallel_context,
-                export_plugin_consumer=export_plugin_consumer,
-            )
 
         logger.info_rank0(
             "%s model via %s backend",
             "Loading" if load_weights else "Materializing",
             self.config.backend.value,
         )
-        if load_weights:
-            self.checkpoint.load_pretrained(model, model_name_or_path)
-        else:
-            self.backend.materialize(model)
-        self.backend.finalize_model_load(model)
+        self.backend.load_model(
+            model,
+            model_name_or_path=model_name_or_path,
+            parallel_context=parallel_context,
+            load_weights=load_weights,
+        )
 
         model.on_materialized()
         meta_tensor_names = has_meta_tensor(model)
@@ -380,15 +344,6 @@ class TorchTurboEngine:
 
         logger.info_rank0("Model built: %s (%s)", type(model).__name__, torch_dtype)
         return model
-
-    @property
-    def checkpoint(self) -> CheckpointCoordinator:
-        """Return checkpoint coordination after model preparation."""
-        if self._checkpoint is None:
-            raise RuntimeError(
-                "Checkpoint coordinator is unavailable. Call prepare_model() first."
-            )
-        return self._checkpoint
 
     def _apply_freeze_policy(self, model: nn.Module, policy: FreezePolicy) -> None:
         if not policy.enabled:
@@ -462,124 +417,30 @@ class TorchTurboEngine:
         if dist.is_initialized():
             dist.barrier()
 
-        self._log_info()
+        if not dist.is_initialized() or dist.get_rank() == 0:
+            logger.info_rank0("Model prepared: %s (%s)", type(model).__name__, torch_dtype)
+            self._log_model_info(model)
 
         return model
 
-    def _log_info(self) -> None:
-        self.config.parallel_plan = self.parallel_plan
-
-        logger.info_rank0("TorchTurbo engine summary:")
-        logger.info_rank0(
-            "EngineConfig:\n%s",
-            json.dumps(
-                vars(self.config),
-                indent=2,
-                default=lambda value: (
-                    {
-                        field.name: getattr(value, field.name)
-                        for field in dataclasses.fields(value)
-                        if field.name != "module_kwargs"
-                    }
-                    if dataclasses.is_dataclass(value)
-                    else (
-                        getattr(value, "__name__", type(value).__name__)
-                        if callable(value)
-                        else str(value)
-                    )
-                ),
-            ),
-        )
-
-        self.ops.log_ops_selection()
-
-        self._log_model_info(self.model)
-
-    def save_model(
-        self,
-        model: nn.Module,
-        output_dir: str,
-        format: CheckpointFormat | None = None,
-        *,
-        final: bool = False,
-        **kwargs: Any,
-    ) -> None:
-        """Save model weights under ``output_dir``.
-
-        Args:
-            model: Model prepared by this engine.
-            output_dir: Checkpoint or export root directory.
-            format: ``CheckpointFormat.HF`` writes an HF safetensors export and
-                ``CheckpointFormat.NATIVE`` writes exact model state in the
-                backend's native format.
-                ``None`` saves the model part of a training checkpoint: the
-                native state, plus an HF export when ``final`` is set or
-                ``checkpoint.hf_export`` is ``"every"``.
-            final: Whether this is the last checkpoint of the run. Only used
-                when ``format`` is ``None``.
-        """
-        if self.model_name_or_path is None:
-            raise RuntimeError("Cannot save before prepare_model().")
-        formats = self.checkpoint.save_model(
+    def save_model(self, model: nn.Module, output_dir: str, **kwargs: Any) -> None:
+        self.backend.save_model(
             model,
+            self.model_name_or_path,
             output_dir,
-            source_path=self.model_name_or_path,
-            format=format,
-            final=final,
+            parallel_context=self._get_parallel_context(),
+            **kwargs,
         )
         logger.info_rank0(
-            "Model saved in %s (%s) via %s backend",
-            output_dir,
-            ", ".join(model_format.value for model_format in formats),
-            self.config.backend.value,
-        )
-
-    def save_optimizer_and_scheduler(
-        self,
-        model: nn.Module,
-        optimizer: torch.optim.Optimizer,
-        lr_scheduler: torch.optim.lr_scheduler.LRScheduler | None,
-        output_dir: str,
-        **kwargs: Any,
-    ) -> None:
-        """Save optimizer and LR scheduler state for resume.
-
-        ``optimizer`` is the engine-owned optimizer, before any framework
-        wrapper is applied. ``model`` and ``lr_scheduler`` are the training
-        loop's live objects.
-        """
-        self.checkpoint.save_optimizer_and_scheduler(
-            model, optimizer, lr_scheduler, output_dir
-        )
-
-    def load_optimizer_and_scheduler(
-        self,
-        model: nn.Module,
-        optimizer: torch.optim.Optimizer,
-        lr_scheduler: torch.optim.lr_scheduler.LRScheduler | None,
-        checkpoint_dir: str,
-        **kwargs: Any,
-    ) -> None:
-        """Restore state written by :meth:`save_optimizer_and_scheduler`."""
-        self.checkpoint.load_optimizer_and_scheduler(
-            model, optimizer, lr_scheduler, checkpoint_dir
-        )
-
-    def load_from_checkpoint(self, model: nn.Module, checkpoint_dir: str, **kwargs: Any) -> None:
-        """Restore model weights saved by :meth:`save_model` in ``checkpoint_dir``."""
-        if self.model_name_or_path is None:
-            raise RuntimeError("Cannot load a checkpoint before prepare_model().")
-        self.checkpoint.load_model(
-            model, checkpoint_dir, source_path=self.model_name_or_path
-        )
-        logger.info_rank0(
-            "Model weights reloaded from %s via %s backend",
-            checkpoint_dir,
-            self.config.backend.value,
+            "Model saved in %s via %s backend", output_dir, self.config.backend.value
         )
 
     def _get_parallel_context(self) -> dict[str, Any]:
-        return self.backend.get_parallel_context()
+        return {
+            "dp": self.get_dp_info(),
+            "sp": self.get_sp_info(),
+            "ep": self.get_ep_info(),
+        }
 
     # ------------------------------------------------------------------
     # Optimizer & LR scheduler
@@ -589,115 +450,46 @@ class TorchTurboEngine:
         self,
         optimizer_cls: type | None = None,
         **kwargs: Any,
-    ) -> torch.optim.Optimizer:
-        """Resolve an optimizer plan and receive the backend's complete optimizer."""
+    ) -> Any:
+        """Create an optimizer for the prepared model.
+
+        Must be called **after** ``prepare_model()``.
+
+        Example::
+
+            model = engine.prepare_model("meta-llama/Llama-2-7b-hf")
+            optimizer = engine.prepare_optimizer(torch.optim.AdamW, lr=1e-4)
+
+        Returns the created optimizer (also stored as ``self.optimizer``).
+        """
         if self.model is None:
             raise RuntimeError("No model prepared. Call engine.prepare_model() first.")
 
-        optimizer_name = self.config.optimizer.name
-        if optimizer_name is not None:
-            if optimizer_cls is not None or kwargs:
-                raise ValueError(
-                    "optimizer_cls and optimizer kwargs cannot be supplied when "
-                    f"using engine-managed optimizer {optimizer_name!r}"
-                )
-            if optimizer_name == MuonPlan.name:
-                optimizer_config = self.config.optimizer.muon
-                # The training framework's own optimizer arguments never reach an
-                # engine-managed optimizer, and its LR scheduler then scales from
-                # the values below. Say so, or a run silently uses a different LR
-                # than the one on the command line.
-                logger.warning_rank0(
-                    "Engine-managed optimizer %r uses lr=%s and weight_decay=%s "
-                    "from engine config optimizer.muon; framework optimizer "
-                    "arguments such as learning_rate and weight_decay are ignored.",
-                    optimizer_name,
-                    optimizer_config.lr,
-                    optimizer_config.weight_decay,
-                )
-                recipe = self.model.get_optimizer_recipe(optimizer_name)
-                plan = MuonPlan(
-                    self.model,
-                    recipe=recipe,
-                    config=optimizer_config,
-                    model_fqn_map=self.backend.get_model_fqn_map(),
-                )
-            else:
-                raise NotImplementedError(
-                    f"TorchTurboEngine cannot prepare optimizer {optimizer_name!r}"
-                )
-        else:
-            if optimizer_cls is None:
-                optimizer_cls = torch.optim.AdamW
-            plan = OptimizerClassPlan(
-                model=self.model,
-                optimizer_cls=optimizer_cls,
-                optimizer_kwargs=kwargs,
-            )
+        if optimizer_cls is None:
+            optimizer_cls = torch.optim.AdamW
 
-        self.optimizer = self.backend.prepare_optimizer(plan)
-        logger.info_rank0(
-            "Created optimizer %s from %r",
-            type(self.optimizer).__name__,
-            plan,
+        kwargs.setdefault("lr", 1e-4)
+        kwargs.setdefault("betas", (0.9, 0.999))
+        kwargs.setdefault("weight_decay", 1e-2)
+
+        self.optimizer = self.backend.prepare_optimizer(
+            self.model, optimizer_cls, **kwargs
         )
+        logger.info_rank0("Created optimizer: %s", type(self.optimizer).__name__)
         return self.optimizer
-
-    def offload_optimizer(self) -> None:
-        """Temporarily suspend optimizer use and release device state for inference.
-
-        Optimizer steps and checkpoint saves/loads are rejected until
-        restore_optimizer() is called. The CPU offload training configuration
-        keeps the optimizer usable and allows checkpoints.
-
-        Call on every training worker after zero_grad(set_to_none=True), with
-        no backward, optimizer step, or checkpoint in progress. Model weights
-        and inference resources are managed separately by the caller. The
-        engine-managed Muon optimizer requires FSDP parameters to keep their
-        storage: moving the model, for example with ``module.to()``, makes its
-        next step fail, so keep parameters in place or use full CPU offload.
-        """
-        if self.optimizer is None:
-            raise RuntimeError(
-                "No optimizer created. Call engine.prepare_optimizer() first."
-            )
-        self.backend.offload_optimizer()
-
-    def restore_optimizer(self) -> None:
-        """End temporary suspension and restore the optimizer's training policy.
-
-        Release inference allocations first. States configured to reside on CPU
-        remain there; execution workspaces are allocated by the next step.
-        """
-        if self.optimizer is None:
-            raise RuntimeError(
-                "No optimizer created. Call engine.prepare_optimizer() first."
-            )
-        self.backend.restore_optimizer()
 
     def prepare_lr_scheduler(
         self,
-        scheduler_cls: type | str,
-        *,
-        optimizer: torch.optim.Optimizer | None = None,
+        scheduler_cls: type,
         **kwargs: Any,
     ) -> Any:
         """Create an LR scheduler for the optimizer.
 
         Must be called **after** ``prepare_optimizer()``.
 
-        A scheduler name uses the engine's named scheduler factory. A scheduler
-        class is constructed directly. The scheduler binds to ``optimizer``
-        when supplied, or to the engine's optimizer otherwise. Base learning
-        rates come from the bound optimizer's parameter groups.
-
         Example::
 
-            optimizer = engine.prepare_optimizer(
-                torch.optim.AdamW,
-                lr=1e-4,
-                weight_decay=1e-2,
-            )
+            optimizer = engine.prepare_optimizer(torch.optim.AdamW, lr=1e-4)
             scheduler = engine.prepare_lr_scheduler(
                 CosineAnnealingLR, T_max=1000,
             )
@@ -709,19 +501,13 @@ class TorchTurboEngine:
                 "No optimizer created. Call engine.prepare_optimizer() first."
             )
 
-        if optimizer is None:
-            optimizer = self.optimizer
-        if isinstance(scheduler_cls, str):
-            self.lr_scheduler = create_lr_scheduler(scheduler_cls, optimizer, **kwargs)
-        else:
-            self.lr_scheduler = scheduler_cls(optimizer, **kwargs)
+        self.lr_scheduler = scheduler_cls(self.optimizer, **kwargs)
         logger.info_rank0("Created LR scheduler: %s", type(self.lr_scheduler).__name__)
         return self.lr_scheduler
 
     def _resolve_parallel_plan(self, model: nn.Module):
         """Resolve the parallel plan for a model."""
         from ..models.base import TurboModel
-        from ..parallel import VisionBalanceSpec
 
         if not isinstance(model, TurboModel):
             raise TypeError(
@@ -730,8 +516,17 @@ class TorchTurboEngine:
             )
 
         plan = type(model).get_default_parallel_plan()
+        logger.info_rank0(
+            "Auto-discovered default parallel plan from %s "
+            "(plan_keys=%d, sp=%d, ep=%d)",
+            type(model).__name__,
+            len(getattr(plan, "plan", {})),
+            getattr(plan, "sp_size", 1),
+            getattr(plan, "ep_size", 1),
+        )
 
         if self.config.parallel_plan is not None:
+            logger.info_rank0("Overriding parallel plan with engine config")
             engine_plan = self.config.parallel_plan
 
             for attr in ["sp_size", "ep_size"]:
@@ -742,36 +537,20 @@ class TorchTurboEngine:
             if hasattr(engine_plan, "plan") and engine_plan.plan:
                 if not hasattr(plan, "plan") or plan.plan is None:
                     plan.plan = {}
-                for fqn, engine_spec in engine_plan.plan.items():
-                    base = plan.plan.get(fqn)
-                    if base is not None and dataclasses.is_dataclass(base):
-                        overrides = {}
-                        for f in dataclasses.fields(engine_spec):
-                            value = getattr(engine_spec, f.name)
-                            if value is not None:
-                                if (
-                                    isinstance(value, VisionBalanceSpec)
-                                    and base.vision_balance is not None
-                                ):
-                                    base_vision = base.vision_balance
-                                    value = VisionBalanceSpec(
-                                        mode=(
-                                            value.mode
-                                            if value.mode is not None
-                                            else base_vision.mode
-                                        ),
-                                        io=(
-                                            value.io
-                                            if value.io is not None
-                                            else base_vision.io
-                                        ),
-                                    )
-                                overrides[f.name] = value
-                        plan.plan[fqn] = dataclasses.replace(base, **overrides)
-                    else:
-                        plan.plan[fqn] = engine_spec
+                plan.plan.update(engine_plan.plan)
 
+        logger.info_rank0(
+            "Parallel Plan for %s (sp=%d, ep=%d)",
+            type(model).__name__,
+            getattr(plan, "sp_size", 1),
+            getattr(plan, "ep_size", 1),
+        )
         return plan
+
+    # ------------------------------------------------------------------
+    # Hook management
+    # ------------------------------------------------------------------
+
 
     # ------------------------------------------------------------------
     # Profiling
@@ -870,52 +649,50 @@ class TorchTurboEngine:
         num_workers: int = 0,
         pin_memory: bool = True,
         drop_last: bool = True,
-        seed: int = 0,
         **kwargs: Any,
     ) -> Any:
         """Create a DataLoader with SP-aware distributed sampling.
 
-        All ranks in an SP group receive the same batches. With ``tt_gbs``
-        set, ``drop_last`` drops only the tail that cannot fill one more
-        whole optimizer step.
+        When ``sp_size > 1``, uses ``DistributedSampler`` with
+        ``num_replicas=dp_size`` and ``rank=dp_rank``, so that all
+        ranks in the same SP group receive the **same batch**.
 
         Example::
 
             dataloader = engine.create_dataloader(
                 dataset, batch_size=4,
             )
-            trainer.train()
+            for batch in dataloader:
+                loss = engine.compute_loss(model, batch)
 
         Parameters
         ----------
         dataset:
             A ``torch.utils.data.Dataset``.
+        sp_size:
+            Sequence parallel size.  ``1`` = standard DP.
         batch_size:
             Per-rank micro-batch size.
         """
+        from torch.utils.data import DataLoader, DistributedSampler
+
         dp_info = self.get_dp_info()
         sp_info = self.get_sp_info()
 
-        # Block granularity: whole optimizer steps (ga * batch_size per
-        # rank) with tt_gbs, else the legacy full-world-sweep layout.
-        gbs = self.config.gbs
-        if gbs is not None:
-            gradient_accumulation_steps = self._ga_from_gbs(
-                gbs, sp_info["sp_size"], dist.get_world_size()
-            )
-            rank_block = gradient_accumulation_steps * batch_size
-        else:
-            rank_block = sp_info["sp_size"]
-
-        sampler = DPBlockDistributedSampler(
+        # sampler = DistributedSampler(
+        #     dataset,
+        #     num_replicas=dp_info["dp_size"],
+        #     rank=dp_info["dp_rank"],
+        #     shuffle=shuffle,
+        #     drop_last=drop_last,
+        # )
+        # To align with version v1
+        sampler = GatherAndInnerLoopSPDistributedSampler(
             dataset,
+            sp_size=sp_info["sp_size"],
             num_replicas=dist.get_world_size(),
             rank=dist.get_rank(),
-            dp_size=dp_info["dp_size"],
-            dp_rank=dp_info["dp_rank"],
-            rank_block=rank_block,
             shuffle=shuffle,
-            seed=seed,
             drop_last=drop_last,
         )
 
@@ -926,7 +703,7 @@ class TorchTurboEngine:
             sp_info["sp_size"],
         )
 
-        return EpochDrivenDataLoader(
+        return DataLoader(
             dataset,
             batch_size=batch_size,
             sampler=sampler,
@@ -935,6 +712,10 @@ class TorchTurboEngine:
             drop_last=drop_last,
             **kwargs,
         )
+
+    # ------------------------------------------------------------------
+    # Training
+    # ------------------------------------------------------------------
 
     def fit(
         self,
@@ -971,147 +752,35 @@ class TorchTurboEngine:
         """Get sequence-parallel rank, size and group."""
         return self.backend.get_sp_info()
 
-    @staticmethod
-    def _ga_from_gbs(gbs: int, sp_size: int, world_size: int) -> int:
-        """ga = gbs * sp_size / world_size (= gbs / dp_size). Single source of
-        truth shared by the training loop and the sampler block sizing so the
-        two cannot drift apart."""
-        if (gbs * sp_size) % world_size != 0:
-            raise ValueError(
-                f"tt_gbs({gbs}) * sp_size({sp_size}) must be divisible by "
-                f"world_size({world_size}); got remainder "
-                f"{(gbs * sp_size) % world_size}."
-            )
-        return (gbs * sp_size) // world_size
-
-    def resolve_gradient_accumulation_steps(self, framework_ga: int) -> int:
-        """Return the ``gradient_accumulation_steps`` for the training loop.
-
-        Two modes:
-        - ``tt_gbs`` set (``--tt_gbs``): derive ``ga = tt_gbs * sp_size /
-          world_size``.
-        - ``tt_gbs`` unset: fall back to ``framework_ga * sp_size``
-        """
-        sp_size = int(self.get_sp_info().get("sp_size", 1))
-        world_size = dist.get_world_size() if dist.is_initialized() else 1
-        gbs = self.config.gbs
-        if gbs is not None:
-            if framework_ga > 1:
-                raise ValueError(
-                    f"Cannot set both tt_gbs ({gbs}) and "
-                    f"gradient_accumulation_steps ({framework_ga}) at the same "
-                    f"time; pick one — tt_gbs will derive ga from gbs*sp/world."
-                )
-            ga = self._ga_from_gbs(gbs, sp_size, world_size)
-            logger.info_rank0(
-                "gbs=%d, sp=%d: gradient_accumulation_steps = %d*%d/%d = %d "
-                "(overriding framework ga=%d)",
-                gbs, sp_size, gbs, sp_size, world_size, ga, framework_ga,
-            )
-            return ga
-        logger.info_rank0(
-            "sp=%d: gradient_accumulation_steps %d -> %d (step compensated)",
-            sp_size, framework_ga, framework_ga * sp_size,
-        )
-        return framework_ga * sp_size
-
     def get_ep_info(self) -> dict[str, Any]:
         """Get expert-parallel rank, size and group."""
         return self.backend.get_ep_info()
 
-    def _prepare_moe_runtime(
-        self,
-        model: nn.Module,
-        inputs: Any,
-        gradient_accumulation_steps: int,
-    ) -> None:
-        """Inject MoE runtime inputs and update the training aux-loss scale."""
-        from ..models.modules.moe.moe_layer import BaseMoELayer
-
-        moe_layers = [
-            module for module in model.modules() if isinstance(module, BaseMoELayer)
-        ]
-        if not moe_layers:
-            return
-
-        from ..models.modules.moe.moe_utils import MoEAuxLossAutoScaler
-
-        if model.training:
-            aux_loss_scale = 1.0 / gradient_accumulation_steps
-            MoEAuxLossAutoScaler.set_loss_scale(aux_loss_scale)
-
-        runtime_inputs = model.get_moe_runtime_inputs(
-            inputs, self._get_parallel_context()
-        )
-        for module in moe_layers:
-            module.set_runtime_inputs(runtime_inputs)
 
     def compute_loss(
-        self,
-        model: nn.Module,
-        inputs: Any,
-        return_outputs: bool = False,
-        num_items_in_batch: int | None = None,
-        gradient_accumulation_steps: int = 1,
-        **kwargs,
+        self, model: nn.Module, inputs: Any, return_outputs: bool = False, **kwargs
     ):
-        """Compute the scalar loss for a single micro-batch.
+        """Compute the scalar loss for a single micro-batch."""
+        if self.config.mfu.enabled and model.training:
+            self._get_mfu_estimator().record_micro(inputs)
+        return self.backend.compute_loss(model, inputs, return_outputs, **kwargs)
 
-        Packed SFT batches contain one token row and validated cu/max metadata.
-        Sequence boundaries reach the models only as ``cu_seq_lens_q/k``;
-        batches carrying ``attention_mask`` are rejected.
-        """
-        inputs = model.on_prepare_inputs(inputs)
-        inputs = self.backend.prepare_inputs(model, inputs)
-        if model.training:
-            self._record_micro(inputs)
-        self._prepare_moe_runtime(
-            model, inputs, gradient_accumulation_steps
-        )
-        result = self.backend.compute_loss(
-            model,
-            inputs,
-            return_outputs,
-            num_items_in_batch=num_items_in_batch,
-            **kwargs,
-        )
-        if return_outputs:
-            self._record_mtp_outputs(result[1], gradient_accumulation_steps)
-        return result
-
-    def collect_metrics(self, model: nn.Module) -> None:
-        """Collect metrics currently pending on ``model``."""
-        self.metric_tracker.collect(model)
-
-    def report_metrics(self, logs: dict, gather: Callable) -> None:
-        """Flush engine metrics into ``logs``"""
-        if self.config.mfu.enabled:
-            self.metric_tracker.record(self._get_mfu_estimator().report())
-        self.metric_tracker.report(logs, gather)
-
-    # ------------------------------------------------------------------
-    # Online MFU / HFU estimation
-    # ------------------------------------------------------------------
     def _get_mfu_estimator(self):
-        """Build the MFU estimator once by extracting what it needs from the engine/model."""
-        if self._mfu_estimator is not None:
-            return self._mfu_estimator
+        if self._mfu_estimator is None:
+            from .metrics import MFUEstimator
 
-        from .metrics import MFUEstimator
-        self._mfu_estimator = MFUEstimator(
-            flops_cls=self.model.get_flops_class(),
-            engine_config=self.config,
-            model_config=self.model.config,
-            parallel_context=self._get_parallel_context(),
-            runtime=self.device_runtime,
-        )
-
+            self._mfu_estimator = MFUEstimator(
+                recipe=self.model.get_flops_class()(self.model.config),
+                config=self.config,
+                sp_size=self.get_sp_info()["sp_size"],
+                runtime=self.device_runtime,
+            )
         return self._mfu_estimator
 
-    def _record_micro(self, inputs: Any) -> None:
-        """Feed one micro-batch to the MFU estimator."""
-        if self.config.mfu.enabled:
-            self._get_mfu_estimator().record_micro(inputs)
+    def report_metrics(self, logs: dict, gather: Callable) -> None:
+        """Flush pending MFU/HFU estimates into a training log dictionary."""
+        if self.config.mfu.enabled and self._mfu_estimator is not None:
+            self._mfu_estimator.report(logs, gather)
 
     def compute_diffusion_loss(
         self,
@@ -1132,38 +801,8 @@ class TorchTurboEngine:
         )
 
     # ------------------------------------------------------------------
-    # MTP loss recording (reported via the shared metric_tracker)
+    # forward / backward API for RL
     # ------------------------------------------------------------------
-
-    def _record_mtp_outputs(
-        self, outputs: Any, gradient_accumulation_steps: int
-    ) -> None:
-        """Record MTP losses stamped on ``outputs`` into ``metric_tracker``.
-
-        The backend sets ``outputs.mtp_loss`` (a list of per-head losses) plus
-        optional ``mtp_loss_scaled`` / ``main_loss`` when MTP (multi-token
-        prediction) is enabled.
-        """
-        mtp_loss = getattr(outputs, "mtp_loss", None)
-        if not mtp_loss:
-            return
-
-        scale = float(gradient_accumulation_steps)
-        metrics: dict[str, torch.Tensor] = {
-            f"mtp_loss/{i}": m * scale for i, m in enumerate(mtp_loss)
-        }
-        # Per-micro-batch mean across heads; the tracker's reduction of this
-        # equals the mean of the per-head ``mtp_loss/{i}`` series.
-        metrics["mtp_loss/avg"] = (sum(mtp_loss) / len(mtp_loss)) * scale
-
-        main_loss = getattr(outputs, "main_loss", None)
-        if main_loss is not None:
-            metrics["mtp_loss/main"] = main_loss * scale
-        scaled_loss = getattr(outputs, "mtp_loss_scaled", None)
-        if scaled_loss is not None:
-            metrics["mtp_loss/scaled"] = scaled_loss * scale
-
-        self.metric_tracker.record(metrics)
 
     def prepare_packed_micro_batch(
         self,
@@ -1172,11 +811,9 @@ class TorchTurboEngine:
     ) -> dict[str, Any]:
         """Create padded model inputs from a packed micro-batch.
 
-        Model inputs use the same backend padding as SFT. The micro-batch
-        ``cu_seqlens`` reach the model as ``cu_seq_lens_q/k``, the same
-        boundary metadata as SFT. Rolled token IDs are aligned to that layout
-        and sliced for the local RL loss. Media tensors and grids stay global
-        and reach the model's input hook before padding.
+        This is the packed-token counterpart of the SFT ``compute_loss`` input
+        preparation.  The engine owns SP state and uses Ulysses helpers when
+        sequence parallelism is active.
         """
 
         input_ids = mb["input_ids"]
@@ -1190,35 +827,47 @@ class TorchTurboEngine:
                 seq_len, device=input_ids.device
             )
 
+        padded_input_ids = input_ids.unsqueeze(0)
+        padded_position_ids = position_ids.unsqueeze(0)
+        attention_mask = mb.get("attention_mask", None)
+        sp_info = self.get_sp_info()
+        sp_size = int(sp_info.get("sp_size", 1))
+
+        sp_pad_size = 0
+        input_ids_rolled = None
+        if sp_size > 1:
+            from torchturbo.adapters.rl.sp import pad_and_slice_packed_inputs
+
+            (
+                padded_input_ids,
+                padded_position_ids,
+                attention_mask,
+                sp_pad_size,
+                input_ids_rolled,
+            ) = pad_and_slice_packed_inputs(
+                padded_input_ids,
+                padded_position_ids,
+                attention_mask,
+                sp_info,
+            )
+
         max_seqlen = max(seqlens) if seqlens else total_len
         result = {
-            "input_ids": input_ids.unsqueeze(0),
-            "position_ids": position_ids.unsqueeze(0),
+            "input_ids": padded_input_ids,
+            "position_ids": padded_position_ids,
             "use_cache": False,
+            "cu_seqlens": cu_seqlens,
             "cu_seq_lens_q": cu_seqlens,
             "cu_seq_lens_k": cu_seqlens,
             "max_length_q": max_seqlen,
             "max_length_k": max_seqlen,
+            "max_seqlen": max_seqlen,
+            "attention_mask": attention_mask,
             "_pad_length": 0,
+            "_sp_pad_size": sp_pad_size,
         }
-        result = self.model.on_prepare_inputs(result, source_inputs=mb)
-        result = self.backend.prepare_inputs(self.model, result)
-        result["_sp_pad_size"] = result["input_ids"].size(-1) - total_len
-
-        sp_info = self.get_sp_info()
-        if sp_info["sp_size"] > 1:
-            from torchturbo.models.modules.attention.ulysses import slice_input_tensor
-
-            # Roll the original sequence before adding the ignored tail. The
-            # padded loss targets must remain valid vocabulary indices.
-            input_ids_rolled = torch.zeros_like(result["input_ids"])
-            input_ids_rolled[:, :total_len] = torch.roll(input_ids, shifts=-1, dims=0)
-            result["_input_ids_rolled"] = slice_input_tensor(
-                input_ids_rolled,
-                dim=1,
-                group=sp_info["sp_group"],
-                rank=sp_info["sp_rank"],
-            ).squeeze(0)
+        if input_ids_rolled is not None:
+            result["_input_ids_rolled"] = input_ids_rolled.squeeze(0)
         return result
 
     def forward_backward_batch(
@@ -1229,10 +878,7 @@ class TorchTurboEngine:
         loss_weight_fn: Callable[[dict[str, Any]], torch.Tensor],
         temperature: float = 1.0,
         forward_only: bool = False,
-        device: Optional[torch.device] = None,
-        auxiliary_loss_fn: Optional[
-            Callable[[Any, dict[str, Any], float], torch.Tensor]
-        ] = None,
+        device: Optional[torch.device] = None
     ) -> None:
         """Run packed-token forward and optional backward over micro-batches."""
 
@@ -1244,8 +890,7 @@ class TorchTurboEngine:
 
         for mb_idx, mb_item in enumerate(mb_list):
             inputs, ctx = prepare_packed_mb_inputs(mb_item)
-            outputs = self._forward_microbatch(inputs)
-            logits = self._get_main_logits(outputs)
+            logits = self._forward_microbatch(inputs)
 
             if process_fn is None:
                 logprobs, entropy = (
@@ -1264,27 +909,22 @@ class TorchTurboEngine:
             else:
                 loss = process_fn(logits, ctx, loss_fn)
 
-            scaled_policy_loss = self._scale_loss(
+            loss = self._scale_loss(
                 loss,
                 ctx,
                 total_loss_weight,
                 loss_multiplier,
                 loss_weight_fn,
             )
-            total_loss = scaled_policy_loss
 
-            if not forward_only and auxiliary_loss_fn is not None:
-                auxiliary_loss = auxiliary_loss_fn(outputs, ctx, loss_multiplier)
-                total_loss = total_loss + auxiliary_loss
-
-            if not forward_only:
+            if not forward_only and loss is not None:
                 if mb_idx == 0 and (not dist.is_initialized() or dist.get_rank() == 0):
                     logger.info_rank0(
                         "packed mb[%d] before backward, loss=%.6f",
                         mb_idx,
-                        total_loss.item(),
+                        loss.item(),
                     )
-                self._backward_loss(total_loss)
+                self._backward_loss(loss)
 
     @torch.no_grad()
     def compute_logprobs(
@@ -1301,8 +941,7 @@ class TorchTurboEngine:
         all_logprobs = []
         for mb_item in mb_list:
             inputs, ctx = prepare_packed_mb_inputs(mb_item)
-            outputs = self._forward_microbatch(inputs)
-            logits = self._get_main_logits(outputs)
+            logits = self._forward_microbatch(inputs)
             logprobs, _ = self._compute_logrobs_and_entropy(
                 logits,
                 ctx,
@@ -1312,11 +951,8 @@ class TorchTurboEngine:
             all_logprobs.append(logprobs.cpu())
         return torch.cat(all_logprobs, dim=0)
 
-    def _forward_microbatch(self, inputs: dict[str, Any]) -> Any:
-        return self.model(**inputs)
-
-    @staticmethod
-    def _get_main_logits(outputs: Any) -> torch.Tensor:
+    def _forward_microbatch(self, inputs: dict[str, Any]) -> torch.Tensor:
+        outputs = self.model(**inputs)
         logits = outputs.logits if hasattr(outputs, "logits") else outputs[0]
         return logits.squeeze(0)
 
@@ -1449,7 +1085,7 @@ class TorchTurboEngine:
             return
 
         # --- Architecture ---
-        logger.info_rank0("Model architecture:\n%s", model)
+        logger.debug_rank0("Model architecture:\n%s", model)
 
         # --- Sharding table ---
         try:
@@ -1486,7 +1122,8 @@ class TorchTurboEngine:
             )
 
         lines.append(sep)
-        logger.info_rank0("Parameter sharding map:\n%s", "\n".join(lines))
+        logger.debug_rank0("Parameter sharding map:\n%s", "\n".join(lines))
+
 
     def __repr__(self) -> str:
         setup_status = "ready" if self.model is not None else "not setup"

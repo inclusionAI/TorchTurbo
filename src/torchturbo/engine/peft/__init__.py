@@ -209,11 +209,6 @@ def apply_peft(
     if isinstance(peft_config, dict):
         peft_config = LoraConfig(**peft_config)
 
-    # Register the GroupedMLP handler for every target format. Explicit
-    # targets and the expanded targets saved in checkpoint metadata can name
-    # experts without the "all-linear" marker.
-    register_grouped_mlp_lora(peft_config)
-
     # Expand "all-linear" to include custom modules like GroupedMLP.
     expand_all_linear_targets(model, peft_config)
 

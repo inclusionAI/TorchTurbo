@@ -39,8 +39,6 @@ _mhc_pre = NpuMhcPreSinkhorn()
 
 
 def npu_mhc_pre(self, hidden, kind):
-    if os.environ.get("TORCHTURBO_ENABLE_NPU_MHC", "0") != "1":
-        return self._glm5_reference_pre(hidden, kind)
     phi = getattr(self, f"hc_{kind}_fn")
     alpha = getattr(self, f"hc_{kind}_scale")
     bias = getattr(self, f"hc_{kind}_base")

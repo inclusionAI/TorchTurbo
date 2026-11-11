@@ -18,12 +18,10 @@ from ...registry import register_op
 class NpuRotaryPositionEmbedding(OpImpl):
     def available(self) -> bool:
         try:
-            import torch_npu
-
-            torch_npu.npu_rotary_mul  # noqa: B018
+            from mindspeed.ops.npu_rotary_position_embedding import (  # noqa: F401
+                npu_rotary_position_embedding,
+            )
         except ImportError:
-            return False
-        except AttributeError:
             return False
         return True
 
@@ -34,13 +32,8 @@ class NpuRotaryPositionEmbedding(OpImpl):
         sin: torch.Tensor,
         mode: int = 0,
     ):
-        import torch_npu
+        from mindspeed.ops.npu_rotary_position_embedding import (
+            npu_rotary_position_embedding,
+        )
 
-        if mode == 0:
-            rotary_mode = "half"
-        elif mode == 1:
-            rotary_mode = "interleave"
-        else:
-            raise ValueError(f"RoPE mode must be 0 or 1, but got {mode}.")
-
-        return torch_npu.npu_rotary_mul(x, cos, sin, rotary_mode=rotary_mode)
+        return npu_rotary_position_embedding(x, cos, sin, mode)

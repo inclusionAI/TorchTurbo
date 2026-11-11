@@ -487,7 +487,7 @@ class GroupedMLPLoRA(nn.Module, BaseTunerLayer):
             adapter_layer[adapter_name] = adapter_layer[adapter_name].to(device)
 
     # ------------------------------------------------------------------
-    # Delta weight computation (used by merge/unmerge)
+    # Delta weight computation (used by merge/unmerge and zero-token fallback)
     # ------------------------------------------------------------------
 
     def _compute_deltas(
@@ -723,16 +723,20 @@ class GroupedMLPLoRA(nn.Module, BaseTunerLayer):
 
         else:
             # No tokens allocated to local experts.
-            # Preserve the output shape and keep local LoRA parameters in the
-            # autograd graph so FSDP still receives zero gradients.
+            # Fall back to delta-weight approach for gradient flow.
             assert torch.count_nonzero(tokens_per_expert) == 0
-            zero = permuted_local_hidden_states.sum() * 0
-            for adapter_name in active:
-                zero = zero + self.lora_A[adapter_name].weight.sum() * 0
-                zero = zero + self.lora_B[adapter_name].weight.sum() * 0
-                zero = zero + self.lora_A2[adapter_name].weight.sum() * 0
-                zero = zero + self.lora_B2[adapter_name].weight.sum() * 0
-            fc2_output = torch.zeros_like(permuted_local_hidden_states) + zero
+
+            delta_w1, delta_w2 = self._compute_deltas(active)
+
+            w1 = base.weight1.view(H, -1)
+            w2 = base.weight2.view(-1, H)
+            if delta_w1 is not None:
+                w1 = w1 + delta_w1.view_as(base.weight1)
+            if delta_w2 is not None:
+                w2 = w2 + delta_w2.view_as(base.weight2)
+            h = torch.matmul(permuted_local_hidden_states, w1)
+            h = base.activation_func_with_probs(h, permuted_probs.unsqueeze(-1))
+            fc2_output = torch.matmul(h, w2)
 
         return fc2_output, None
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any
 from transformers import PretrainedConfig
@@ -12,13 +13,11 @@ from torch.optim import Optimizer
 
 from ...logging import get_logger
 from ...runtime import DeviceRuntime
-from ..model_fqn import ModelFQNMap
 from ..checkpoint.format import ComponentStatus
 
 if TYPE_CHECKING:
     from ...models.weight_converter import BaseWeightConverter
     from ..config import EngineConfig
-    from ..optimizers.plan import OptimizerPlan
 
 
 class BaseCheckpointManager(ABC):
@@ -115,7 +114,6 @@ class BaseBackend(ABC):
                 "select the process device runtime first."
             )
         self._device_runtime = device_runtime
-        self._model_fqn_map: ModelFQNMap | None = None
 
     @property
     def device_runtime(self) -> DeviceRuntime:
@@ -124,14 +122,6 @@ class BaseBackend(ABC):
     @property
     def device(self) -> torch.device:
         return self._device_runtime.device
-
-    def get_model_fqn_map(self) -> ModelFQNMap:
-        """Return the FQN map captured while preparing the current model."""
-        if self._model_fqn_map is None:
-            raise RuntimeError(
-                "Model FQN map is unavailable. Call prepare_model() first."
-            )
-        return self._model_fqn_map
 
     @abstractmethod
     def prepare_model(
@@ -157,35 +147,35 @@ class BaseBackend(ABC):
         """
 
     @abstractmethod
-    def materialize(self, model: nn.Module) -> nn.Module:
-        """Materialize a prepared model without loading source weights."""
-
-    def finalize_model_load(self, model: nn.Module) -> nn.Module:
-        """Run backend setup that requires materialized model parameters."""
-        return model
+    def load_model(
+        self,
+        model: nn.Module,
+        model_name_or_path: str,
+        parallel_context: dict[str, Any],
+        load_weights: bool = True,
+    ) -> nn.Module:
+        """Load weights or materialize the model without checkpoint I/O."""
 
     @abstractmethod
-    def create_checkpoint_manager(self) -> BaseCheckpointManager:
-        """Create checkpoint I/O after the backend has prepared its topology."""
+    def save_model(
+        self,
+        model: nn.Module,
+        model_name_or_path: str,
+        output_dir: str,
+        parallel_context: dict[str, Any],
+        **kwargs: Any,
+    ) -> None:
+        """Save weights."""
 
     @abstractmethod
     def prepare_optimizer(
-        self,
-        plan: OptimizerPlan,
-    ) -> Optimizer:
-        """Return a validated optimizer with all plan-defined step hooks installed."""
+        self, model: nn.Module, optimizer_cls: type, **optimizer_kwargs
+    ) -> Any:
+        """Create an optimizer compatible with this backend.
 
-    def offload_optimizer(self) -> None:
-        """Release prepared optimizer device resources at a cleared-gradient boundary."""
-        raise NotImplementedError(
-            f"{type(self).__name__} does not support optimizer offload"
-        )
-
-    def restore_optimizer(self) -> None:
-        """Restore the prepared optimizer's configured training state locations."""
-        raise NotImplementedError(
-            f"{type(self).__name__} does not support optimizer restore"
-        )
+        Some backends (e.g. Megatron) require engine-managed optimizers.
+        The default can just instantiate the class normally.
+        """
 
     @abstractmethod
     def get_dp_info(self) -> dict[str, Any]:
@@ -207,17 +197,6 @@ class BaseBackend(ABC):
 
         Override in subclass for distributed backends.
         """
-
-    @abstractmethod
-    def get_parallel_context(self) -> dict[str, Any]:
-        """Return parallel-context dict of EP/SP/DP info.
-
-        Override in subclass for distributed backends.
-        """
-
-    def prepare_inputs(self, model: nn.Module, inputs: Any) -> Any:
-        """Apply backend-specific input layout requirements before a step."""
-        return inputs
 
     @abstractmethod
     def compute_loss(

@@ -37,6 +37,8 @@ logger = get_logger(__name__)
 ENV_MAP: dict[str, str] = {
     "TORCH_TURBO_BACKEND": "backend",
     "TORCH_TURBO_MEGA_MOE": "mega_moe",
+    "TORCH_TURBO_LOG_MFU": "mfu.enabled",
+    "TORCH_TURBO_CARD_NAME": "mfu.card",
     "TORCH_TURBO_MIXED_PRECISION": "mixed_precision",
     "TORCH_TURBO_OP_POLICY": "ops.policy",
     "TORCH_TURBO_GRADIENT_CHECKPOINTING": "activation_checkpointing.enabled",
@@ -106,6 +108,17 @@ class MixedPrecisionPolicy(str, Enum):
     FP16 = "fp16"
     FP32 = "fp32"
     FP8 = "fp8"
+
+
+@dataclass
+class MfuConfig:
+    """Opt-in theoretical MFU/HFU logging with a per-device peak table."""
+
+    enabled: bool = False
+    card: str | None = None
+
+    def __post_init__(self) -> None:
+        self.enabled = string_to_bool(self.enabled)
 
 
 @dataclass
@@ -305,6 +318,9 @@ class EngineConfig:
     mega_moe: bool = False
     """Use the opt-in BF16 NPU MegaMoE/MoonEP backend for grouped experts."""
 
+    mfu: MfuConfig = field(default_factory=MfuConfig)
+    """Model and hardware FLOP utilization reporting settings."""
+
     ops: OpsConfig = field(default_factory=OpsConfig)
     """Op dispatch settings."""
 
@@ -451,6 +467,9 @@ class EngineConfig:
         ac_d = d.get("activation_checkpointing", {})
         ac = ActivationCheckpointingConfig(**ac_d)
 
+        mfu_d = d.get("mfu", {})
+        mfu = mfu_d if isinstance(mfu_d, MfuConfig) else MfuConfig(**mfu_d)
+
         # Communication
         comm_d = d.get("comm", {})
         if not comm_d:
@@ -491,6 +510,7 @@ class EngineConfig:
             "backend",
             "mixed_precision",
             "mega_moe",
+            "mfu",
             "parallel",
             "fsdp",
             "backend_config",
@@ -528,6 +548,7 @@ class EngineConfig:
             parallel_plan=parallel_plan,
             mixed_precision=mp,
             mega_moe=d.get("mega_moe", False),
+            mfu=mfu,
             ops=ops,
             backend_config=backend_config,
             activation_checkpointing=ac,
@@ -652,6 +673,7 @@ def build_from_args(torchturbo_args: TorchTurboArgs | None) -> EngineConfig:
         parallel_plan=parallel_plan,
         mixed_precision=mixed_precision,
         mega_moe=tt.mega_moe,
+        mfu=MfuConfig(enabled=tt.log_mfu, card=tt.card_name),
         backend_config=fsdp_config,
         activation_checkpointing=ac_config,
         comm=CommConfig(overlap_comm_compute=False),

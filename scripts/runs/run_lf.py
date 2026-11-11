@@ -84,10 +84,6 @@ def main():
 
     from llamafactory.train.tuner import run_exp
 
-    # # Deterministic computation
-    # import torch
-    # torch.use_deterministic_algorithms(True)
-
     run_exp(args=remaining_argv)
 
 

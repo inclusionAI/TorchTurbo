@@ -129,6 +129,12 @@ class TurboGlm5NextForConditionalGeneration(
     def visual(self):
         return self.model.visual
 
+    def get_flops_class(self) -> type:
+        """Return the GLM-5.3-Flash text FLOP recipe."""
+        from .mfu import Glm5NextFlops
+
+        return Glm5NextFlops
+
     def get_norm(self):
         return self.model.language_model.norm
 

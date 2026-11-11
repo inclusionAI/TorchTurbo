@@ -125,6 +125,8 @@ class TorchTurboArgs:
     freeze_vision_tower: bool = False
     freeze_multi_modal_projector: bool = False
     freeze_language_model: bool = False
+    log_mfu: bool = False
+    card_name: str | None = None
     profiling: bool = False
     memory_snapshot_steps: int | None = None
     log_level: LogLevel = LogLevel.INFO
@@ -348,6 +350,16 @@ def _build_parser() -> argparse.ArgumentParser:
              "Only affects the BD dataset path.",
     )
     parser.add_argument(
+        "--tt_log_mfu", type=string_to_bool, nargs="?", const=True,
+        default=False, metavar="BOOL",
+        help="Log theoretical MFU/HFU estimates at training log intervals.",
+    )
+    parser.add_argument(
+        "--tt_card_name", default=None, metavar="CARD",
+        help="MFU peak table: 910b, 910c, h20, a100, h100, h200. "
+             "Defaults to 910c on NPU and h20 on CUDA.",
+    )
+    parser.add_argument(
         "--tt_profiling",
         type=string_to_bool,
         nargs="?",
@@ -418,6 +430,8 @@ def parse_torchturbo_args(argv: list[str]) -> tuple[TorchTurboArgs, list[str]]:
         freeze_vision_tower=parsed.tt_freeze_vision_tower,
         freeze_multi_modal_projector=parsed.tt_freeze_multi_modal_projector,
         freeze_language_model=parsed.tt_freeze_language_model,
+        log_mfu=parsed.tt_log_mfu,
+        card_name=parsed.tt_card_name,
         profiling=parsed.tt_profiling,
         memory_snapshot_steps=parsed.tt_memory_snapshot_steps,
         cap_lambda=parsed.tt_cap_lambda,

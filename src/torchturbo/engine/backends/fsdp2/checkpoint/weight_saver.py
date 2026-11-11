@@ -1,72 +1,21 @@
-import gc
 import json
-import math
 import os
 import shutil
 import time
-from functools import partial
 from pathlib import Path
-from typing import Any
-
 import psutil
+import gc
+
 import torch
 import torch.distributed as dist
 from safetensors.torch import save_file
 from torch.distributed._tensor import DTensor
-from transformers.utils import CONFIG_NAME
 
 from torchturbo.engine.peft.weights import apply_lora_delta, build_lora_delta_map
 from torchturbo.engine.utils import is_peft_adapter_param, strip_peft_prefix
 from torchturbo.logging import get_logger
-from torchturbo.models.modules.cpu_resident import CPUResidentParameter
-
-from ....checkpoint.distributed import collective_check, rank_zero_call
-from ....checkpoint.layout import HF_INDEX_FILE, save_json, sync_directory
 
 logger = get_logger(__name__)
-
-# Serialized locations of the MTP layer count. Composite configs nest it under
-# their language config (llm_config is an alias of text_config), and Qwen3.5
-# configs name it mtp_num_hidden_layers.
-_MTP_LAYER_COUNT_PATHS = (
-    ("num_nextn_predict_layers",),
-    ("mtp_num_hidden_layers",),
-    ("text_config", "num_nextn_predict_layers"),
-    ("text_config", "mtp_num_hidden_layers"),
-    ("llm_config", "num_nextn_predict_layers"),
-)
-
-
-def _sync_mtp_layer_count(config_path: Path, runtime_config: dict[str, Any]) -> None:
-    """Record the trained MTP layer count in a copied source ``config.json``.
-
-    Training with MTP disabled strips the MTP layers, so the export holds no
-    MTP weights and its config must not declare any. Every other field keeps
-    its source value, and the file stays byte-identical when the MTP layer
-    counts it declares match the runtime config.
-
-    Args:
-        config_path: ``config.json`` copied from the source model.
-        runtime_config: ``to_dict()`` of the model config used for training.
-            It serializes the MTP layer count at the same locations as the
-            source file.
-    """
-    with open(config_path) as config_file:
-        data = json.load(config_file)
-    changed = False
-    for *parents, key in _MTP_LAYER_COUNT_PATHS:
-        source_section = data
-        runtime_section = runtime_config
-        for parent in parents:
-            source_section = source_section.get(parent, {})
-            runtime_section = runtime_section.get(parent, {})
-        if key not in source_section:
-            continue
-        if source_section[key] != runtime_section[key]:
-            source_section[key] = runtime_section[key]
-            changed = True
-    if changed:
-        save_json(data, str(config_path))
 
 
 class ShardedParamManager:
@@ -81,8 +30,6 @@ class ShardedParamManager:
         processing_class=None,
         is_cpu_offload: bool = False,
     ):
-        if weight_converter is None:
-            raise ValueError("weight_converter must not be None")
         self.move_to_cpu = True
         self.model = model
         self.device_runtime = device_runtime
@@ -118,11 +65,10 @@ class ShardedParamManager:
         # Load checkpoint index for format detection (fused vs per-expert)
         # and metadata preservation. Cached so the file is only read once.
         self._src_weight_map, self._src_metadata = (
-            collective_check(lambda: self._load_index_json(self.src_path))
+            self._load_index_json(self.src_path)
             if self.src_path is not None else ({}, {})
         )
         self.param_to_filename = self._src_weight_map
-        self._cpu_keys = {}
         self.local_params = self._build_meta_info()
         self._lora_delta_map = build_lora_delta_map(model)
         if self._lora_delta_map:
@@ -215,12 +161,6 @@ class ShardedParamManager:
             if is_peft_adapter_param(clean_name):
                 continue
 
-            if isinstance(param, CPUResidentParameter):
-                collective_check(
-                    partial(self._register_cpu_keys, name, clean_name, param)
-                )
-                continue
-
             common_keys, expert_keys, size_map = (
                 self.param_converter.get_param_save_entries(
                     clean_name, param.numel(),
@@ -231,66 +171,23 @@ class ShardedParamManager:
             common_params.extend(common_keys)
             expert_params.extend(expert_keys)
 
-        for name, buf in self._persistent_buffers_to_save().items():
+        for name, buf in self.model.named_buffers():
             clean_name = strip_peft_prefix(name)
-            hf_buffer_name = self.param_converter.convert_persist_buffer(clean_name)
-            common_params.append(hf_buffer_name)
-            self.param_size_map[hf_buffer_name] = buf.numel() * buf.element_size()
+            if self.param_converter.is_persist_buffer(clean_name):
+                hf_buffer_name = self.param_converter.convert_persist_buffer(clean_name)
+                common_params.append(hf_buffer_name)
+                self.param_size_map[hf_buffer_name] = buf.numel() * buf.element_size()
 
         self._assign_param_to_ranks(expert_params, self.edp_ranks, common_params)
-        parameters = dict(self.model.named_parameters())
-        for name, keys in self._cpu_keys.items():
-            param = parameters[name]
-            # Each parameter assigns its source shards to saving ranks.
-            for index, key in enumerate(keys):
-                owner = param.shard_owner(index)
-                self._update_per_shard([key], owner)
-                self.rank_to_params[owner].append(key)
 
         elapsed = time.perf_counter() - start_time
         logger.info_rank0("[save] meta info built in %.2fs", elapsed)
 
         return set(self.rank_to_params[self.rank])
 
-    def _register_cpu_keys(
-        self, name: str, clean_name: str, param: CPUResidentParameter
-    ) -> None:
-        """Resolve the HF keys of a CPU parameter from its loaded source layout."""
-        if param.shard_sizes is None:
-            raise RuntimeError(
-                f"CPU parameter {name} has no shard layout; call load_ before HF export"
-            )
-        source = self.param_converter.get_omitted_tied_source(
-            clean_name, self.param_converter.to_hf_name(clean_name)
-        )
-        if source is not None:
-            keys = [source]
-        else:
-            keys, _, _ = self.param_converter.get_param_save_entries(
-                clean_name, param.numel(), self.param_to_filename
-            )
-        if len(keys) != len(param.shard_sizes):
-            raise ValueError(
-                f"CPU parameter {name} shard layout does not match its HF keys"
-            )
-        row_elements = math.prod(param.shape[1:])
-        for key, rows in zip(keys, param.shard_sizes, strict=True):
-            dtype = self.param_converter.get_default_hf_dtype(key)
-            element_size = torch.empty((), dtype=dtype, device="meta").element_size()
-            self.param_size_map[key] = rows * row_elements * element_size
-        self._cpu_keys[name] = keys
-
-    def _persistent_buffers_to_save(self) -> dict[str, torch.Tensor]:
-        """Return buffers selected by the model's checkpoint converter."""
-        return {
-            name: buffer
-            for name, buffer in self.model.named_buffers()
-            if self.param_converter.is_persist_buffer(strip_peft_prefix(name))
-        }
-
     def _load_index_json(self, path):
         """Load the model.safetensors.index.json file."""
-        index_path = Path(path) / HF_INDEX_FILE
+        index_path = Path(path) / "model.safetensors.index.json"
         if not index_path.exists():
             raise FileNotFoundError(f"Index file not found: {index_path}")
         with open(index_path) as f:
@@ -305,7 +202,7 @@ class ShardedParamManager:
         for item in Path(src_path).iterdir():
             if item.is_file():
                 # Skip safetensors files and index json
-                if item.suffix == '.safetensors' or item.name == HF_INDEX_FILE:
+                if item.suffix == '.safetensors' or item.name == 'model.safetensors.index.json':
                     continue
                 shutil.copy2(item, dst_path / item.name)
             elif item.is_dir():
@@ -367,18 +264,6 @@ class ShardedParamManager:
         )
         return staged.full_tensor()
 
-    def _collect_cpu_parameter(
-        self, name: str, param: CPUResidentParameter, state: dict[str, torch.Tensor]
-    ) -> None:
-        keys = self._cpu_keys[name]
-
-        def collect(index: int, tensor: torch.Tensor) -> None:
-            key = keys[index]
-            if key in self.local_params:
-                state[key] = self._normalize_tensor(key, tensor)
-
-        param.save(collect)
-
     def _get_local_hf_state_dict(self, local_params):
         """Build state_dict containing only the parameters this rank needs to save."""
         start_time = time.perf_counter()
@@ -398,9 +283,6 @@ class ShardedParamManager:
                 logger.debug_rank0("[saving] param: %s (original: %s)", clean_name, name)
             else:
                 logger.debug_rank0("[saving] param: %s", clean_name)
-            if isinstance(param, CPUResidentParameter):
-                self._collect_cpu_parameter(name, param, full_sd)
-                continue
             full_tensor = self._gather_full_tensor(param)
 
             # Merge LoRA deltas into the base weight without modifying the model.
@@ -422,17 +304,18 @@ class ShardedParamManager:
             if self._get_cpu_memory_usage_percent() >= 80 or self._get_gpu_memory_usage_percent() >= 80:
                 self._gc_cleanup()
 
-        for name, buf in self._persistent_buffers_to_save().items():
+        for name, buf in self.model.named_buffers():
             clean_name = strip_peft_prefix(name)
-            hf_buffer_name = self.param_converter.convert_persist_buffer(clean_name)
-            logger.debug_rank0("[saving] buffer: %s -> %s", clean_name, hf_buffer_name)
-            buf = self._gather_full_tensor(buf)
-            if hf_buffer_name in local_params:
-                value = self._normalize_tensor(hf_buffer_name, buf)
-                full_sd[hf_buffer_name] = value
-            del buf
-            if self._get_cpu_memory_usage_percent() >= 80 or self._get_gpu_memory_usage_percent() >= 80:
-                self._gc_cleanup()
+            if self.param_converter.is_persist_buffer(clean_name):
+                hf_buffer_name = self.param_converter.convert_persist_buffer(clean_name)
+                logger.debug_rank0("[saving] buffer: %s -> %s", clean_name, hf_buffer_name)
+                if isinstance(buf, DTensor):
+                    buf = buf.full_tensor()
+                if hf_buffer_name in local_params:
+                    full_sd[hf_buffer_name] = self._normalize_tensor(hf_buffer_name, buf)
+                del buf
+                if self._get_cpu_memory_usage_percent() >= 80 or self._get_gpu_memory_usage_percent() >= 80:
+                    self._gc_cleanup()
 
         # Final sync before returning
         missing_params = local_params - set(full_sd.keys())
@@ -479,76 +362,65 @@ class ShardedParamManager:
             start_index += num_shards_list[i]
         num_total_files = start_index
 
-        def write_files() -> tuple[dict[str, str], int]:
-            file_index = cur_start_index
-            weight_map = {}
-            total_size = 0
-            for cur_param_group in self.sharded_param_groups:
-                shard_dict = {}
-                if cur_param_group:
-                    file_name = f"model-{file_index:05d}-of-{num_total_files:05d}.safetensors"
-                    file_index += 1
-                for param in cur_param_group:
-                    assert param in self.local_params, f"param '{param}' not in local_params"
-                    assert param in state_dict, f"param '{param}' not in state_dict"
-                    shard_dict[param] = state_dict[param]
-                    tensor = shard_dict[param]
-                    total_size += tensor.numel() * tensor.element_size()
-                    weight_map[param] = file_name
-                if shard_dict:
-                    logger.debug(
-                        "[save][rank %d] Saving %s with %d params...",
-                        self.rank, file_name, len(shard_dict),
-                    )
-                    file_start = time.perf_counter()
-                    file_path = save_path / file_name
-                    save_file(shard_dict, file_path.as_posix())
-                    with open(file_path, "rb") as shard_file:
-                        os.fsync(shard_file.fileno())
-                    file_elapsed = time.perf_counter() - file_start
-                    logger.info(
-                        "[save][rank %d] Saved %s in %.2fs",
-                        self.rank, file_name, file_elapsed,
-                    )
+        # step 2, save to shared safetensors files
+        weight_map = {}
+        total_size = 0
+        for cur_param_group in self.sharded_param_groups:
+            shard_dict = {}
+            if cur_param_group:
+                file_name = f"model-{cur_start_index:05d}-of-{num_total_files:05d}.safetensors"
+                cur_start_index += 1
+            for param in cur_param_group:
+                assert param in self.local_params, f"param '{param}' not in local_params"
+                assert param in state_dict, f"param '{param}' not in state_dict"
+                shard_dict[param] = state_dict[param]
+                tensor = shard_dict[param]
+                total_size += tensor.numel() * tensor.element_size()
+                weight_map[param] = file_name
+            if shard_dict:
+                logger.debug_rank0(
+                    "[save][rank %d] Saving %s with %d params...",
+                    self.rank, file_name, len(shard_dict),
+                )
+                file_start = time.perf_counter()
+                file_path = save_path / file_name
+                save_file(shard_dict, file_path.as_posix())
+                file_elapsed = time.perf_counter() - file_start
+                logger.debug_rank0(
+                    "[save][rank %d] Saved %s in %.2fs",
+                    self.rank, file_name, file_elapsed,
+                )
 
-            return weight_map, total_size
-
-        saved_info = collective_check(write_files)
-
-        def write_metadata() -> None:
-            self._copy_non_safetensor_files(self.src_path, save_path)
-            if self.processing_class is not None:
-                self.processing_class.save_pretrained(save_path)
-            # The export keeps the source config; other training-time
-            # changes such as use_cache are not written back.
-            _sync_mtp_layer_count(save_path / CONFIG_NAME, self.model.config.to_dict())
-            # All shard writers have finished, including atomic renames. Sync
-            # config/tokenizer files before publishing the index.
-            for directory, _, files in os.walk(save_path):
-                for name in files:
-                    if name.endswith(".safetensors"):
-                        continue
-                    with open(os.path.join(directory, name), "rb") as file:
-                        os.fsync(file.fileno())
-                sync_directory(directory)
-
-        rank_zero_call(write_metadata)
         # step 3, deal with non-tensor metas
         saved_info_list = [None] * self.world_size
-        dist.all_gather_object(saved_info_list, saved_info)
+        dist.all_gather_object(saved_info_list, (weight_map, total_size))
         final_weight_map = {}
         total_size = 0
         for cur_map, cur_size in saved_info_list:
             final_weight_map.update(cur_map)
             total_size += cur_size
 
-        # Every writer has synced its shards and rank zero has synced the
-        # required metadata. The index is published only after that boundary.
-        rank_zero_call(lambda: save_json(
-            {"metadata": {**self._src_metadata, "total_size": total_size}, "weight_map": final_weight_map},
-            str(save_path / HF_INDEX_FILE),
-        ))
-        logger.info_rank0("[save] HF model saved to %s", save_path.absolute())
+        if self.rank == 0:
+            metadata = {**self._src_metadata, "total_size": total_size}
+            index_content = {
+                "metadata": metadata,
+                "weight_map": final_weight_map
+            }
+            with open(save_path / "model.safetensors.index.json", "w") as f:
+                json.dump(index_content, f, indent=2)
+
+            self._copy_non_safetensor_files(self.src_path, save_path)
+
+            update_config = getattr(self.param_converter, "update_saved_config", None)
+            if update_config is not None:
+                update_config(save_path)
+
+            if self.processing_class is not None:
+                self.processing_class.save_pretrained(save_path)
+
+            logger.info_rank0("[save] HF model saved to %s", save_path.absolute())
+        os.sync()
+        torch.distributed.barrier()
 
     def get_local_hf_state_dict(self):
         return self._get_local_hf_state_dict(self.local_params)
@@ -556,7 +428,8 @@ class ShardedParamManager:
     def save_model(self, save_path):
         save_path = Path(save_path)
 
-        save_path.mkdir(parents=True, exist_ok=True)
+        if self.rank == 0:
+            save_path.mkdir(parents=True, exist_ok=True)
 
         torch.distributed.barrier()  # Ensure directory is created
 

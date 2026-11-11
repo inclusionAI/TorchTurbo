@@ -1,37 +1,16 @@
-"""Engine metrics: running-mean tracker + online MFU/HFU estimation.
+"""Online model and hardware FLOP utilization estimates."""
 
-:class:`MFUEstimator` asks the live model (``model.get_flops_class()``) for a
-forward-FLOP recipe, sums the components per micro-batch, and derives MFU/HFU
-from the window wall-clock time. Models own their recipes (subclass
-``BaseModelFlops`` / ``LLMFlops`` / ``VLMFlops`` in :mod:`flops`); :mod:`op_flops`
-provides the FLOP primitives.
-"""
+from typing import Protocol
 
-from __future__ import annotations
+import torch
 
-from .tracker import MetricTracker
-from .flops import (
-    BaseModelFlops,
-    Component,
-    ComputeProfile,
-    DenseLLMFlops,
-    LLMFlops,
-    MlaLLMFlops,
-    MoELLMFlops,
-    VLMFlops,
-)
+
+class FlopsRecipe(Protocol):
+    """Model-specific theoretical forward work for a full, unsliced input."""
+
+    def forward_flops(self, inputs: dict[str, torch.Tensor]) -> int: ...
+
+
 from .mfu_estimator import MFUEstimator
 
-__all__ = [
-    "MetricTracker",
-    "MFUEstimator",
-    # Flops data types + reusable recipe bases (models subclass these).
-    "BaseModelFlops",
-    "Component",
-    "ComputeProfile",
-    "DenseLLMFlops",
-    "LLMFlops",
-    "MlaLLMFlops",
-    "MoELLMFlops",
-    "VLMFlops",
-]
+__all__ = ["FlopsRecipe", "MFUEstimator"]

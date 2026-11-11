@@ -390,7 +390,7 @@ class FSDP2Backend(BaseBackend):
         load_weights: bool = True,
     ):
         if load_weights:
-            from .weight_loader import DistParamLoader
+            from .checkpoint.weight_loader import DistParamLoader
 
             weight_converter = model.get_weight_converter(parallel_context)
             loader = DistParamLoader(
@@ -403,7 +403,7 @@ class FSDP2Backend(BaseBackend):
                 is_cpu_offload=self.fsdp_config.cpu_offload,
                 weight_converter=weight_converter,
             )
-            loader.load_weights()
+            loader.load_weights(assign=True)
         else:
             device = torch.device("cpu") if self.fsdp_config.cpu_offload else self.device
             model.to_empty(device=device)
@@ -452,15 +452,16 @@ class FSDP2Backend(BaseBackend):
         parallel_context: dict[str, Any],
         **kwargs: Any,
     ):
-        from .weight_saver import DistParamSaver
+        from .checkpoint.weight_saver import ShardedParamManager
 
         weight_converter = model.get_weight_converter(parallel_context)
-        saver = DistParamSaver(
+        saver = ShardedParamManager(
             model=model,
             rank=self.rank,
             mesh=self._mesh,
             path=model_name_or_path,
             processing_class=None,
+            is_cpu_offload=self.fsdp_config.cpu_offload,
             weight_converter=weight_converter,
             device_runtime=self.device_runtime,
         )

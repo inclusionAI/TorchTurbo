@@ -14,15 +14,16 @@ MODEL=${MODEL:-/models/GLM5-3-Flash}
 # output directory
 OUTPUT_DIR=${OUTPUT_DIR:-/tmp/tblf-sft/$(basename "$MODEL")}
 # sequence length
-SEQ_LEN=${SEQ_LEN:-4096}
+SEQ_LEN=${SEQ_LEN:-65536}
 # finetuning type
 FINETUNING_TYPE=${FINETUNING_TYPE:-full}
 # training dataset (must be registered in ${DATASET_DIR}/dataset_info.json)
 DATASET=${DATASET:-science}
-# turbo engine flags (sp/ep, freeze, cpu offload) live in the sibling yaml.
-TT_CONFIG=${TT_CONFIG:-"$(dirname "$0")/sft.yaml"}
-
-source /usr/local/Ascend/ascend-toolkit/set_env.sh
+sp_size=${SP_SIZE:-8}
+ep_size=${EP_SIZE:-32}
+mega_moe=${MEGA_MOE:-true}
+freeze_vision_tower=${FREEZE_VISION_TOWER:-true}
+freeze_multi_modal_projector=${FREEZE_MULTI_MODAL_PROJECTOR:-true}
 
 export HCCL_CONNECT_TIMEOUT=7200
 export HCCL_EXEC_TIMEOUT=7200
@@ -47,28 +48,19 @@ export MASTER_ADDR=${MASTER_ADDR:-127.0.0.1}
 export MASTER_PORT=${MASTER_PORT:-23556}
 export ASCEND_PROCESS_LOG_PATH=$OUTPUT_DIR/log
 
+MHC_VENDOR_DIR="${MHC_OPP_ROOT:-/usr/local/Ascend/ops-transformer}/vendors/dsv41exp_transformer"
+export ASCEND_CUSTOM_OPP_PATH="${MHC_VENDOR_DIR}${ASCEND_CUSTOM_OPP_PATH:+:${ASCEND_CUSTOM_OPP_PATH}}"
+export LD_LIBRARY_PATH="${MHC_VENDOR_DIR}/op_api/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+export LD_LIBRARY_PATH=/usr/local/Ascend/ascend-toolkit/latest/opp/vendors/custom_transformer/op_api/lib/:${LD_LIBRARY_PATH}
+
 CUR_TIME=$(date "+%Y%m%d-%H%M%S")
 LOG_FILE=${LOG_FILE_PREFIX:-$OUTPUT_DIR/rank$NODE_RANK}-$CUR_TIME.log
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 RUN_LF="${REPO_ROOT}/scripts/runs/run_lf.py"
-DATASET_DIR="${REPO_ROOT}/dataset"
-export PYTHONPATH="${REPO_ROOT}/src:${PYTHONPATH:-}"
-
-# Use the bundled MegaMoE and SHMEM runtime unless another installation is selected.
-if [[ -z "${MEGAMOE_RUNTIME:-}" && -d "${REPO_ROOT}/src/torchturbo/models/glm5_3_flash/runtime/python/tt_megamoe" ]]; then
-    MEGAMOE_RUNTIME="${REPO_ROOT}/src/torchturbo/models/glm5_3_flash/runtime"
-fi
-if [[ -n "${MEGAMOE_RUNTIME:-}" ]]; then
-    if [[ ! -d "${MEGAMOE_RUNTIME}/python/tt_megamoe" ]]; then
-        echo "MEGAMOE_RUNTIME must contain python/tt_megamoe: ${MEGAMOE_RUNTIME}" >&2
-        exit 1
-    fi
-    export MEGAMOE_RUNTIME
-    export PYTHONPATH="${MEGAMOE_RUNTIME}/python:${PYTHONPATH}"
-fi
-# Check native dependencies before spawning workers.
-python "${REPO_ROOT}/src/torchturbo/optimizations/mega_moe/bootstrap.py" --tt_mega_moe true
+DATASET_DIR="${DATASET_DIR:-${REPO_ROOT}/dataset}"
+LLAMAFACTORY_SRC_DIR="${LLAMAFACTORY_SRC_DIR:-/code/LLaMA-Factory/src}"
+export PYTHONPATH="/opt/MindSpeed:${REPO_ROOT}/src:${LLAMAFACTORY_SRC_DIR}:${PYTHONPATH:-}"
 
 DISTRIBUTED_ARGS="
     --nproc_per_node $NPUS_PER_NODE \
@@ -83,8 +75,11 @@ echo $CUR_TIME >> $LOG_FILE
 echo $OUTPUT_DIR >> $LOG_FILE
 
 torchrun $DISTRIBUTED_ARGS $RUN_LF \
-    --tt_mega_moe true \
-    --tt_config ${TT_CONFIG} \
+    --tt_sp_size $sp_size \
+    --tt_ep_size $ep_size \
+    --tt_mega_moe "$mega_moe" \
+    --tt_freeze_vision_tower "$freeze_vision_tower" \
+    --tt_freeze_multi_modal_projector "$freeze_multi_modal_projector" \
     --report_to tensorboard \
     --disable_shuffling \
     --stage sft \
@@ -118,4 +113,4 @@ torchrun $DISTRIBUTED_ARGS $RUN_LF \
     --bf16 \
     --neat_packing \
     --trust_remote_code \
-    2>&1 | tee $LOG_FILE
+    "$@" 2>&1 | tee $LOG_FILE

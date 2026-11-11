@@ -1,7 +1,0 @@
-engine_config:
-  parallel_plan:
-    sp_size: 2
-    ep_size: 8
-  backend_config:
-    cpu_offload:
-      enabled: false

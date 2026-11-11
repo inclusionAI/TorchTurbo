@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Optional
 
 
 class ShardingStrategy(str, Enum):
@@ -34,63 +33,6 @@ class FSDPPrefetchDirection(str, Enum):
     FORWARD_BACKWARD = "forward_backward"
 
 
-class CPUOffloadMode(str, Enum):
-    """Execution modes selected by :class:`CPUOffloadConfig`.
-
-    ``FULL`` offloads parameters, gradients, and optimizer state.
-    ``OPTIMIZER`` keeps parameters and gradients on the device while optimizer state stays on CPU.
-    """
-
-    FULL = "full"
-    OPTIMIZER = "optimizer"
-
-
-@dataclass
-class CPUOffloadConfig:
-    """FSDP2 CPU offload policy used during training.
-
-    Optimizer steps and checkpoints remain available with this policy enabled.
-    Temporary suspension via engine.offload_optimizer() is controlled separately.
-
-    ``enabled`` controls CPU offload. When enabled, ``mode`` selects either
-    full offload or optimizer-state-only offload. ``optimizer_memory_fraction``
-    bounds optimizer workspaces: AdamWSwap sizes its staging slab from that
-    fraction of free device memory, while Muon checks its complete-matrix
-    compute and exchange buffers against that fraction of free device memory
-    plus blocks cached by the device allocator. Muon stages offloaded tensors
-    with blocking copies, so ``overlap_comm_compute`` gives little overlap
-    there. Zero selects synchronous CPU updates, which for Muon includes CPU
-    collectives in either mode. Full-mode native AdamW retains its existing
-    execution policy based on each parameter's device.
-    """
-
-    enabled: Optional[bool] = None
-    mode: CPUOffloadMode = CPUOffloadMode.FULL
-    optimizer_memory_fraction: float = 0.8
-
-    def __post_init__(self) -> None:
-        if self.enabled is None:
-            return
-        if isinstance(self.enabled, str):
-            # Lazy import: engine.args imports this module.
-            from ...args import string_to_bool
-
-            self.enabled = string_to_bool(self.enabled)
-        else:
-            self.enabled = bool(self.enabled)
-        if not self.enabled:
-            self.mode = CPUOffloadMode.FULL
-            self.optimizer_memory_fraction = 0.8
-            return
-        self.mode = CPUOffloadMode(self.mode)
-        self.optimizer_memory_fraction = float(self.optimizer_memory_fraction)
-        if not 0 <= self.optimizer_memory_fraction <= 1:
-            raise ValueError(
-                "optimizer_memory_fraction must be in [0, 1], got "
-                f"{self.optimizer_memory_fraction}"
-            )
-
-
 @dataclass
 class FSDPConfig:
     """FSDP2-specific configuration.
@@ -102,9 +44,9 @@ class FSDPConfig:
     reshard_after_forward:
         Whether to reshard params after forward (trade memory for speed).
     cpu_offload:
-        Structured CPU-offload policy (see :class:`CPUOffloadConfig`). The
-        master ``enabled`` switch and ``mode`` select no offload, full FSDP
-        offload, or optimizer-state-only offload.
+        Whether to apply CPU offload to all FSDP-wrapped units.
+    pin_memory:
+        Pin CPU offloaded memory for faster transfers.
     prefetch_strategy:
         MoE-aware explicit prefetch topology. ``NATIVE`` keeps FSDP's
         implicit-only behavior.
@@ -123,44 +65,14 @@ class FSDPConfig:
 
     sharding_strategy: ShardingStrategy = ShardingStrategy.FULL_SHARD
     reshard_after_forward: bool = True
-    cpu_offload: CPUOffloadConfig = field(
-        default_factory=lambda: CPUOffloadConfig(enabled=False)
-    )
+    cpu_offload: bool = False
+    pin_memory: bool = True
     prefetch_strategy: FSDPPrefetchStrategy = FSDPPrefetchStrategy.AUTO
     prefetch_direction: FSDPPrefetchDirection = FSDPPrefetchDirection.FORWARD_BACKWARD
     forward_prefetch_depth: int = 1
     backward_prefetch_depth: int = 1
 
     def __post_init__(self) -> None:
-        cpu_offload = self.cpu_offload
-        if cpu_offload is None:
-            self.cpu_offload = CPUOffloadConfig(enabled=False)
-        elif isinstance(cpu_offload, CPUOffloadConfig):
-            self.cpu_offload = cpu_offload
-        elif isinstance(cpu_offload, bool):
-            raise ValueError(
-                "cpu_offload must be an object with 'enabled' (e.g. "
-                '{"enabled":true, "mode":"optimizer"}); bare true/false is not accepted'
-            )
-        elif isinstance(cpu_offload, dict):
-            if "enabled" not in cpu_offload:
-                raise ValueError("cpu_offload requires 'enabled'")
-            self.cpu_offload = CPUOffloadConfig(**cpu_offload)
-        else:
-            try:
-                from omegaconf import DictConfig, OmegaConf
-            except ImportError as exc:  # pragma: no cover — omegaconf is a core dep
-                raise TypeError(
-                    f"Cannot interpret {cpu_offload!r} as CPUOffloadConfig"
-                ) from exc
-            if not isinstance(cpu_offload, DictConfig):
-                raise TypeError(
-                    f"Cannot interpret {cpu_offload!r} as CPUOffloadConfig"
-                )
-            config = OmegaConf.to_container(cpu_offload, resolve=True)
-            if "enabled" not in config:
-                raise ValueError("cpu_offload requires 'enabled'")
-            self.cpu_offload = CPUOffloadConfig(**config)
         if isinstance(self.sharding_strategy, str):
             self.sharding_strategy = ShardingStrategy(self.sharding_strategy)
         if isinstance(self.prefetch_strategy, str):

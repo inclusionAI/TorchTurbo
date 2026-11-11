@@ -2,36 +2,17 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from contextlib import nullcontext
-from dataclasses import dataclass
 from typing import Any
 
 import torch
 import torch.nn as nn
 
-from ...engine.checkpoint import CheckpointFormat
-from ...engine.checkpoint.layout import validate_output_dir
-from ...engine.distributed import assert_finite
 from ...logging import get_logger
-from ...models.modules.cpu_resident import CPUResidentParameter
+
 
 logger = get_logger(__name__)
-
-
-@dataclass
-class LlamaFactoryInputCollator:
-    """Normalize native pretraining collation before device transfer."""
-
-    collator: Any
-
-    def __call__(self, features: list[dict[str, Any]]) -> dict[str, Any]:
-        from .patches import _collate_training_features
-
-        return _collate_training_features(
-            self.collator,
-            features,
-            padding_side=self.collator.tokenizer.padding_side,
-        )
 
 
 class TorchTurboTrainerBase:
@@ -60,13 +41,8 @@ class TorchTurboTrainerBase:
         )
         self._mm_processor = kwargs.get("processor", None)
         super().__init__(*args, **kwargs)
-        if self.optimizer is not None:
-            raise ValueError(
-                "TorchTurbo does not support externally supplied optimizers"
-            )
         self._maybe_upgrade_collator_for_mllm_pt()
-        if self.stage == "pt":
-            self.data_collator = LlamaFactoryInputCollator(self.data_collator)
+        self.add_callback(self._make_ulysses_callback())
 
     def _move_model_to_device(self, model, _device):
         # TorchTurbo already materializes and shards the model before Trainer init.
@@ -114,7 +90,7 @@ class TorchTurboTrainerBase:
             model=self.model,
             pad_to_multiple_of=8,
             label_pad_token_id=IGNORE_INDEX,
-            tokenizer=self.processing_class,
+            tokenizer=self.tokenizer,
             processor=self._mm_processor,
         )
         logger.info_rank0("Upgraded PT collator to MultiModalDataCollatorForSeq2Seq")
@@ -151,40 +127,11 @@ class TorchTurboTrainerBase:
             raise RuntimeError("TorchTurbo trainer is missing its engine binding.")
         return engine
 
-    # Checkpoint resume hooks — route to the engine; fall back to HF when unbound.
-    def _save_optimizer_and_scheduler(self, output_dir: str) -> None:
-        self.engine.save_optimizer_and_scheduler(
-            self.model,
-            self.engine.optimizer,
-            self.lr_scheduler,
-            output_dir,
-        )
-
-    def _load_from_checkpoint(self, resume_from_checkpoint, model=None):
-        self.engine.load_from_checkpoint(self.model, resume_from_checkpoint)
-
-    def _load_optimizer_and_scheduler(self, checkpoint):
-        if checkpoint:
-            self.engine.load_optimizer_and_scheduler(
-                self.model,
-                self.engine.optimizer,
-                self.lr_scheduler,
-                checkpoint,
-            )
-
     def create_optimizer(self):
         if self.optimizer is not None:
             return self.optimizer
 
         engine = self._engine()
-
-        if engine.config.optimizer.name is not None:
-            self.optimizer = engine.prepare_optimizer()
-            logger.info_rank0(
-                "torchturbo: created engine-managed optimizer %s",
-                engine.config.optimizer.name,
-            )
-            return self.optimizer
 
         from transformers import Trainer
 
@@ -192,11 +139,9 @@ class TorchTurboTrainerBase:
             self.args,
             self.model,
         )
-        optimizer_kwargs = dict(optimizer_kwargs)
         optimizer_kwargs.pop("params", None)
         optimizer_kwargs.pop("model", None)
         optimizer_kwargs.pop("optimizer_dict", None)
-        optimizer_kwargs["weight_decay"] = self.args.weight_decay
 
         self.optimizer = engine.prepare_optimizer(optimizer_cls, **optimizer_kwargs)
         logger.info_rank0(
@@ -207,50 +152,14 @@ class TorchTurboTrainerBase:
         )
         return self.optimizer
 
-    def create_scheduler(
-        self,
-        num_training_steps: int,
-        optimizer: torch.optim.Optimizer | None = None,
-    ) -> torch.optim.lr_scheduler.LRScheduler:
-        engine = self._engine()
-        if engine.config.optimizer.name is not None:
-            # Engine-managed optimizers take their LRs from engine config, so
-            # the engine also builds their LR schedule.
-            if self.lr_scheduler is None:
-                from llamafactory.train.trainer_utils import create_custom_scheduler
-
-                # Preserve LlamaFactory's scheduler argument defaults.
-                create_custom_scheduler(self.args, num_training_steps)
-                if optimizer is None:
-                    optimizer = self.optimizer
-                self.lr_scheduler = engine.prepare_lr_scheduler(
-                    self.args.lr_scheduler_type,
-                    optimizer=optimizer,
-                    num_warmup_steps=self.args.get_warmup_steps(num_training_steps),
-                    num_training_steps=num_training_steps,
-                    scheduler_specific_kwargs=self.args.lr_scheduler_kwargs,
-                )
-                self._created_lr_scheduler = True
-            return self.lr_scheduler
-        return super().create_scheduler(num_training_steps, optimizer)
-
     def save_model(self, output_dir=None, _internal_call=False):
         engine = self._engine()
         if output_dir is None:
             output_dir = self.args.output_dir
 
-        logger.info_rank0("torchturbo: saving model via engine.save_model(%s)", output_dir)
-        # Intermediate checkpoints come through the HF checkpoint machinery
-        # (_internal_call=True) and store native model state. LF's final save is
-        # an explicit save_model() that exports HF weights, and a model-only
-        # checkpoint cannot be resumed, so it is an export too.
-        if _internal_call and not self.args.save_only_model:
-            engine.save_model(
-                self.model,
-                output_dir,
-            )
-        else:
-            engine.save_model(self.model, output_dir, format=CheckpointFormat.HF)
+        save_path = str(Path(output_dir) / "huggingface")
+        logger.info_rank0("torchturbo: saving model via engine.save_model(%s)", save_path)
+        engine.save_model(self.model, save_path)
 
         if getattr(self.args, "push_to_hub", False) and not _internal_call:
             self.push_to_hub(commit_message="Model save")
@@ -266,12 +175,20 @@ class TorchTurboTrainerBase:
 
         engine = self._engine()
         args = self.args
+        sp_size = engine.get_sp_info()["sp_size"]
+        if sp_size <= 1:
+            return super().get_train_dataloader()
 
-        args.gradient_accumulation_steps = (
-            engine.resolve_gradient_accumulation_steps(
-                args.gradient_accumulation_steps
+        if not getattr(args, "_torchturbo_sp_adjusted", False):
+            orig = args.gradient_accumulation_steps
+            args.gradient_accumulation_steps = orig * sp_size
+            args._torchturbo_sp_adjusted = True
+            logger.info_rank0(
+                "SP=%d: gradient_accumulation_steps %d -> %d",
+                sp_size,
+                orig,
+                args.gradient_accumulation_steps,
             )
-        )
 
         finetuning_args = getattr(self, "finetuning_args", None)
         disable_shuffling = bool(
@@ -286,16 +203,14 @@ class TorchTurboTrainerBase:
             pin_memory=args.dataloader_pin_memory,
             drop_last=args.dataloader_drop_last,
             shuffle=not disable_shuffling,
-            seed=args.seed,
         )
 
     def _get_bd_train_dataloader(self):
         """Build the SP-aware DataLoader for block-diffusion (``BDDataset``).
 
         BD needs per-sample ``[noisy|clean]`` beams + a 4D block mask, so it
-        cannot use LlamaFactory's tokenized dataset. Noise range and block size
-        come from ``engine.config.diffusion`` (``--tt_bd_mask_low/high``,
-        ``--tt_bd_block_size``); the rest (cutoff_len, data file, model path,
+        cannot use LlamaFactory's tokenized dataset. Noise range comes from
+        ``engine.config.diffusion``; the rest (cutoff_len, data file, model path,
         block_diag_attn) is read from the LF args the engine stashed at run_exp
         time. SP folds ``gradient_accumulation_steps *= sp_size`` so the backend's
         ``compute_diffusion_loss`` ``/ ga`` lands on the right scale.
@@ -317,18 +232,15 @@ class TorchTurboTrainerBase:
 
         cutoff_len = getattr(data_args, "cutoff_len", None)
         if cutoff_len:
-            # Undo LF neat_packing's `cutoff_len -= 1` and ceil to a block_size multiple.
-            # Use diff.bd_block_size (from --tt_bd_block_size, default 32) so this alignment
-            # and the SP divisibility check below match the alignment BDDataset re-applies.
-            cutoff_len = bd._align_cutoff_to_block(cutoff_len, diff.bd_block_size)
+            # Undo LF neat_packing's `cutoff_len -= 1` and ceil to a BLOCK_SIZE multiple.
+            cutoff_len = bd._align_cutoff_to_block(cutoff_len)
             beam_len = 2 * cutoff_len
             if sp_size > 1 and beam_len % sp_size != 0:
                 raise ValueError(
                     f"BD beam_len=2*cutoff_len={beam_len} must be divisible by "
                     f"sp_size={sp_size} (SP slices the beam, see "
                     "backend.compute_diffusion_loss). "
-                    f"Adjust --cutoff_len or --tt_bd_block_size "
-                    f"(aligned value {cutoff_len}, block_size {diff.bd_block_size})."
+                    f"Adjust --cutoff_len (aligned value {cutoff_len})."
                 )
 
         bd_data_file, bd_columns, bd_tags = bd.resolve_bd_data_file(data_args)
@@ -339,16 +251,19 @@ class TorchTurboTrainerBase:
             cutoff_len=cutoff_len,
             mask_low=diff.bd_mask_low,
             mask_high=diff.bd_mask_high,
-            block_size=diff.bd_block_size,
             columns=bd_columns,
             tags=bd_tags,
         )
 
-        args.gradient_accumulation_steps = (
-            engine.resolve_gradient_accumulation_steps(
-                args.gradient_accumulation_steps
+        # ga *= sp_size must run — compute_diffusion_loss does /ga expecting the SP factor.
+        if sp_size > 1 and not getattr(args, "_torchturbo_sp_adjusted", False):
+            orig_ga = args.gradient_accumulation_steps
+            args.gradient_accumulation_steps = orig_ga * sp_size
+            args._torchturbo_sp_adjusted = True
+            logger.info_rank0(
+                "BD SP=%d: gradient_accumulation_steps %d -> %d",
+                sp_size, orig_ga, args.gradient_accumulation_steps,
             )
-        )
 
         return engine.create_dataloader(
             dataset=dataset,
@@ -358,20 +273,48 @@ class TorchTurboTrainerBase:
             pin_memory=args.dataloader_pin_memory,
             drop_last=args.dataloader_drop_last,
             shuffle=False,
-            seed=args.seed,
         )
+
+
+    def _make_ulysses_callback(self) -> Any:
+        """Apply sequence-parallel attention at native Trainer startup."""
+        from functools import partial
+        from transformers import TrainerCallback
+
+        engine = self._engine()
+
+        class UlyssesAttentionCallback(TrainerCallback):
+            def on_train_begin(
+                self, args: Any, state: Any, control: Any, **kwargs: Any
+            ) -> Any:
+                sp_info = engine.backend.get_sp_info()
+                if sp_info["sp_group"] is None or sp_info["sp_size"] <= 1:
+                    return control
+
+                import transformers.integrations.flash_attention as flash_integration
+                import transformers.modeling_flash_attention_utils as flash_utils
+
+                from ...models.modules.attention import ulysses
+
+                patched_forward = partial(
+                    ulysses.ulysses_flash_attention_forward,
+                    sp_group=sp_info["sp_group"],
+                    sp_size=sp_info["sp_size"],
+                )
+                flash_utils._flash_attention_forward = patched_forward
+                flash_integration._flash_attention_forward = patched_forward
+                logger.info_rank0(
+                    "Patched Transformers Ulysses attention via TrainerCallback for SP size=%d",
+                    sp_info["sp_size"],
+                )
+                return control
+
+        return UlyssesAttentionCallback()
 
     def train(self, *args, **kwargs):
         from ...engine.args import get_torchturbo_args
 
         engine = self._engine()
-        # Fail before training instead of at the first checkpoint save.
-        validate_output_dir(self.args.output_dir, engine.model_name_or_path)
-        logger.info_rank0(
-            "LlamaFactory training started: %d epochs, max_steps=%s",
-            int(getattr(self.args, "num_train_epochs", 1)),
-            getattr(self.args, "max_steps", None),
-        )
 
         tt_args = get_torchturbo_args()
         profiling_enabled = tt_args is not None and tt_args.profiling
@@ -430,25 +373,45 @@ class TorchTurboTrainerBase:
             **kwargs,
         )
 
-    def training_step(self, model, inputs, *args, **kwargs):
-        """Check loss and collect engine metrics after backward."""
-        result = super().training_step(model, inputs, *args, **kwargs)
-        assert_finite(result, "loss")
-        engine = getattr(self, "engine", None)
-        if engine is not None:
-            engine.collect_metrics(model)
-        return result
-
-    def _report_engine_metrics(self, logs) -> None:
-        from transformers.trainer import nested_gather
-
-        def gather_fn(tensors):
-            return nested_gather(tensors, self.args.parallel_mode)
-
-        self._engine().report_metrics(logs, gather_fn)
-
     def log(self, logs, *args, **kwargs):
-        self._report_engine_metrics(logs)
+        if "loss" in logs:
+            self._engine().report_metrics(logs, self._nested_gather)
+        buf = getattr(self, "_mtp_loss_buf", None)
+        count = buf["count"] if buf else 0
+        if buf and count > 0 and buf["mtp"]:
+            # mirror HF Trainer's tr_loss reduction
+            grad_accum = self.args.gradient_accumulation_steps
+            opt_steps = count / grad_accum if grad_accum else count
+
+            per_layer = []
+            for acc in buf["mtp"]:
+                gathered = self._nested_gather(acc)
+                per_layer.append(gathered.mean().item() / opt_steps)
+            for i, mean_value in enumerate(per_layer):
+                logs[f"mtp_loss/{i}"] = round(mean_value, 4)
+            logs["mtp_loss/avg"] = round(
+                sum(per_layer) / len(per_layer), 4
+            )
+            if buf["main"] is not None:
+                logs["mtp_loss/main"] = round(
+                    self._nested_gather(buf["main"]).mean().item() / opt_steps,
+                    4,
+                )
+            if buf["scaled"] is not None:
+                logs["mtp_loss/scaled"] = round(
+                    self._nested_gather(buf["scaled"]).mean().item()
+                    / opt_steps,
+                    4,
+                )
+
+            for acc in buf["mtp"]:
+                acc.zero_()
+            if buf["main"] is not None:
+                buf["main"].zero_()
+            if buf["scaled"] is not None:
+                buf["scaled"].zero_()
+            buf["count"] = 0
+
         return super().log(logs, *args, **kwargs)
 
     def _compute_causal_lm_loss(self, model, inputs, return_outputs=False, **kwargs):
@@ -461,16 +424,12 @@ class TorchTurboTrainerBase:
             )
 
         engine = self._engine()
-        num_items_in_batch = kwargs.pop("num_items_in_batch", None)
+        num_items_in_batch = kwargs.get("num_items_in_batch", None)
 
         loss, outputs = engine.compute_loss(
             model,
             inputs,
             return_outputs=True,
-            num_items_in_batch=num_items_in_batch,
-            gradient_accumulation_steps=(
-                self.current_gradient_accumulation_steps if model.training else 1
-            ),
             **kwargs,
         )
 
@@ -478,6 +437,8 @@ class TorchTurboTrainerBase:
         if num_items_in_batch is None and sp_size > 1:
             loss = loss * sp_size
             outputs.loss = loss
+
+        self._record_mtp_outputs(outputs)
 
         return (loss, outputs) if return_outputs else loss
 
@@ -493,7 +454,41 @@ class TorchTurboTrainerBase:
         loss, outputs = engine.compute_diffusion_loss(
             model, inputs, ga=ga, return_outputs=True, **kwargs
         )
+        self._record_mtp_outputs(outputs)  # no-op for BD (no mtp_loss attr)
         return (loss, outputs) if return_outputs else loss
+
+    def _record_mtp_outputs(self, outputs) -> None:
+        mtp_loss = getattr(outputs, "mtp_loss", None)
+        if not mtp_loss:
+            return
+
+        buf = getattr(self, "_mtp_loss_buf", None)
+        if buf is None:
+            buf = {"mtp": None, "main": None, "scaled": None, "count": 0}
+            self._mtp_loss_buf = buf
+
+        device = mtp_loss[0].device
+        if buf["mtp"] is None:
+            buf["mtp"] = [
+                torch.zeros((), device=device, dtype=torch.float32)
+                for _ in mtp_loss
+            ]
+        for acc, m in zip(buf["mtp"], mtp_loss):
+            acc.add_(m.detach().float())
+
+        main_loss = getattr(outputs, "main_loss", None)
+        if main_loss is not None:
+            if buf["main"] is None:
+                buf["main"] = torch.zeros((), device=device, dtype=torch.float32)
+            buf["main"].add_(main_loss.detach().float())
+
+        scaled_loss = getattr(outputs, "mtp_loss_scaled", None)
+        if scaled_loss is not None:
+            if buf["scaled"] is None:
+                buf["scaled"] = torch.zeros((), device=device, dtype=torch.float32)
+            buf["scaled"].add_(scaled_loss.detach().float())
+
+        buf["count"] += 1
 
 
 class TorchTurboDPOTrainer(TorchTurboTrainerBase):
@@ -542,8 +537,7 @@ class TorchTurboDPOTrainer(TorchTurboTrainerBase):
 
         with torch.no_grad():
             for name in sorted(src_state):
-                source = src_state[name]
-                src = source.detach()
+                src = src_state[name].detach()
                 dst = dst_state[name]
                 if src.shape != dst.shape:
                     raise RuntimeError(
@@ -551,26 +545,7 @@ class TorchTurboDPOTrainer(TorchTurboTrainerBase):
                         f"{name} shape differs ({tuple(src.shape)} vs "
                         f"{tuple(dst.shape)})."
                     )
-                if isinstance(dst, CPUResidentParameter):
-                    sizes = (
-                        source.shard_sizes
-                        if isinstance(source, CPUResidentParameter)
-                        else None
-                    )
-                    copy_sizes = sizes
-                    if copy_sizes is None:
-                        copy_sizes = (src.shape[0] if src.ndim else 1,)
-                    shards = src.split(copy_sizes) if src.ndim else (src,)
-
-                    def copy_cpu(index: int, target: torch.Tensor) -> None:
-                        target.copy_(shards[index])
-
-                    dst.load_(copy_sizes, copy_cpu, dtype=src.dtype)
-                    # load_ records the copy partition; a source without a known
-                    # layout must leave the reference without one as well.
-                    dst.shard_sizes = sizes
-                else:
-                    dst.copy_(src)
+                dst.copy_(src)
 
     @staticmethod
     def _named_persistent_buffers(model: Any) -> dict[str, torch.Tensor]:
@@ -589,7 +564,6 @@ class TorchTurboDPOTrainer(TorchTurboTrainerBase):
 
     def concatenated_forward(self, model, batch, is_ref_model: bool = False):
         from llamafactory.train.trainer_utils import nested_detach
-
         from torchturbo.models.modules.attention.ulysses import slice_input_tensor
 
         sp_info = self._engine().get_sp_info()
@@ -617,6 +591,8 @@ class TorchTurboDPOTrainer(TorchTurboTrainerBase):
                 dim=1,
                 group=sp_group,
                 rank=sp_rank,
+                padding=False,
+                sp_mode="ulysses",
             )
 
         all_logps, valid_length = self.get_batch_logps_with_sp(
@@ -664,13 +640,16 @@ class TorchTurboDPOTrainer(TorchTurboTrainerBase):
 
     def get_batch_loss_metrics(self, model, inputs, train_eval: str = "train"):
         from torch.distributed.nn.functional import all_reduce
-
-        from torchturbo.models.modules.attention.ulysses import ulysses_pad_inputs
+        from torchturbo.models.modules.attention.ulysses import (
+            ulysses_pad,
+            ulysses_pad_and_slice_inputs,
+        )
 
         inputs = dict(inputs)
         sp_info = self._engine().get_sp_info()
         sp_size = sp_info["sp_size"]
         sp_group = sp_info["sp_group"]
+        sp_rank = sp_info["sp_rank"]
 
         if inputs.get("position_ids", None) is None:
             inputs["position_ids"] = torch.arange(
@@ -678,10 +657,39 @@ class TorchTurboDPOTrainer(TorchTurboTrainerBase):
                 device=inputs["input_ids"].device,
             ).unsqueeze(0)
 
+        from ...models.base import SequenceParallelInputMode
+
+        if model.get_sequence_parallel_input_mode() == SequenceParallelInputMode.POST_EMBEDDING:
+            (
+                inputs["input_ids"],
+                inputs["position_ids"],
+                _,
+                pad_size,
+            ) = ulysses_pad(
+                inputs["input_ids"],
+                position_ids_rmpad=inputs["position_ids"],
+                sp_size=sp_size,
+            )
+        else:
+            (
+                inputs["input_ids"],
+                inputs["position_ids"],
+                _,
+                pad_size,
+            ) = ulysses_pad_and_slice_inputs(
+                inputs["input_ids"],
+                position_ids_rmpad=inputs["position_ids"],
+                sp_size=sp_size,
+                sp_group=sp_group,
+                sp_rank=sp_rank,
+            )
         inputs["attention_mask"] = None
-        inputs = ulysses_pad_inputs(
-            inputs, model.get_sequence_parallel_input_slicing_spec(), sp_size
-        )
+        if pad_size:
+            inputs["labels"] = nn.functional.pad(
+                inputs["labels"],
+                (0, pad_size),
+                value=self.label_pad_token_id,
+            )
 
         metrics = {}
         (

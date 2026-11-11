@@ -1121,11 +1121,20 @@ class Glm5NextPreTrainedModel(PreTrainedModel):
     config_class = Glm5NextConfig
     base_model_prefix = "model"
     supports_gradient_checkpointing = True
-    # Keep LF's FA2 packing-mask interface; attention kernels are selected
-    # explicitly by the text/vision forwards and the NPU patches.
-    _supports_flash_attn_2 = True
     _supports_sdpa = True
     _no_split_modules = ["Glm5NextTextDecoderLayer", "Glm5NextVisionBlock"]
+
+    def __init__(self, config):
+        # Training launchers may request FA2 globally. Sparse per-query masks
+        # require this implementation's SDPA path rather than standard FA2.
+        for cfg in (
+            config,
+            getattr(config, "text_config", None),
+            getattr(config, "vision_config", None),
+        ):
+            if cfg is not None:
+                cfg._attn_implementation = "sdpa"
+        super().__init__(config)
 
     def _init_weights(self, module):
         config = getattr(self.config, "text_config", self.config)

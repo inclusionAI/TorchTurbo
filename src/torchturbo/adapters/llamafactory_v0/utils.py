@@ -16,7 +16,6 @@ from ...engine.config import (
     ENV_MAP,
     MixedPrecisionPolicy,
 )
-from ...engine.hooks import TrainState
 from ...logging import get_logger
 
 
@@ -564,7 +563,7 @@ def strip_lora_args(args: Any) -> Any:
 def compute_sft_loss(
     model: nn.Module,
     batch: dict[str, torch.Tensor],
-    state: TrainState,
+    state: Any = None,
 ) -> torch.Tensor:
     """Standard SFT (supervised fine-tuning) loss.
 

@@ -1,11 +1,3 @@
-  # Adapted from NVIDIA Megatron-LM:
-  # https://github.com/NVIDIA/Megatron-LM
-  #
-  # Copyright (c) 2019-2025, NVIDIA CORPORATION. All rights reserved.
-  # Licensed under the BSD 3-Clause License.
-  #
-  # Modified by the TorchTurbo contributors.
-
 import functools
 from dataclasses import dataclass
 from typing import Callable, List, Optional
@@ -41,10 +33,6 @@ class MoEConfig:
     moe_ffn_hidden_size: Optional[int] = None
     """The load balancing strategy for the router."""
     moe_router_load_balancing_type: str = "none"
-    """Token-level auxiliary loss coefficient."""
-    moe_aux_loss_coeff: float = 0.0
-    """Z-loss coefficient for router logits; 0.0 disables."""
-    moe_z_loss_coeff: float = 0.0
     """Number of experts to route to for each token."""
     moe_router_topk: int = 2
     """Number of groups to divide experts into for group-limited routing."""
@@ -69,9 +57,6 @@ class MoEConfig:
     moe_apply_probs_on_input: bool = False
     """Per-layer swiglu limit for clamping gate/up values in SwiGLU activation."""
     moe_swiglu_limit: Optional[List[float]] = None
-    """Cap the activated gate, min(act(gate), limit), instead of the gate
-    pre-activation when applying moe_swiglu_limit."""
-    moe_swiglu_clamp_gate_after_activation: bool = False
     """Number of layers using token-id hash routing."""
     num_hash_layers: int = 0
     """Vocabulary size for token-id hash routing table."""
