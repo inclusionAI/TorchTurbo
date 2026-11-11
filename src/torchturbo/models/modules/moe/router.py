@@ -280,7 +280,7 @@ class TopKRouter(Router):
         input_ids: Optional[torch.Tensor] = None,
         padding_mask: torch.Tensor | None = None,
         accumulate_tokens_per_expert: bool = True,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Top-k routing function
 
         Args:
@@ -288,8 +288,7 @@ class TopKRouter(Router):
 
         Returns:
             Dense routing weights, boolean assignment mask, and the selected
-            expert IDs in the top-k order, or None for hash routing so the
-            dispatcher derives the IDs from the boolean mask.
+            expert IDs in their native top-k order.
         """
         seq_length, bsz = logits.shape[:2]
         logits = logits.view(-1, self.config.num_moe_experts)
@@ -362,13 +361,13 @@ class TopKRouter(Router):
         input_ids: Optional[torch.Tensor] = None,
         padding_mask: torch.Tensor | None = None,
         accumulate_tokens_per_expert: bool = True,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Forward pass of the router.
 
         Returns:
             Dense routing weights, boolean assignment mask, selected expert
-            IDs (None for hash routing), and the router logits.
+            IDs, and the router logits.
         """
         self._maintain_float32_expert_bias()
 

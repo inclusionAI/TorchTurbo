@@ -30,13 +30,13 @@ def test_topk_result_packs_weights_map_and_expert_ids(
     assert routing_map.sum(dim=-1).tolist() == [8] * 17
 
     expected_indices = routing_map.nonzero(as_tuple=True)[1].reshape(17, 8)
+    assert expert_indices.shape == (17, 8)
     if hash_routing:
-        assert expert_indices is None
-        assert torch.equal(expected_indices, hash_table.sort(-1).values)
-    else:
-        assert expert_indices.shape == (17, 8)
+        torch.testing.assert_close(
+            expert_indices.sort(-1).values, hash_table.sort(-1).values,
+        )
 
-    selected_ids = expected_indices if expert_indices is None else expert_indices
+    selected_ids = expert_indices
     order = selected_ids.sort(-1).indices
     selected = probs.gather(1, selected_ids).gather(1, order)
     expected = probs.masked_select(routing_map).reshape(17, 8)
