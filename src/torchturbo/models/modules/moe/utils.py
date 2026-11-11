@@ -7,32 +7,12 @@
   # Modified by the TorchTurbo contributors.
 
 import math
-from dataclasses import dataclass
 from typing import Optional
 
 import numpy as np
 import torch
 
 from torchturbo.runtime import get_device_runtime
-
-
-@dataclass(frozen=True, slots=True)
-class RoutingResult:
-    """Route assignments and weights for one local token batch.
-
-    Attributes:
-        probs: Final dense routing weights, shaped [tokens, experts].
-        routing_map: Boolean assignment mask, shaped [tokens, experts].
-        expert_indices: Selected IDs sorted per token, shaped [tokens, top_k].
-    """
-
-    probs: torch.Tensor
-    routing_map: torch.Tensor
-    expert_indices: torch.Tensor
-
-    def selected_probs(self) -> torch.Tensor:
-        """Gather final weights in the exact order used for permutation."""
-        return self.probs.gather(1, self.expert_indices)
 
 
 def slice_tensor_for_ep_rank(tensor, ep_rank, ep_world_size):
@@ -156,7 +136,7 @@ def topk_softmax_with_capacity(
     use_hash_routing: bool = False,
     hash_table: Optional[torch.Tensor] = None,
     input_ids: Optional[torch.Tensor] = None,
-) -> RoutingResult:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """Select fixed-top-k experts and compute their routing probabilities.
     Args:
         logits (torch.Tensor): Logits tensor.
@@ -169,8 +149,10 @@ def topk_softmax_with_capacity(
         expert_bias (torch.Tensor): The bias added to logits for expert routing.
 
     Returns:
-        RoutingResult: Dense weights and mask, plus selected expert IDs in
-        ascending expert-ID order for each token.
+        Dense weights, boolean assignment mask, and the selected expert IDs.
+        Learned routing returns the top-k IDs in their native selection
+        order. Hash routing returns None so the dispatcher derives the IDs
+        from the boolean mask instead of paying for a second sort.
     """
     assert (
         logits.dim() == 2
@@ -244,11 +226,12 @@ def topk_softmax_with_capacity(
     # TODO Try using element-wise operations instead of scatter?
     topk_masked_gates = torch.zeros_like(logits).scatter(1, top_indices, probs)
     topk_map = torch.zeros_like(logits).int().scatter(1, top_indices, 1).bool()
-    return RoutingResult(
-        probs=topk_masked_gates,
-        routing_map=topk_map,
-        expert_indices=top_indices.sort(dim=-1).values,
-    )
+    # Top-k already returns compact expert IDs; reuse them directly instead
+    # of deriving them again from the boolean mask later. Hash routing has no
+    # cheap ascending order and the boolean map already contains the selected
+    # set, so let the permute path derive expert IDs from the map.
+    expert_indices = None if use_hash_routing else top_indices
+    return topk_masked_gates, topk_map, expert_indices
 
 
 def ensure_divisibility(numerator, denominator):

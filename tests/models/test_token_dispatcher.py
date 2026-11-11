@@ -13,7 +13,7 @@ from torchturbo.models.modules.moe import token_dispatcher as dispatch_module
 from torchturbo.ops import OpPolicy, get_or_create_ops
 from torchturbo.runtime.cpu import CpuRuntime
 from torchturbo.runtime import TurboDevice
-from torchturbo.models.modules.moe.utils import RoutingResult, maybe_move_tensor_to_cpu
+from torchturbo.models.modules.moe.utils import maybe_move_tensor_to_cpu
 
 
 @pytest.mark.parametrize("as_numpy", [False, True])
@@ -46,8 +46,11 @@ def test_six_stages_restore_token_order_and_gradients():
     )
     x = torch.tensor([[10.0], [20.0], [30.0]], requires_grad=True)
     probs = torch.tensor([[0.0, 0.5], [0.25, 0.0], [0.0, 0.75]], requires_grad=True)
-    routing = RoutingResult(probs, probs.detach().bool(), torch.tensor([[1], [0], [1]]))
-    packed, packed_probs = dispatcher.dispatch_preprocess(x, routing)
+    routing_map = probs.detach().bool()
+    expert_indices = torch.tensor([[1], [0], [1]])
+    packed, packed_probs = dispatcher.dispatch_preprocess(
+        x, routing_map, probs, expert_indices=expert_indices,
+    )
     torch.testing.assert_close(packed, torch.tensor([[20.0], [10.0], [30.0]]))
     received, received_probs = dispatcher.token_dispatch(packed, packed_probs)
     local, counts, local_probs = dispatcher.dispatch_postprocess(received, received_probs)
@@ -66,8 +69,10 @@ def test_six_stages_restore_token_order_and_gradients():
 
     other = torch.tensor([[40.0], [50.0]])
     other_probs = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
-    other_routing = RoutingResult(other_probs, other_probs.bool(), torch.tensor([[0], [1]]))
-    other_packed, _ = dispatcher.dispatch_preprocess(other, other_routing)
+    other_packed, _ = dispatcher.dispatch_preprocess(
+        other, other_probs.bool(), other_probs,
+        expert_indices=torch.tensor([[0], [1]]),
+    )
     torch.testing.assert_close(dispatcher.combine_postprocess(other_packed), other)
 
 
@@ -82,10 +87,11 @@ def test_combine_sums_already_weighted_expert_outputs(dtype):
     probs = torch.tensor([
         [.25, 0., .5], [0., .75, .125], [.125, .25, 0.],
     ], requires_grad=True)
-    routing = RoutingResult(
-        probs, probs.detach().bool(), torch.tensor([[0, 2], [1, 2], [0, 1]]),
+    routing_map = probs.detach().bool()
+    expert_indices = torch.tensor([[0, 2], [1, 2], [0, 1]])
+    packed, packed_probs = dispatcher.dispatch_preprocess(
+        x, routing_map, probs, expert_indices=expert_indices,
     )
-    packed, packed_probs = dispatcher.dispatch_preprocess(x, routing)
     packed = (packed * packed_probs.unsqueeze(-1)).to(dtype)
     output = dispatcher.combine_postprocess(packed)
     torch.testing.assert_close(output, torch.tensor([[7.5], [17.5], [11.25]], dtype=dtype))
@@ -114,10 +120,10 @@ def test_two_rank_counts_and_receiver_expert_order(monkeypatch):
         [True, True, False, False],
         [False, False, True, True],
     ])
-    routing = RoutingResult(
-        routing_map.float(), routing_map, torch.tensor([[1, 3], [0, 1], [2, 3]]),
+    packed, _ = dispatcher.dispatch_preprocess(
+        x, routing_map, routing_map.float(),
+        expert_indices=torch.tensor([[1, 3], [0, 1], [2, 3]]),
     )
-    packed, _ = dispatcher.dispatch_preprocess(x, routing)
     torch.testing.assert_close(packed.flatten(), torch.tensor([20., 10., 20., 30., 10., 30.]))
     np.testing.assert_array_equal(dispatcher.input_splits, [3, 3])
     np.testing.assert_array_equal(dispatcher.output_splits, [4, 3])
@@ -178,13 +184,14 @@ def test_npu_dispatch_handles_empty_sources_and_input_probs(
     probs = torch.tensor([[0., .5], [.25, 0.], [0., .75]])[:num_tokens].requires_grad_()
     routing_map = probs.detach().bool() if on_input else torch.ones_like(probs, dtype=torch.bool)
     indices = routing_map.nonzero(as_tuple=True)[1].reshape(num_tokens, config.moe_router_topk)
-    routing = RoutingResult(probs, routing_map, indices)
     with monkeypatch.context() as cached_indices:
         cached_indices.setattr(
             torch, "nonzero",
             lambda *args, **kwargs: pytest.fail("Dispatcher must reuse cached expert indices."),
         )
-        packed, packed_probs = dispatcher.dispatch_preprocess(x, routing)
+        packed, packed_probs = dispatcher.dispatch_preprocess(
+            x, routing_map, probs, expert_indices=indices,
+        )
     received, received_probs = dispatcher.token_dispatch(packed, packed_probs)
     packed, _, packed_probs = dispatcher.dispatch_postprocess(received, received_probs)
     assert packed_probs is not None
