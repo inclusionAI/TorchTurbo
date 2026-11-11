@@ -150,7 +150,7 @@ class MoELayer(BaseMoELayer):
         self, hidden_states: torch.Tensor, input_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Route tokens, compute local experts, and combine their outputs."""
-        routing, logits = self.router(
+        probs, routing_map, expert_indices, logits = self.router(
             hidden_states, input_ids, self._runtime_inputs.padding_mask,
             self._runtime_inputs.accumulate_tokens_per_expert,
         )
@@ -158,7 +158,9 @@ class MoELayer(BaseMoELayer):
 
         dispatcher = self.token_dispatcher
         # Reuse stage variables so completed layouts are not kept alive here.
-        expert_tokens, expert_probs = dispatcher.dispatch_preprocess(hidden_states, routing)
+        expert_tokens, expert_probs = dispatcher.dispatch_preprocess(
+            hidden_states, routing_map, probs, expert_indices=expert_indices,
+        )
         expert_tokens, expert_probs = dispatcher.token_dispatch(expert_tokens, expert_probs)
         expert_tokens, tokens_per_expert, expert_probs = dispatcher.dispatch_postprocess(
             expert_tokens, expert_probs,
