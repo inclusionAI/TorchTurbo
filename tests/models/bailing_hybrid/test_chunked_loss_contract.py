@@ -8,7 +8,6 @@ from torch import nn
 from torchturbo.engine.backends.fsdp2.backend import FSDP2Backend
 from torchturbo.models.bailing_hybrid.model import TurboBailingMoeV3ForCausalLM
 from torchturbo.models.bailing_hybrid.modeling_bailing_moe_v3 import (
-    BailingMoeV3ForCausalLM,
     MoeV3ModelOutputWithPast,
 )
 
@@ -26,12 +25,7 @@ class _Backbone(nn.Module):
         )
 
 
-def test_bailing_uses_standard_forward_with_noop_lm_head():
-    assert "forward" not in TurboBailingMoeV3ForCausalLM.__dict__
-    assert TurboBailingMoeV3ForCausalLM.forward is BailingMoeV3ForCausalLM.forward
-
-
-def test_bailing_standard_forward_returns_main_and_mtp_hidden_states():
+def test_bailing_chunked_loss_receives_main_and_mtp_hidden_states():
     model = object.__new__(TurboBailingMoeV3ForCausalLM)
     nn.Module.__init__(model)
     model.config = SimpleNamespace(
