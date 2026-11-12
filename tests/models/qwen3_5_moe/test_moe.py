@@ -48,7 +48,7 @@ def test_qwen3_router_respects_model_normalization(normalize):
     if normalize:
         expected = expected / expected.sum(-1, keepdim=True)
 
-    probs = layer.router.routing(logits).probs
+    probs = layer.router.routing(logits)[0]
 
     torch.testing.assert_close(probs[:, :2], expected.reshape(1, 2))
     gradient = torch.tensor([[1.0, 3.0]])
@@ -74,7 +74,7 @@ def test_qwen3_5_router_preserves_normalized_probabilities(topk):
     expected = reference_logits.softmax(-1)[..., :topk]
     expected = expected / expected.sum(-1, keepdim=True)
 
-    probs = layer.router.routing(logits).probs
+    probs = layer.router.routing(logits)[0]
 
     torch.testing.assert_close(probs[:, :topk], expected.reshape(1, topk))
     gradient = torch.tensor([[1.0, 3.0]])[:, :topk]
