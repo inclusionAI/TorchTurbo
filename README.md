@@ -201,7 +201,7 @@ When training is launched through an entry point provided by TorchTurbo, the tra
 The LlamaFactory entry point, `scripts/runs/run_lf.py`, explicitly activates `llamafactory_v0` and then calls LlamaFactory's `run_exp()`.    
 The ms-swift entry point, `scripts/runs/run_swift.py`, parses TorchTurbo arguments and activates the `msswift` plugin before dispatching the selected stage.
 
-See the [`Qwen3.5 MoE training guide`](docs/runs/qwen3_5_moe/README_NPU.md).
+See the [training guide](docs/runs/README.md) for common preparation steps and model-specific examples.
 
 ### Configuration
 

@@ -16,7 +16,7 @@ SEQ_LEN=${SEQ_LEN:-65536}
 OUTPUT_DIR=${OUTPUT_DIR:-/tmp/tbsf-sft-lora/$(basename "${MODEL}")}
 # tuner type: 'full' | 'lora'
 FINETUNING_TYPE=${FINETUNING_TYPE:-lora}
-# training dataset (ms-swift dataset id "repo#subset", or path to a local jsonl/parquet)
+# training dataset (ms-swift dataset id "repo:subset", or path to a local jsonl/parquet)
 DATASET=${DATASET:-/datasets/AM-Thinking-v1-Distilled/science.jsonl}
 # turbo engine flags (sp/ep, cpu offload, chunk loss, ...) live in the sibling yaml.
 TT_CONFIG=${TT_CONFIG:-"$(dirname "$0")/swift_sft_lora.yaml"}
