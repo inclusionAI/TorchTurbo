@@ -28,8 +28,9 @@ so this module stays swift-free until a concrete trainer is actually built.
 from __future__ import annotations
 
 import os
-from contextlib import nullcontext
+from contextlib import ExitStack
 from functools import partial
+from typing import Any
 
 import torch
 import torch.nn.functional as F
@@ -41,8 +42,8 @@ from ...engine import CPUOffloadMode
 from ...engine.distributed import assert_finite
 from ...engine.checkpoint import CheckpointFormat
 from ...engine.checkpoint.layout import validate_output_dir
+from ...engine.garbage_collection import GarbageCollector
 from ...logging import get_logger
-from ...runtime.garbage_collection import freeze_training_gc
 from . import engine_registry
 
 logger = get_logger(__name__)
@@ -233,43 +234,47 @@ class TurboTrainerMixin:
             if engine is not None and tt_args is not None
             else None
         )
-        if profiling_enabled or memory_snapshot_steps is not None:
-            self.add_callback(self._make_torchturbo_profiling_callback())
-            engine.start_profiling(
-                self.args.output_dir,
-                profiling_enabled,
-                memory_snapshot_steps,
-            )
-        gc_scope = nullcontext()
-        if engine is not None and engine.config.garbage_collection.mode == "freeze":
-            gc_scope = freeze_training_gc(self)
-        try:
-            with gc_scope:
-                return super().train(*args, **kwargs)
-        finally:
-            if profiling_enabled or memory_snapshot_steps is not None:
-                engine.stop_profiling()
+        profiling_active = profiling_enabled or memory_snapshot_steps is not None
+        freeze_gc = engine is not None and engine.config.garbage_collection.mode == "freeze"
+        with ExitStack() as scope:
+            if profiling_active:
+                engine.start_profiling(
+                    self.args.output_dir, profiling_enabled, memory_snapshot_steps
+                )
+                scope.callback(engine.stop_profiling)
+            collector = scope.enter_context(GarbageCollector()) if freeze_gc else None
+            if profiling_active or freeze_gc:
+                callback = self._make_torchturbo_training_callback(
+                    collector, profiling_active
+                )
+                self.add_callback(callback)
+                scope.callback(self.remove_callback, callback)
+            return super().train(*args, **kwargs)
 
-    def _make_torchturbo_profiling_callback(self):
-        """HF ``TrainerCallback`` that advances TorchTurbo profiling per step.
-
-        Built in a closure, not at module scope — it is held only by the
-        trainer (never pickled through swift's ``dataset.map``), matching the
-        llamafactory adapter's callback factory.
-        """
+    def _make_torchturbo_training_callback(
+        self, collector: GarbageCollector | None, profiling_active: bool
+    ) -> Any:
+        """Bridge trainer lifecycle events without retaining callbacks across runs."""
         from transformers import TrainerCallback
 
         engine = engine_registry.get_engine_or_none()
 
-        class TorchTurboProfilingCallback(TrainerCallback):
-            """Bridge swift/HF step boundaries to TorchTurbo profiling."""
+        class TorchTurboTrainingCallback(TrainerCallback):
+            def on_train_begin(
+                self, args: Any, state: Any, control: Any, **kwargs: Any
+            ) -> Any:
+                if collector is not None:
+                    collector.freeze()
+                return control
 
-            def on_step_end(self, args, state, control, **kwargs):
-                if engine is not None:
+            def on_step_end(
+                self, args: Any, state: Any, control: Any, **kwargs: Any
+            ) -> Any:
+                if profiling_active and engine is not None:
                     engine.step_profiling()
                 return control
 
-        return TorchTurboProfilingCallback()
+        return TorchTurboTrainingCallback()
 
     def _wrap_model(self, model, training=True, dataloader=None, **kwargs):
         # The model is already FSDP2-sharded; return it as-is.

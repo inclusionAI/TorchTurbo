@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
 from dataclasses import dataclass
 from typing import Any
 
@@ -12,9 +12,9 @@ import torch.nn as nn
 from ...engine.checkpoint import CheckpointFormat
 from ...engine.checkpoint.layout import validate_output_dir
 from ...engine.distributed import assert_finite
+from ...engine.garbage_collection import GarbageCollector
 from ...logging import get_logger
 from ...models.modules.cpu_resident import CPUResidentParameter
-from ...runtime.garbage_collection import freeze_training_gc
 
 logger = get_logger(__name__)
 
@@ -379,41 +379,45 @@ class TorchTurboTrainerBase:
         memory_snapshot_steps = (
             tt_args.memory_snapshot_steps if tt_args is not None else None
         )
-        if profiling_enabled or memory_snapshot_steps is not None:
-            profiling_callback = self._make_torchturbo_profiling_callback()
-            self.add_callback(profiling_callback)
-            engine.start_profiling(
-                self.args.output_dir,
-                profiling_enabled,
-                memory_snapshot_steps,
-            )
+        profiling_active = profiling_enabled or memory_snapshot_steps is not None
+        freeze_gc = engine.config.garbage_collection.mode == "freeze"
+        with ExitStack() as scope:
+            if profiling_active:
+                engine.start_profiling(
+                    self.args.output_dir, profiling_enabled, memory_snapshot_steps
+                )
+                scope.callback(engine.stop_profiling)
+            collector = scope.enter_context(GarbageCollector()) if freeze_gc else None
+            if profiling_active or freeze_gc:
+                callback = self._make_torchturbo_training_callback(
+                    collector, profiling_active
+                )
+                self.add_callback(callback)
+                scope.callback(self.remove_callback, callback)
+            return super().train(*args, **kwargs)
 
-        gc_scope = (
-            freeze_training_gc(self)
-            if engine.config.garbage_collection.mode == "freeze"
-            else nullcontext()
-        )
-        try:
-            with gc_scope:
-                result = super().train(*args, **kwargs)
-        finally:
-            if profiling_enabled or memory_snapshot_steps is not None:
-                engine.stop_profiling()
-
-        return result
-
-    def _make_torchturbo_profiling_callback(self):
+    def _make_torchturbo_training_callback(
+        self, collector: GarbageCollector | None, profiling_active: bool
+    ) -> Any:
         from transformers import TrainerCallback
         engine = self._engine()
 
-        class TorchTurboProfilingCallback(TrainerCallback):
-            """Bridge HF optimizer-step boundaries to TorchTurbo profiling."""
-
-            def on_step_end(self, args, state, control, **kwargs):
-                engine.step_profiling()
+        class TorchTurboTrainingCallback(TrainerCallback):
+            def on_train_begin(
+                self, args: Any, state: Any, control: Any, **kwargs: Any
+            ) -> Any:
+                if collector is not None:
+                    collector.freeze()
                 return control
 
-        return TorchTurboProfilingCallback()
+            def on_step_end(
+                self, args: Any, state: Any, control: Any, **kwargs: Any
+            ) -> Any:
+                if profiling_active:
+                    engine.step_profiling()
+                return control
+
+        return TorchTurboTrainingCallback()
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         if self.stage in {"sft", "pt"}:

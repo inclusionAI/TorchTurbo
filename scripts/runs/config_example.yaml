@@ -72,7 +72,8 @@ engine_config:
     use_reentrant: false
 
   garbage_collection:
-    # auto preserves Python's GC policy; freeze skips initialization survivors.
+    # auto: Preserve the current Python GC behavior.
+    # freeze: Exclude existing objects from GC scans during training.
     mode: auto
 
   # Engine-managed optimizer configuration.
