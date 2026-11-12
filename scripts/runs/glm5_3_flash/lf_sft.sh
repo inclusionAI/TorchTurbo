@@ -19,7 +19,8 @@ SEQ_LEN=${SEQ_LEN:-65536}
 FINETUNING_TYPE=${FINETUNING_TYPE:-full}
 # training dataset (must be registered in ${DATASET_DIR}/dataset_info.json)
 DATASET=${DATASET:-science}
-TEMPLATE=${TEMPLATE:-glm5}
+# Use glm5_3_flash_vl for image/video datasets.
+TEMPLATE=${TEMPLATE:-glm5_3_flash}
 # Turbo engine flags live in the sibling YAML.
 TT_CONFIG=${TT_CONFIG:-"$(dirname "$0")/sft.yaml"}
 
