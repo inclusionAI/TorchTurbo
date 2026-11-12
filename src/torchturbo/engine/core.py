@@ -32,6 +32,11 @@ from torchturbo.adapters.rl.packed import (
     prepare_packed_mb_inputs,
     shifted_packed_tensor,
 )
+from torchturbo.adapters.rl.sparse import (
+    SparseLogitsPlan,
+    build_sparse_plan,
+    restore_sparse_logprobs_entropy,
+)
 from ..ops import get_or_create_ops
 from ..runtime import BaseProfiler, get_device_runtime
 
@@ -1266,18 +1271,49 @@ class TorchTurboEngine:
         auxiliary_loss_fn: Optional[
             Callable[[Any, dict[str, Any], float], torch.Tensor]
         ] = None,
+        *,
+        loss_uses_ppo_mask: bool = False,
     ) -> None:
-        """Run packed-token forward and optional backward over micro-batches."""
+        """Run packed-token forward and optional backward over micro-batches.
+
+        With sparse logits enabled, ``loss_uses_ppo_mask=True`` is a caller
+        assertion that the policy and entropy losses read only nonzero
+        ``ppo_loss_mask`` positions. Masked-out log-probabilities are filled
+        with ``old_logp``; they are not current policy evaluations. Raw-logit
+        callbacks and auxiliary losses cannot use this path. Forward-only
+        evaluation remains dense.
+        """
 
         if self.model is None:
             raise RuntimeError("Call engine.prepare_model() before forward_backward_batch().")
+
+        use_sparse = self.config.sparse_logits.enabled and not forward_only
+        if use_sparse:
+            if loss_uses_ppo_mask is not True:
+                raise ValueError("Sparse logits require loss_uses_ppo_mask=True.")
+            if process_fn is not None or auxiliary_loss_fn is not None:
+                raise ValueError("Sparse logits do not support raw-logit or auxiliary losses.")
+            if self.config.mtp.enabled:
+                raise ValueError("Sparse logits require mtp.enabled=False.")
+            if not torch.is_grad_enabled() or not self.model.training:
+                raise ValueError("Sparse logits require grad-enabled training.")
+            plan = self.config.parallel_plan
+            if plan is not None and plan.ep_size != 1:
+                raise ValueError("Sparse logits currently require ep_size=1.")
+            if int(self.get_sp_info().get("sp_size", 1)) not in (1, 8):
+                raise ValueError("Sparse logits currently support SP1 or Ulysses SP8.")
 
         total_loss_weight = self._compute_total_loss_weight(mb_list, device)
         loss_multiplier = self._get_loss_multiplier()
 
         for mb_idx, mb_item in enumerate(mb_list):
             inputs, ctx = prepare_packed_mb_inputs(mb_item)
-            outputs = self._forward_microbatch(inputs)
+            sparse_plan = None
+            if use_sparse:
+                sparse_plan = build_sparse_plan(ctx, self.get_sp_info())
+                outputs = self.model.forward_sparse_logits(inputs, sparse_plan.model_rows)
+            else:
+                outputs = self._forward_microbatch(inputs)
             logits = self._get_main_logits(outputs)
 
             if process_fn is None:
@@ -1287,6 +1323,7 @@ class TorchTurboEngine:
                         ctx,
                         temperature=temperature,
                         grad_scaler=True,
+                        sparse_plan=sparse_plan,
                     )
                 )
                 loss = loss_fn(
@@ -1359,13 +1396,14 @@ class TorchTurboEngine:
         ctx: Any,
         temperature: float,
         grad_scaler: bool,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        sparse_plan: SparseLogitsPlan | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         sp_info = self.get_sp_info()
         sp_size = int(sp_info.get("sp_size", 1))
         mb_input = ctx["mb_input"]
         cu_seqlens = mb_input.get("cu_seqlens")
 
-        if sp_size > 1:
+        if sp_size > 1 and sparse_plan is None:
             from torchturbo.adapters.rl.sp import (
                 gather_entropy_and_shift,
                 gather_logprobs_and_shift,
@@ -1389,18 +1427,31 @@ class TorchTurboEngine:
             )
             return logprobs, entropy
 
-        input_ids = ctx["model_inputs"]["input_ids"].squeeze(0)
-        if ctx["pad_length"] > 0:
-            logits = logits[: -ctx["pad_length"]]
-            input_ids = input_ids[: -ctx["pad_length"]]
+        if sparse_plan is not None:
+            if logits.ndim != 2 or logits.shape[0] != sparse_plan.model_rows.numel():
+                raise ValueError(
+                    "Sparse model output does not match selected predictor rows."
+                )
+            if temperature <= 0:
+                raise ValueError("temperature must be positive.")
+            # Sparse rows already have next-token labels; do not shift them again.
+            shifted_logits = logits
+            shifted_labels = sparse_plan.labels
+        else:
+            input_ids = ctx["model_inputs"]["input_ids"].squeeze(0)
+            if ctx["pad_length"] > 0:
+                logits = logits[: -ctx["pad_length"]]
+                input_ids = input_ids[: -ctx["pad_length"]]
 
-        shifted_logits = shifted_packed_tensor(logits, cu_seqlens, 0, 1)
-        shifted_labels = shifted_packed_tensor(input_ids, cu_seqlens, 1, 0)
+            shifted_logits = shifted_packed_tensor(logits, cu_seqlens, 0, 1)
+            shifted_labels = shifted_packed_tensor(input_ids, cu_seqlens, 1, 0)
         logprobs, entropy = gather_logprobs_entropy(
             shifted_logits,
             shifted_labels,
             temperature,
         )
+        if sparse_plan is not None:
+            return restore_sparse_logprobs_entropy(logprobs, entropy, sparse_plan)
         return logprobs, entropy
 
     def _scale_loss(
