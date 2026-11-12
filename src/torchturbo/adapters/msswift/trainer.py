@@ -42,7 +42,7 @@ from ...engine.distributed import assert_finite
 from ...engine.checkpoint import CheckpointFormat
 from ...engine.checkpoint.layout import validate_output_dir
 from ...logging import get_logger
-from ..garbage_collection import freeze_training_gc
+from ...runtime.garbage_collection import freeze_training_gc
 from . import engine_registry
 
 logger = get_logger(__name__)

@@ -14,7 +14,7 @@ from ...engine.checkpoint.layout import validate_output_dir
 from ...engine.distributed import assert_finite
 from ...logging import get_logger
 from ...models.modules.cpu_resident import CPUResidentParameter
-from ..garbage_collection import freeze_training_gc
+from ...runtime.garbage_collection import freeze_training_gc
 
 logger = get_logger(__name__)
 

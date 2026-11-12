@@ -11,15 +11,10 @@ import pytest
 
 @pytest.fixture
 def freeze_training_gc(monkeypatch):
-    root = Path(__file__).parents[2] / "src/torchturbo"
-    for name, path in [
-        ("torchturbo.runtime.garbage_collection", root / "runtime/garbage_collection.py"),
-        ("torchturbo.adapters.garbage_collection", root / "adapters/garbage_collection.py"),
-    ]:
-        spec = importlib.util.spec_from_file_location(name, path)
-        module = importlib.util.module_from_spec(spec)
-        monkeypatch.setitem(sys.modules, name, module)
-        spec.loader.exec_module(module)
+    source = Path(__file__).parents[2] / "src/torchturbo/runtime/garbage_collection.py"
+    spec = importlib.util.spec_from_file_location("training_gc_under_test", source)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
     transformers = ModuleType("transformers")
     transformers.TrainerCallback = type("TrainerCallback", (), {})
     monkeypatch.setitem(sys.modules, "transformers", transformers)
