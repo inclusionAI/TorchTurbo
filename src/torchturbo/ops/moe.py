@@ -42,7 +42,7 @@ class MoEPermutation:
     # int64 tensor of shape [num_tokens, topk]. Entry [i, j] is the global expert
     # ID in [0, num_experts) for the assignment at row_indices[i, j]. Unpermutation
     # uses these IDs to gather explicitly supplied dense merging weights. Output
-    # slot order need not match the sorted expert IDs passed into permutation.
+    # slot order need not match the order of the expert IDs passed into permutation.
     expert_indices: torch.Tensor
 
 

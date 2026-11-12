@@ -76,16 +76,16 @@ def test_deepseek_router_keeps_native_selection_and_megatron_normalization(score
     inputs = torch.tensor([[[1., 0., -.5, 2.], [-1., .5, 1., 0.]]], requires_grad=True)
     ref_inputs = inputs.detach().clone().requires_grad_()
     ids = torch.tensor([[0, 1]])
-    routing, _ = router(inputs, ids)
+    routing_probs, _, _, _ = router(inputs, ids)
     weights, indices = gate(ref_inputs.reshape(-1, config.hidden_size), ids.flatten())
     if score != "softmax" and topk == 1:
         logits = F.linear(ref_inputs.reshape(-1, config.hidden_size), gate.weight)
         scores = logits.sigmoid() if score == "sigmoid" else F.softplus(logits).sqrt()
         weights = scores.gather(1, indices) * config.route_scale
-    expected = torch.zeros_like(routing.probs).scatter(1, indices.view(2, topk), weights.view(2, topk))
-    torch.testing.assert_close(routing.probs, expected, rtol=0, atol=0)
+    expected = torch.zeros_like(routing_probs).scatter(1, indices.view(2, topk), weights.view(2, topk))
+    torch.testing.assert_close(routing_probs, expected, rtol=0, atol=0)
     gradient = torch.arange(8, dtype=torch.float32).view(2, 4)
-    actual_grads = torch.autograd.grad(routing.probs, (inputs, router.weight), gradient)
+    actual_grads = torch.autograd.grad(routing_probs, (inputs, router.weight), gradient)
     expected_grads = torch.autograd.grad(expected, (ref_inputs, gate.weight), gradient)
     for actual, expected in zip(actual_grads, expected_grads):
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
@@ -107,12 +107,12 @@ def test_llada_native_routing_matches_when_group_score_formulas_agree(topk, num_
         router.expert_bias.copy_(original.gate.expert_bias)
     inputs = torch.tensor([[[1., 0.], [-1., .5]]], requires_grad=True)
     ref_inputs = inputs.detach().clone().requires_grad_()
-    actual, _ = router(inputs)
+    actual_probs, _, _, _ = router(inputs)
     indices, weights, _ = original.gate(ref_inputs)
-    expected = torch.zeros_like(actual.probs).scatter(1, indices, weights)
-    torch.testing.assert_close(actual.probs, expected, rtol=0, atol=0)
+    expected = torch.zeros_like(actual_probs).scatter(1, indices, weights)
+    torch.testing.assert_close(actual_probs, expected, rtol=0, atol=0)
     gradient = torch.arange(32, dtype=torch.float32).view(2, 16)
-    actual_grads = torch.autograd.grad(actual.probs, (inputs, router.weight), gradient)
+    actual_grads = torch.autograd.grad(actual_probs, (inputs, router.weight), gradient)
     expected_grads = torch.autograd.grad(expected, (ref_inputs, original.gate.weight), gradient)
     for actual_grad, expected_grad in zip(actual_grads, expected_grads):
         torch.testing.assert_close(actual_grad, expected_grad, rtol=0, atol=0)
@@ -120,12 +120,12 @@ def test_llada_native_routing_matches_when_group_score_formulas_agree(topk, num_
 
 def test_group_limited_routing_accepts_an_empty_source_rank():
     logits = torch.empty(0, 16, requires_grad=True)
-    routing = topk_softmax_with_capacity(
+    probs, routing_map, expert_indices = topk_softmax_with_capacity(
         logits, 4, num_groups=4, group_topk=2, score_function="sigmoid",
     )
-    assert routing.probs.shape == routing.routing_map.shape == (0, 16)
-    assert routing.expert_indices.shape == (0, 4)
-    routing.probs.sum().backward()
+    assert probs.shape == routing_map.shape == (0, 16)
+    assert expert_indices.shape == (0, 4)
+    probs.sum().backward()
     torch.testing.assert_close(logits.grad, torch.empty_like(logits))
 
 
@@ -157,18 +157,20 @@ def test_group_adapters_preserve_default_native_routing(model):
         router.expert_bias.copy_(bias)
     inputs = torch.randn(1, 5, 4, requires_grad=True)
     ref_inputs = inputs.detach().clone().requires_grad_()
-    actual, _ = router(inputs)
+    actual_probs, _, actual_indices, _ = router(inputs)
     if model == "bailing":
         indices, weights, _ = original.gate(ref_inputs)
     elif model == "kimi":
         indices, weights = original.gate(ref_inputs)
     else:
         indices, weights = original.route_tokens_to_experts(original.gate(ref_inputs))
-    expected = torch.zeros_like(actual.probs).scatter(1, indices, weights)
-    torch.testing.assert_close(actual.expert_indices, indices.sort(-1).values)
-    torch.testing.assert_close(actual.probs, expected)
+    expected = torch.zeros_like(actual_probs).scatter(1, indices, weights)
+    torch.testing.assert_close(
+        actual_indices.sort(-1).values, indices.sort(-1).values,
+    )
+    torch.testing.assert_close(actual_probs, expected)
     gradient = torch.randn_like(expected)
-    actual_grads = torch.autograd.grad(actual.probs, (inputs, router.weight), gradient)
+    actual_grads = torch.autograd.grad(actual_probs, (inputs, router.weight), gradient)
     expected_grads = torch.autograd.grad(expected, (ref_inputs, original.gate.weight), gradient)
     for actual_grad, expected_grad in zip(actual_grads, expected_grads):
         torch.testing.assert_close(actual_grad, expected_grad)
@@ -194,9 +196,9 @@ def test_group_adapters_derive_group_score_count_from_megatron_topk(replace):
     router = replace_layer(replace, original, hf_config).router
     # Top-4 sums favor group 1 (2.4 > 1.72); fixed top-2 favors group 0 (1.7 > 1.2).
     scores = torch.tensor([[0.9, 0.8, 0.01, 0.01, 0.6, 0.6, 0.6, 0.6]])
-    actual = router.routing(scores.logit().unsqueeze(0))
-    torch.testing.assert_close(actual.expert_indices, torch.tensor([[4, 5, 6, 7]]))
-    torch.testing.assert_close(actual.probs, torch.tensor([[0., 0., 0., 0., .25, .25, .25, .25]]))
+    actual_probs, _, actual_indices = router.routing(scores.logit().unsqueeze(0))
+    torch.testing.assert_close(actual_indices.sort(-1).values, torch.tensor([[4, 5, 6, 7]]))
+    torch.testing.assert_close(actual_probs, torch.tensor([[0., 0., 0., 0., .25, .25, .25, .25]]))
 
 
 @pytest.mark.parametrize("model", ["kimi", "glm"])
@@ -222,7 +224,7 @@ def test_sigmoid_adapters_follow_megatron_normalization(model, topk, normalize):
         router.expert_bias.copy_(original.gate.e_score_correction_bias)
     inputs = torch.tensor([[[1., 0., -.5, 2.], [-1., .5, 1., 0.]]], requires_grad=True)
     ref_inputs = inputs.detach().clone().requires_grad_()
-    actual, _ = router(inputs)
+    actual_probs, _, _, _ = router(inputs)
     if model == "kimi":
         indices, _ = original.gate(ref_inputs)
     else:
@@ -232,10 +234,10 @@ def test_sigmoid_adapters_follow_megatron_normalization(model, topk, normalize):
     if topk > 1:
         weights = weights / (weights.sum(-1, keepdim=True) + 1e-20)
     weights = weights * config.routed_scaling_factor
-    expected = torch.zeros_like(actual.probs).scatter(1, indices, weights)
-    torch.testing.assert_close(actual.probs, expected, rtol=0, atol=0)
+    expected = torch.zeros_like(actual_probs).scatter(1, indices, weights)
+    torch.testing.assert_close(actual_probs, expected, rtol=0, atol=0)
     gradient = torch.arange(32, dtype=torch.float32).view(2, 16)
-    actual_grads = torch.autograd.grad(actual.probs, (inputs, router.weight), gradient)
+    actual_grads = torch.autograd.grad(actual_probs, (inputs, router.weight), gradient)
     expected_grads = torch.autograd.grad(expected, (ref_inputs, original.gate.weight), gradient)
     for actual_grad, expected_grad in zip(actual_grads, expected_grads):
         torch.testing.assert_close(actual_grad, expected_grad, rtol=0, atol=0)

@@ -16,7 +16,6 @@ from torchturbo.models.modules.moe.module import ModuleSpec
 from torchturbo.models.modules.moe.moe_config import MoEConfig
 from torchturbo.models.modules.moe.moe_layer import MoESubmodules
 from torchturbo.models.modules.moe.token_dispatcher import MoEAlltoAllTokenDispatcher
-from torchturbo.models.modules.moe.utils import RoutingResult
 from torchturbo.ops import OpPolicy, get_or_create_ops
 from torchturbo.runtime.cpu import CpuRuntime
 
@@ -44,8 +43,9 @@ def _routed_forward(experts, dispatcher, tokens, routing_map, probs):
     indices = routing_map.nonzero(as_tuple=True)[1].reshape(
         probs.shape[0], dispatcher.config.moe_router_topk,
     )
-    routing = RoutingResult(probs, routing_map, indices)
-    packed, packed_probs = dispatcher.dispatch_preprocess(tokens, routing)
+    packed, packed_probs = dispatcher.dispatch_preprocess(
+        tokens, routing_map, probs, expert_indices=indices,
+    )
     received, received_probs = dispatcher.token_dispatch(packed, packed_probs)
     local, counts, local_probs = dispatcher.dispatch_postprocess(received, received_probs)
     output, _ = experts(local, counts, local_probs)
@@ -176,9 +176,9 @@ def test_bailing_replacement_preserves_shared_experts_and_parameter_layout():
         for parameter in layer.parameters():
             parameter.normal_(std=0.1)
     x = torch.randn(2, 3, 4, requires_grad=True)
-    routing, expected_logits = layer.router(x)
+    probs, routing_map, _, expected_logits = layer.router(x)
     expected = _reference(
-        x.reshape(-1, 4), routing.probs, routing.routing_map,
+        x.reshape(-1, 4), probs, routing_map,
         layer.experts.weight1.view(4, 4, 6), layer.experts.weight2.view(4, 3, 4), 0.3,
     ).reshape_as(x) + layer.shared_experts(x)
     output, logits = layer(x)

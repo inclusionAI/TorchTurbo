@@ -131,9 +131,9 @@ def _check_adapter_losses(rank: int, init_file: str) -> None:
                 router = model.mlp.router
                 with torch.no_grad():
                     router.weight.copy_(weight)
-                routing, _ = router(local_inputs.unsqueeze(0))
+                probs, _, _, _ = router(local_inputs.unsqueeze(0))
                 # Remove the main-loss contribution to isolate attached router losses.
-                (routing.probs.sum() * 0).backward()
+                (probs.sum() * 0).backward()
                 gradient = router.weight.grad.clone()
                 dist.all_reduce(gradient)
                 gradient /= 2

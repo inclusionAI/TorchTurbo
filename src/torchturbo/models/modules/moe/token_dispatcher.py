@@ -18,7 +18,7 @@ from torchturbo.runtime import get_device_runtime
 
 from ..comm.comm import all_to_all, gather_from_sequence_parallel_region
 from .moe_config import MoEConfig
-from .utils import RoutingResult, maybe_move_tensor_to_cpu
+from .utils import maybe_move_tensor_to_cpu
 
 
 class MoETokenDispatcher(ABC):
@@ -31,7 +31,12 @@ class MoETokenDispatcher(ABC):
 
     @abstractmethod
     def dispatch_preprocess(
-        self, hidden_states: torch.Tensor, routing: RoutingResult,
+        self,
+        hidden_states: torch.Tensor,
+        routing_map: torch.Tensor,
+        probs: torch.Tensor,
+        *,
+        expert_indices: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Group source tokens by destination expert and prepare counts."""
         raise NotImplementedError
@@ -142,11 +147,14 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         return tokens_per_expert
 
     def dispatch_preprocess(
-        self, hidden_states: torch.Tensor, routing: RoutingResult,
+        self,
+        hidden_states: torch.Tensor,
+        routing_map: torch.Tensor,
+        probs: torch.Tensor,
+        *,
+        expert_indices: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Group source tokens and probabilities for weighting inside the experts."""
-        probs = routing.probs
-        routing_map = routing.routing_map
         self.hidden_shape = hidden_states.shape
         assert probs.dim() == 2, "Expected 2D tensor for probs"
         assert routing_map.dim() == 2, "Expected 2D tensor for token2expert mask"
@@ -158,7 +166,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         permutation = ops.moe_permutation(
             hidden_states, routing_map, probs=probs,
             num_out_tokens=routing_map.size(0) * self.config.moe_router_topk,
-            expert_indices=routing.expert_indices,
+            expert_indices=expert_indices,
         )
         # Retain only inverse metadata across expert communication; the source
         # packed activations and weights need not stay alive until combine.
