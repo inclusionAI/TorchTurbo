@@ -32,6 +32,10 @@ from torchturbo.adapters.rl.packed import (
     prepare_packed_mb_inputs,
     shifted_packed_tensor,
 )
+from torchturbo.adapters.rl.sparse import (
+    build_sparse_plan,
+    compute_sparse_logprobs_entropy,
+)
 from ..ops import get_or_create_ops
 from ..runtime import BaseProfiler, get_device_runtime
 
@@ -220,6 +224,12 @@ class TorchTurboEngine:
             "TorchTurboEngine initialized: backend=%s, device=%s",
             backend_name,
             self.device_runtime.device.type,
+        )
+        logger.info_rank0(
+            "Logprob computation: chunk_size=%d, checkpoint_chunks=%s, "
+            "use_reentrant=False",
+            self.config.logprob_computation.chunk_size,
+            self.config.logprob_computation.checkpoint_chunks,
         )
 
     # ------------------------------------------------------------------
@@ -1266,21 +1276,60 @@ class TorchTurboEngine:
         auxiliary_loss_fn: Optional[
             Callable[[Any, dict[str, Any], float], torch.Tensor]
         ] = None,
+        *,
+        loss_uses_ppo_mask: bool = False,
     ) -> None:
-        """Run packed-token forward and optional backward over micro-batches."""
+        """Run packed-token forward and optional backward over micro-batches.
+
+        With sparse logits enabled, ``loss_uses_ppo_mask=True`` is a caller
+        assertion that the policy and entropy losses read only nonzero
+        ``ppo_loss_mask`` positions. Masked-out log-probabilities are filled
+        with ``old_logp``; they are not current policy evaluations. Raw-logit
+        callbacks and auxiliary losses cannot use this path. Forward-only
+        evaluation remains dense.
+        """
 
         if self.model is None:
             raise RuntimeError("Call engine.prepare_model() before forward_backward_batch().")
+
+        use_sparse = self.config.sparse_logits.enabled and not forward_only
+        if use_sparse:
+            if loss_uses_ppo_mask is not True:
+                raise ValueError("Sparse logits require loss_uses_ppo_mask=True.")
+            if process_fn is not None or auxiliary_loss_fn is not None:
+                raise ValueError("Sparse logits do not support raw-logit or auxiliary losses.")
+            if self.config.mtp.enabled:
+                raise ValueError("Sparse logits require mtp.enabled=False.")
+            if not torch.is_grad_enabled() or not self.model.training:
+                raise ValueError("Sparse logits require grad-enabled training.")
+            plan = self.config.parallel_plan
+            if plan is not None and plan.ep_size != 1:
+                raise ValueError("Sparse logits currently require ep_size=1.")
+            if int(self.get_sp_info().get("sp_size", 1)) not in (1, 8):
+                raise ValueError("Sparse logits currently support SP1 or Ulysses SP8.")
 
         total_loss_weight = self._compute_total_loss_weight(mb_list, device)
         loss_multiplier = self._get_loss_multiplier()
 
         for mb_idx, mb_item in enumerate(mb_list):
             inputs, ctx = prepare_packed_mb_inputs(mb_item)
-            outputs = self._forward_microbatch(inputs)
+            if use_sparse:
+                sparse_plan = build_sparse_plan(ctx, self.get_sp_info())
+                outputs = self.model.forward_sparse_logits(inputs, sparse_plan.model_rows)
+            else:
+                outputs = self._forward_microbatch(inputs)
             logits = self._get_main_logits(outputs)
 
-            if process_fn is None:
+            if use_sparse:
+                logprobs, entropy = compute_sparse_logprobs_entropy(
+                    logits, sparse_plan, temperature=temperature,
+                    chunk_size=self.config.logprob_computation.chunk_size,
+                    checkpoint_chunks=self.config.logprob_computation.checkpoint_chunks,
+                )
+                loss = loss_fn(
+                    logprobs=logprobs, entropy=entropy, mb_input=ctx["mb_input"]
+                )
+            elif process_fn is None:
                 logprobs, entropy = (
                     self._compute_logrobs_and_entropy(
                         logits,
@@ -1364,6 +1413,7 @@ class TorchTurboEngine:
         sp_size = int(sp_info.get("sp_size", 1))
         mb_input = ctx["mb_input"]
         cu_seqlens = mb_input.get("cu_seqlens")
+        logprob_config = self.config.logprob_computation
 
         if sp_size > 1:
             from torchturbo.adapters.rl.sp import (
@@ -1372,7 +1422,13 @@ class TorchTurboEngine:
             )
 
             labels = mb_input["_input_ids_rolled"]
-            logprobs, entropy = gather_logprobs_entropy(logits, labels, temperature)
+            logprobs, entropy = gather_logprobs_entropy(
+                logits,
+                labels,
+                temperature,
+                chunk_size=logprob_config.chunk_size,
+                checkpoint_chunks=logprob_config.checkpoint_chunks,
+            )
             logprobs = gather_logprobs_and_shift(
                 logprobs,
                 ctx["sp_pad_size"],
@@ -1400,6 +1456,8 @@ class TorchTurboEngine:
             shifted_logits,
             shifted_labels,
             temperature,
+            chunk_size=logprob_config.chunk_size,
+            checkpoint_chunks=logprob_config.checkpoint_chunks,
         )
         return logprobs, entropy
 
