@@ -40,6 +40,35 @@ def test_packed_params_cache_is_owned_by_the_caller():
     assert calls == [cu_seqlens]
 
 
+def test_kda_metadata_cache_reuses_boundaries_and_refreshes_mutations():
+    from torchturbo.ops.providers.npu.kda import _prepare_kda_metadata
+
+    _prepare_kda_metadata.cache_clear()
+    cu = torch.tensor([0, 65, 128], dtype=torch.int32)
+    before = _prepare_kda_metadata(cu, cu._version)
+    assert _prepare_kda_metadata(cu, cu._version) is before
+
+    cu[1] = 64
+    after = _prepare_kda_metadata(cu, cu._version)
+    assert after is not before
+    assert before[0] == [0, 65, 128]
+    assert after[0] == [0, 64, 128]
+    assert after[1] == [0, 0, 1, 0]
+    assert _prepare_kda_metadata(cu, cu._version) is after
+    _prepare_kda_metadata.cache_clear()
+
+
+def test_kda_metadata_preserves_empty_sequence_numbering():
+    from torchturbo.ops.providers.npu.kda import _prepare_kda_metadata
+
+    cu = torch.tensor([0, 0, 65, 65, 128], dtype=torch.int32)
+    cu_host, indices = _prepare_kda_metadata(cu, cu._version)
+
+    assert cu_host == [0, 0, 65, 65, 128]
+    assert indices == [1, 0, 1, 1, 3, 0]
+    _prepare_kda_metadata.cache_clear()
+
+
 def test_causal_conv_consumes_prevalidated_offsets_without_host_conversion():
     gdn = _gdn_module()
     packed = build_packed_params(torch.tensor([0, 3], dtype=torch.int32))

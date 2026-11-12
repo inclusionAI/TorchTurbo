@@ -45,10 +45,10 @@ class BaseVisionBalanceIO(ABC):
     Empty outputs must retain their gradient connection when rebuilding the
     return value. Media inputs are always present at the boundary: training
     frameworks give media-less batches a dummy image, so ``read_inputs`` must
-    not invent media for missing inputs. ``make_dummy`` serves only the ranks
-    the distribution leaves without media because the world pool holds fewer
-    media than ranks; that dummy must exercise the same differentiable output
-    streams as real media so every rank joins the backward exchanges.
+    not invent media for missing inputs. A sparse world pool keeps those
+    original local inputs without redistributing media. ``make_dummy`` defines
+    minimal valid media for an empty assignment; its outputs must retain the
+    same differentiable streams as real media.
     """
 
     @abstractmethod
@@ -81,6 +81,4 @@ class BaseVisionBalanceIO(ABC):
 
     @abstractmethod
     def make_dummy(self, tower: nn.Module) -> VisionBatch:
-        """Build minimal valid media for a rank the distribution assigns no
-        media, which happens when the world pool holds fewer media than
-        ranks."""
+        """Build minimal valid media with all differentiable output streams."""

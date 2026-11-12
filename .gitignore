@@ -13,7 +13,6 @@ __pycache__
 build/
 dist/
 *.whl
-!docker/npu/pkg/*.whl
 
 # pip temporary dirs
 pip-build-tracker-*/

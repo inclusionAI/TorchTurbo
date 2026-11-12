@@ -144,9 +144,10 @@ def test_parallel_plan_replacement_uses_current_moe_layer_signature(monkeypatch)
             topk_group=1,
             routed_scaling_factor=1.0,
         ),
-        sp_info={},
+        sp_info={"sp_group": None},
         ep_info={"ep_group": object(), "ep_size": 1},
         moe_submodules=object(),
+        engine_config=EngineConfig(),
     )
 
     assert isinstance(result, FakeMoELayer)

@@ -1,17 +1,21 @@
 from __future__ import annotations
 
 import importlib
+from collections.abc import Mapping
 from dataclasses import dataclass
 from types import ModuleType
 from typing import Any
+
+import torch
 
 from torchturbo.logging import get_logger
 from torchturbo.runtime import DeviceRuntime, TurboDevice
 
 from .base import OpImpl, OpImplKind, OpPolicy, OpSpec
+from .moe import MoEPermutation, get_expert_indices
+from .packed_params import get_packed_params
 from .providers import iter_provider_modules
 from .registry import OpRegistry
-
 
 logger = get_logger(__name__)
 
@@ -30,12 +34,21 @@ class OpDispatcher:
         device_runtime: DeviceRuntime,
         registry: OpRegistry,
         default_policy: OpPolicy = OpPolicy.AUTO,
+        overrides: Mapping[str, str] | None = None,
     ) -> None:
         if not isinstance(default_policy, OpPolicy):
             raise TypeError("default_policy must be an OpPolicy.")
         self.registry = registry
         self._device_runtime = device_runtime
         self._default_policy = default_policy
+        self._overrides = dict(overrides or {})
+        if any(
+            not isinstance(op_name, str) or not isinstance(impl_name, str)
+            for op_name, impl_name in self._overrides.items()
+        ):
+            raise TypeError(
+                "overrides must map op names to implementation names."
+            )
         self._impls: dict[str, OpImpl] = {}
         self._impl_classes: dict[str, type[OpImpl]] = {}
         self._candidate_impl_cache: dict[
@@ -51,6 +64,10 @@ class OpDispatcher:
     @property
     def default_policy(self) -> OpPolicy:
         return self._default_policy
+
+    @property
+    def overrides(self) -> dict[str, str]:
+        return dict(self._overrides)
 
     def _index_provider_module(
         self,
@@ -95,11 +112,18 @@ class OpDispatcher:
         specs = self.registry.list(
             spec_filter=lambda spec: not spec.devices or device in spec.devices
         )
-        op_names = sorted({spec.op_name for spec in specs})
-        for op_name in op_names:
+        op_names = {spec.op_name for spec in specs}
+        op_names.update(self._overrides)
+        for op_name in sorted(op_names):
+            override = self._overrides.get(op_name)
             try:
-                self._candidate_impl(op_name, device)
+                self._candidate_impl(op_name, device, impl=override)
             except RuntimeError as exc:
+                if override is not None:
+                    raise RuntimeError(
+                        f"Invalid override for op {op_name!r}: "
+                        f"{override!r}. {exc}"
+                    ) from exc
                 self._unresolved_ops[op_name] = str(exc)
 
     def _candidate_key(
@@ -187,19 +211,24 @@ class OpDispatcher:
         return impl
 
     def log_ops_selection(self) -> None:
-        """Log the implementations selected for this dispatcher."""
-        default_candidates = {
+        """Log the selected ops for this dispatcher."""
+        selected_candidates = {
             op_name: candidate
             for (op_name, _, impl_name), candidate in self._candidate_impl_cache.items()
-            if impl_name is None
+            if impl_name == self._overrides.get(op_name)
         }
-        op_names = sorted(set(default_candidates) | set(self._unresolved_ops))
+        op_names = sorted(set(selected_candidates) | set(self._unresolved_ops))
         rows: list[tuple[str, str, str, str, str]] = []
         for op_name in op_names:
-            candidate = default_candidates.get(op_name)
+            candidate = selected_candidates.get(op_name)
             if candidate is None:
                 rows.append((op_name, "-", "-", "-", "unavailable"))
                 continue
+
+            if op_name in self._overrides:
+                status = "overridden"
+            else:
+                status = "fallback" if candidate.fallback else "selected"
 
             rows.append(
                 (
@@ -207,7 +236,7 @@ class OpDispatcher:
                     candidate.spec.impl_name,
                     candidate.spec.kind.value,
                     str(candidate.spec.priority),
-                    "fallback" if candidate.fallback else "selected",
+                    status,
                 )
             )
 
@@ -255,7 +284,12 @@ class OpDispatcher:
         **kwargs: Any,
     ):
         device = self._device_runtime.turbo_device
-        impl_obj = self._candidate_impl(op_name, device, impl=impl)
+        selected_impl = (
+            impl
+            if impl is not None
+            else self._overrides.get(op_name)
+        )
+        impl_obj = self._candidate_impl(op_name, device, impl=selected_impl)
         return impl_obj(*args, **kwargs)
 
     def rms_norm(
@@ -292,12 +326,31 @@ class OpDispatcher:
             impl=impl,
         )
 
+    def matmul_add(
+        self,
+        accumulator,
+        lhs,
+        rhs,
+        *,
+        transpose_lhs: bool = False,
+        impl: str | None = None,
+    ):
+        return self._dispatch(
+            "matmul_add",
+            accumulator,
+            lhs,
+            rhs,
+            transpose_lhs=transpose_lhs,
+            impl=impl,
+        )
+
     def gated_activation(
         self,
         x,
         *,
         activation_func,
         limit: float = 0.0,
+        clamp_gate_after_activation: bool = False,
         impl: str | None = None,
     ):
         return self._dispatch(
@@ -305,6 +358,7 @@ class OpDispatcher:
             x,
             activation_func=activation_func,
             limit=limit,
+            clamp_gate_after_activation=clamp_gate_after_activation,
             impl=impl,
         )
 
@@ -317,6 +371,291 @@ class OpDispatcher:
         return self._dispatch(
             "swiglu",
             x,
+            impl=impl,
+        )
+
+    def gated_delta_rule(
+        self,
+        q,
+        k,
+        v,
+        g,
+        beta,
+        *,
+        initial_state=None,
+        output_final_state: bool = False,
+        use_qk_l2norm_in_kernel: bool = False,
+        cu_seqlens: torch.Tensor | None = None,
+        packed_params=None,
+        save_backward_intermediates: bool | None = None,
+        impl: str | None = None,
+    ):
+        if cu_seqlens is not None:
+            if packed_params is not None:
+                raise ValueError("pass either cu_seqlens or packed_params, not both")
+            packed_params = get_packed_params(cu_seqlens, q.size(1), device=q.device)
+        return self._dispatch(
+            "gated_delta_rule",
+            q,
+            k,
+            v,
+            g,
+            beta,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            packed_params=packed_params,
+            save_backward_intermediates=save_backward_intermediates,
+            impl=impl,
+        )
+
+    def kda(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        *,
+        A_log: torch.Tensor | None = None,
+        dt_bias: torch.Tensor | None = None,
+        scale: float | None = None,
+        initial_state: torch.Tensor | None = None,
+        output_final_state: bool = False,
+        use_qk_l2norm_in_kernel: bool = False,
+        use_beta_sigmoid_in_kernel: bool = True,
+        use_gate_in_kernel: bool = False,
+        safe_gate: bool = False,
+        lower_bound: float | None = None,
+        cu_seqlens: torch.Tensor | None = None,
+        impl: str | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Run KDA on [B,T,C] Q/K/V inputs and return [B,T,H,Dv]."""
+        return self._dispatch(
+            "kda",
+            q,
+            k,
+            v,
+            g,
+            beta,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            scale=scale,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            use_beta_sigmoid_in_kernel=use_beta_sigmoid_in_kernel,
+            use_gate_in_kernel=use_gate_in_kernel,
+            safe_gate=safe_gate,
+            lower_bound=lower_bound,
+            cu_seqlens=cu_seqlens,
+            impl=impl,
+        )
+
+    def causal_conv1d(
+        self,
+        x,
+        weight,
+        bias=None,
+        *,
+        activation=None,
+        initial_state=None,
+        output_final_state: bool = False,
+        cu_seqlens: torch.Tensor | None = None,
+        packed_params=None,
+        impl: str | None = None,
+    ):
+        if cu_seqlens is not None:
+            if packed_params is not None:
+                raise ValueError("pass either cu_seqlens or packed_params, not both")
+            packed_params = get_packed_params(cu_seqlens, x.size(1), device=x.device)
+        return self._dispatch(
+            "causal_conv1d",
+            x,
+            weight,
+            bias,
+            activation=activation,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            packed_params=packed_params,
+            impl=impl,
+        )
+
+    def sparse_flash_mla(
+        self,
+        query,
+        ori_kv,
+        cmp_kv,
+        cmp_sparse_indices,
+        cmp_residual_kv,
+        sinks,
+        softmax_scale,
+        cmp_ratio,
+        ori_win_left,
+        ori_win_right,
+        *,
+        cu_seq_lens_q=None,
+        cu_seq_lens_ori_kv=None,
+        cu_seq_lens_cmp_kv=None,
+        impl: str | None = None,
+    ):
+        return self._dispatch(
+            "sparse_flash_mla",
+            query,
+            ori_kv,
+            cmp_kv,
+            cmp_sparse_indices,
+            cmp_residual_kv,
+            sinks,
+            softmax_scale,
+            cmp_ratio,
+            ori_win_left,
+            ori_win_right,
+            cu_seq_lens_q=cu_seq_lens_q,
+            cu_seq_lens_ori_kv=cu_seq_lens_ori_kv,
+            cu_seq_lens_cmp_kv=cu_seq_lens_cmp_kv,
+            impl=impl,
+        )
+
+    def lightning_indexer(self, *args, impl: str | None = None, **kwargs):
+        return self._dispatch("lightning_indexer", *args, impl=impl, **kwargs)
+
+    def lightning_indexer_metadata(
+        self, *args, impl: str | None = None, **kwargs
+    ):
+        return self._dispatch(
+            "lightning_indexer_metadata", *args, impl=impl, **kwargs
+        )
+
+    def moe_permutation(
+        self,
+        tokens: torch.Tensor,
+        routing_map: torch.Tensor,
+        probs: torch.Tensor | None = None,
+        num_out_tokens: int | None = None,
+        expert_indices: torch.Tensor | None = None,
+        *,
+        impl: str | None = None,
+    ) -> MoEPermutation:
+        """Duplicate and group token assignments by expert without weighting.
+
+        Every source token selects the same number of distinct experts. Each
+        assignment produces one output row, ordered by expert ID, then source
+        token ID. Selected routes are retained even when their weight is zero.
+
+        Args:
+            tokens: Source features of shape [num_tokens, hidden_size].
+            routing_map: Boolean assignment mask of shape
+                [num_tokens, num_experts] on the token device. Each row must
+                contain exactly topk selected experts; token dropping is
+                unsupported.
+            probs: Optional dense routing weights of shape
+                [num_tokens, num_experts] on the token device. Selected weights
+                are gathered into packed row order, retaining their dtype.
+                They are not multiplied into token features by this operator.
+            num_out_tokens: Optional output row count. Must equal
+                num_tokens * topk; when omitted, derive it from the assignments.
+            expert_indices: Optional int64 tensor of shape [num_tokens, topk]
+                on the token device. Each row must contain the selected expert
+                IDs in ascending order and match routing_map. Providing it
+                avoids deriving the IDs from the mask. For empty inputs,
+                pass shape [0, topk] to retain the known topk; otherwise the
+                inferred index shape is [0, 0].
+            impl: Optional explicit implementation name. When omitted, use
+                the configured operator override or dispatch policy.
+
+        Returns:
+            MoEPermutation containing packed features, optional packed weights,
+            and provider-independent row/expert indices for unpermutation.
+
+        Raises:
+            ValueError: If deriving indices reveals nonuniform topk, or
+                num_out_tokens differs from the number of assignments.
+        """
+        if expert_indices is None:
+            expert_indices = get_expert_indices(routing_map)
+        expected_tokens = expert_indices.numel()
+        if num_out_tokens is not None and num_out_tokens != expected_tokens:
+            raise ValueError(
+                "num_out_tokens must equal num_tokens * topk; token dropping is unsupported."
+            )
+        return self._dispatch(
+            "moe_permutation",
+            tokens,
+            routing_map,
+            probs=probs,
+            num_out_tokens=expected_tokens,
+            expert_indices=expert_indices,
+            impl=impl,
+        )
+
+    def moe_unpermutation(
+        self,
+        permutation: MoEPermutation,
+        restore_shape: torch.Size,
+        probs: torch.Tensor | None = None,
+        *,
+        impl: str | None = None,
+    ) -> torch.Tensor:
+        """Sum expert output rows back into source-token order.
+
+        Source token i receives the sum of
+        ``permutation.tokens[permutation.row_indices[i, j]]`` over all slots j.
+        If probs is supplied, multiply each contribution by
+        ``probs[i, permutation.expert_indices[i, j]]`` before summing.
+        Permuting and immediately unpermuting without weighting therefore
+        returns topk times the source features.
+
+        Args:
+            permutation: Shared operator data containing expert output features
+                in the original packed row order and the corresponding inverse
+                indices. It may originate from any compatible provider.
+                The permutation.probs field is not used for merging.
+            restore_shape: Output shape [num_tokens, hidden_size], matching
+                the source-token count in row_indices and feature width in
+                permutation.tokens. The caller restores any batch/sequence
+                dimensions separately.
+            probs: Optional dense merging weights of shape
+                [num_tokens, num_experts] on the feature device. Expert IDs
+                select the weight for each contribution. Omit when expert
+                computation has already applied routing weights; None means
+                sum the contributions without additional weighting.
+            impl: Optional explicit implementation name, selected independently
+                of the permutation implementation. When omitted, use the
+                configured operator override or dispatch policy.
+
+        Returns:
+            Combined features with restore_shape and the dtype and device of
+            permutation.tokens.
+        """
+        return self._dispatch(
+            "moe_unpermutation",
+            permutation,
+            restore_shape,
+            probs=probs,
+            impl=impl,
+        )
+
+    def moe_sort_chunks(
+        self,
+        input: torch.Tensor,
+        split_sizes: torch.Tensor,
+        sorted_idxs: torch.Tensor,
+        probs: torch.Tensor | None = None,
+        *,
+        impl: str | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Reorder chunks using metadata on the input device."""
+        if split_sizes.device != input.device or sorted_idxs.device != input.device:
+            raise ValueError(
+                "Chunk sorting requires split_sizes and sorted_idxs on the input device."
+            )
+        return self._dispatch(
+            "moe_sort_chunks",
+            input,
+            split_sizes,
+            sorted_idxs,
+            probs=probs,
             impl=impl,
         )
 

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 from torchturbo.runtime import DeviceRuntime
 
 from .base import OpPolicy
@@ -14,23 +16,24 @@ def get_or_create_ops(
     *,
     device_runtime: DeviceRuntime,
     default_policy: OpPolicy = OpPolicy.AUTO,
+    overrides: Mapping[str, str] | None = None,
 ) -> OpDispatcher:
-    """Return the compatible process-wide dispatcher or create it once.
+    """Return or create the process-wide dispatcher.
 
-    A process-wide dispatcher is safe to share between engines only when its
-    device and policy match. Conflicting engine configurations are rejected
-    instead of silently changing the ops used by existing models.
+    Reuse requires matching device, policy, and per-op overrides.
     """
     global _OPS
 
     if not isinstance(default_policy, OpPolicy):
         raise TypeError("default_policy must be an OpPolicy.")
+    requested_overrides = dict(overrides or {})
 
     if _OPS is None:
         _OPS = OpDispatcher(
             device_runtime=device_runtime,
             registry=registry,
             default_policy=default_policy,
+            overrides=requested_overrides,
         )
         return _OPS
 
@@ -43,6 +46,10 @@ def get_or_create_ops(
     if _OPS.default_policy != default_policy:
         conflicts.append(
             f"policy={_OPS.default_policy.value!r} vs {default_policy.value!r}"
+        )
+    if _OPS.overrides != requested_overrides:
+        conflicts.append(
+            f"overrides={_OPS.overrides!r} vs {requested_overrides!r}"
         )
     if conflicts:
         raise RuntimeError(

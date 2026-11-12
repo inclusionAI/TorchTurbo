@@ -113,8 +113,7 @@ def test_provider_modules_are_discovered_from_provider_packages():
         in npu_modules
     )
     assert "torchturbo.ops.providers.npu.cross_entropy_loss" in npu_modules
-    assert "torchturbo.ops.providers.npu.moe_token_permutation" in npu_modules
-    assert "torchturbo.ops.providers.npu.moe_token_unpermutation" in npu_modules
+    assert "torchturbo.ops.providers.npu.moe_permutation" in npu_modules
     assert "torchturbo.ops.providers.npu.rotary_position_embedding" in npu_modules
     assert "torchturbo.ops.providers.npu.lightning_indexer" in npu_modules
     assert "torchturbo.ops.providers.npu.sparse_flash_mla" in npu_modules

@@ -1,3 +1,13 @@
+  # Adapted from NVIDIA Megatron-LM:
+  # https://github.com/NVIDIA/Megatron-LM
+  #
+  # Copyright (c) 2019-2025, NVIDIA CORPORATION. All rights reserved.
+  # Licensed under the BSD 3-Clause License.
+  #
+  # Modified by the TorchTurbo contributors.
+
+from typing import TYPE_CHECKING
+
 import torch
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter
@@ -5,6 +15,9 @@ from torch.nn.parameter import Parameter
 from .moe_config import MoEConfig
 from torchturbo.ops import ops
 from torchturbo.logging import get_logger
+
+if TYPE_CHECKING:
+    from torchturbo.engine.optimizers import MuonParameterSpec
 
 logger = get_logger(__name__)
 
@@ -56,7 +69,7 @@ class GroupedMLP(torch.nn.Module):
                     "Activation function must be silu or gelu when using GroupedMLP."
                 )
 
-            def glu(x, _probs):
+            def glu(x):
                 if (
                     self.config.activation_func is F.silu
                     and self.swiglu_limit == 0.0
@@ -66,13 +79,14 @@ class GroupedMLP(torch.nn.Module):
                     x,
                     activation_func=self.config.activation_func,
                     limit=self.swiglu_limit,
+                    clamp_gate_after_activation=(
+                        self.config.moe_swiglu_clamp_gate_after_activation
+                    ),
                 )
 
             self.activation_func = glu
         else:
             self.activation_func = self.config.activation_func
-
-        self.activation_func_with_probs = self.activation_func
 
         # How many feature each rank holds for fc1 and fc2, respectively.
         if config.gated_linear_unit:
@@ -126,13 +140,59 @@ class GroupedMLP(torch.nn.Module):
                 )
             )
 
+    def get_muon_parameter_specs(self) -> dict[str, "MuonParameterSpec"]:
+        """Describe the independent matrices packed into fused expert storage."""
+        from torch.distributed.tensor import Shard
+
+        from torchturbo.engine.optimizers import (
+            ExpertDownComputeView,
+            ExpertUpComputeView,
+            MuonParameterSpec,
+        )
+
+        if transformer_engine_is_available() and self.use_te:
+            # GroupedLinear owns separate weights instead of fused expert tensors.
+            return {}
+
+        for name, parameter, matrix_rows in (
+            ("weight1", self.weight1, self.config.hidden_size),
+            ("weight2", self.weight2, self.config.moe_ffn_hidden_size),
+        ):
+            if parameter.shape[0] % matrix_rows:
+                raise ValueError(
+                    f"GroupedMLP parameter {name!r} has invalid shape "
+                    f"{tuple(parameter.shape)}"
+                )
+        return {
+            "weight1": MuonParameterSpec(
+                compute_placement=Shard(0),
+                compute_view=ExpertUpComputeView(
+                    num_experts=self.weight1.shape[0] // self.config.hidden_size,
+                    fused_gate_up=self.config.gated_linear_unit,
+                ),
+            ),
+            "weight2": MuonParameterSpec(
+                compute_placement=Shard(0),
+                compute_view=ExpertDownComputeView(
+                    num_experts=self.weight2.shape[0] // self.config.moe_ffn_hidden_size,
+                ),
+            ),
+        }
+
+    def activation_func_with_probs(
+        self, hidden_states: torch.Tensor, probs: torch.Tensor,
+    ) -> torch.Tensor:
+        """Weight activated expert features before FC2, retaining probability precision."""
+        hidden_states = self.activation_func(hidden_states)
+        return (hidden_states * probs).to(hidden_states.dtype)
+
     def forward(
         self,
         permuted_local_hidden_states: torch.Tensor,
         tokens_per_expert: torch.Tensor,
         permuted_probs: torch.Tensor,
-    ):
-        """Forward step of the GroupedMLP."""
+    ) -> tuple[torch.Tensor, None]:
+        """Apply routing probabilities inside each expert before its second linear."""
         if self._execution_backend is not None:
             return self._execution_backend.execute(
                 self, permuted_local_hidden_states, tokens_per_expert, permuted_probs
@@ -151,6 +211,8 @@ class GroupedMLP(torch.nn.Module):
             # Probs already applied, so reset to 1.
             permuted_probs = torch.ones_like(permuted_probs)
 
+        activation_probs = permuted_probs.unsqueeze(-1)
+
         # `tokens_per_expert` is the per-expert token count used as the grouped-GEMM
         # `batch_sizes`. The grouped_gemm C++ kernel hard-requires it on CPU
         # (`assert batch_sizes.is_cpu()`). During normal forward the AlltoAll token
@@ -163,40 +225,38 @@ class GroupedMLP(torch.nn.Module):
         if isinstance(tokens_per_expert, torch.Tensor) and tokens_per_expert.is_cuda:
             tokens_per_expert = tokens_per_expert.cpu()
 
-        if permuted_local_hidden_states.nelement() != 0:
+        if transformer_engine_is_available() and self.use_te:
+            # TE also handles empty inputs and keeps its expert weights in the graph.
+            m_splits = tokens_per_expert.tolist()
+            # First grouped linear: hidden_size -> fc1_output_size
+            fc1_output = self.fc1_linear(permuted_local_hidden_states, m_splits)
 
-            if transformer_engine_is_available() and self.use_te:
-                # Use TransformerEngine GroupedLinear if available, otherwise fall back to grouped_gemm
-                m_splits = tokens_per_expert.tolist()
-                # First grouped linear: hidden_size -> fc1_output_size
-                fc1_output = self.fc1_linear(permuted_local_hidden_states, m_splits)
+            # Apply activation function
+            intermediate_parallel = self.activation_func_with_probs(
+                fc1_output, activation_probs
+            )
 
-                # Apply activation function
-                intermediate_parallel = self.activation_func_with_probs(
-                    fc1_output, permuted_probs.unsqueeze(-1)
-                )
+            # Second grouped linear: fc2_input_size -> hidden_size
+            fc2_output = self.fc2_linear(intermediate_parallel, m_splits)
+        elif permuted_local_hidden_states.nelement() != 0:
+            # Fall back to the grouped_matmul op registry.
+            # Reshape the weights for the grouped GEMMs.
+            w1 = self.weight1.view(
+                self.num_local_experts, self.config.hidden_size, -1
+            )
+            w2 = self.weight2.view(
+                self.num_local_experts, -1, self.config.hidden_size
+            )
 
-                # Second grouped linear: fc2_input_size -> hidden_size
-                fc2_output = self.fc2_linear(intermediate_parallel, m_splits)
-            else:
-                # Fall back to the grouped_matmul op registry.
-                # Reshape the weights for the grouped GEMMs.
-                w1 = self.weight1.view(
-                    self.num_local_experts, self.config.hidden_size, -1
-                )
-                w2 = self.weight2.view(
-                    self.num_local_experts, -1, self.config.hidden_size
-                )
-
-                fc1_output = ops.grouped_matmul(
-                    permuted_local_hidden_states, w1, tokens_per_expert, trans_b=False
-                )
-                intermediate_parallel = self.activation_func_with_probs(
-                    fc1_output, permuted_probs.unsqueeze(-1)
-                )
-                fc2_output = ops.grouped_matmul(
-                    intermediate_parallel, w2, tokens_per_expert, trans_b=False
-                )
+            fc1_output = ops.grouped_matmul(
+                permuted_local_hidden_states, w1, tokens_per_expert, trans_b=False
+            )
+            intermediate_parallel = self.activation_func_with_probs(
+                fc1_output, activation_probs
+            )
+            fc2_output = ops.grouped_matmul(
+                intermediate_parallel, w2, tokens_per_expert, trans_b=False
+            )
         else:
             # No token is allocated for local experts.
             assert torch.count_nonzero(tokens_per_expert) == 0
@@ -205,7 +265,7 @@ class GroupedMLP(torch.nn.Module):
             w1 = self.weight1.view(self.config.hidden_size, -1)
             w2 = self.weight2.view(-1, self.config.hidden_size)
             h = torch.matmul(permuted_local_hidden_states, w1)
-            h = self.activation_func_with_probs(h, permuted_probs.unsqueeze(-1))
+            h = self.activation_func_with_probs(h, activation_probs)
             fc2_output = torch.matmul(h, w2)
 
         return fc2_output, None

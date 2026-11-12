@@ -124,7 +124,7 @@ def test_dpo_uses_engine_auxiliary_gradients_and_metrics(
     captured = {}
 
     def capture_logits(module, args, output):
-        captured["logits"] = output[2].reshape(-1, router.num_experts)
+        captured["logits"] = output[1].reshape(-1, router.num_experts)
 
     router.register_forward_hook(capture_logits)
     batch = _packed_batch()

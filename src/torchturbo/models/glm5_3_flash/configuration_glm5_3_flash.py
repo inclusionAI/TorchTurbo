@@ -91,12 +91,12 @@ class Glm5NextTextConfig(PretrainedConfig):
         if values["layer_types"] is None:
             full = linear.get("full_attn_layers", list(range(3, n, 4)))
             values["layer_types"] = [
-                "indexed_attention" if i in full else "linear_attention"
+                "full_attention" if i in full else "linear_attention"
                 for i in range(n)
             ]
         values["layer_types"] = [
-            "indexed_attention"
-            if t in ("full_attention", "deepseek_sparse_attention")
+            "full_attention"
+            if t in ("deepseek_sparse_attention", "indexed_attention")
             else t
             for t in values["layer_types"]
         ]
@@ -114,7 +114,7 @@ class Glm5NextTextConfig(PretrainedConfig):
                     for i in range(n)
                 ]
         for field, allowed in (
-            ("layer_types", {"linear_attention", "indexed_attention"}),
+            ("layer_types", {"linear_attention", "full_attention"}),
             ("mlp_layer_types", {"dense", "sparse"}),
             ("indexer_types", {"full", "shared"}),
         ):
@@ -145,7 +145,7 @@ class Glm5NextTextConfig(PretrainedConfig):
             raise ValueError("Invalid MoE top-k/group configuration")
         seen_full = False
         for t, indexer in zip(values["layer_types"], values["indexer_types"]):
-            if t == "indexed_attention":
+            if t == "full_attention":
                 if indexer == "shared" and not seen_full:
                     raise ValueError(
                         "A shared indexer requires a preceding full DSA layer"

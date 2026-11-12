@@ -38,6 +38,7 @@ engine_config:
 
   mixed_precision: bf16
   use_deterministic_algorithms: false
+  mega_moe: false  # Requires the MoonEP-enabled tt-megamoe runtime.
 
   ops:
     policy: auto
@@ -113,6 +114,11 @@ engine_config:
         # Size limit in MiB. Required for size and unused by other strategies.
         bucket_cap_mb: null
 
+  moe:
+    aux_loss_coeff: 0.0
+    z_loss_coeff: 0.0
+    token_dispatcher: alltoall
+
   mtp:
     enabled: false
     loss_scaling_factor: 0.1
@@ -132,6 +138,11 @@ engine_config:
     vision_tower: false
     multi_modal_projector: false
     language_model: false
+    # YAML-only FQN wildcard patterns ('*' one segment, '**' multiple) to
+    # freeze arbitrary parameters, matched on base-model FQNs.
+    # patterns:
+    #   - "model.layers.*.self_attn.**"
+    #   - "lm_head.weight"
 
   diffusion:
     cap_lambda: 0.0

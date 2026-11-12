@@ -17,6 +17,11 @@ from torchturbo.ops.providers.npu._fla_gdn import (
 from torchturbo.ops.providers.npu._fla_gdn import (
     kkt,
 )
+from torchturbo.ops.providers.npu.gated_delta_rule import AscendCGatedDeltaRule
+
+
+def test_ascendc_gated_delta_rule_is_available() -> None:
+    assert AscendCGatedDeltaRule().available()
 
 
 @pytest.mark.parametrize("packed", [False, True])

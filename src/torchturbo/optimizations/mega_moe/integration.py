@@ -35,7 +35,7 @@ def configure_token_capacity(config: Any, sequence_length: int, batch_size: int)
 
 
 class RoutedExpertsBackend:
-    """Adapt the existing router mask without changing expert parameter ownership."""
+    """Adapt compact router selections without changing expert parameter ownership."""
 
     def __init__(self, ep_group: dist.ProcessGroup, token_bound: int) -> None:
         self.ep_group = ep_group
@@ -46,18 +46,12 @@ class RoutedExpertsBackend:
         experts: GroupedMLP,
         hidden_states: torch.Tensor,
         probs: torch.Tensor,
-        routing_map: torch.Tensor,
+        *,
+        expert_indices: torch.Tensor,
     ) -> tuple:
         """Gather selected probabilities, including selected zero-weight experts."""
-        num_experts = routing_map.shape[-1]
-        keys = torch.arange(num_experts, device=routing_map.device, dtype=torch.float32)
-        keys = torch.where(routing_map, keys, float(num_experts))
-        indices = keys.topk(
-            experts.config.moe_router_topk, dim=-1, largest=False, sorted=True
-        ).values.long()
-        # Match the dispatcher probability cast at the expert-output boundary.
-        selected_probs = probs.gather(1, indices).to(hidden_states.dtype)
-        return experts(hidden_states, indices, selected_probs)
+        selected_probs = probs.gather(1, expert_indices).to(hidden_states.dtype)
+        return experts(hidden_states, expert_indices, selected_probs)
 
 
 def install(model: nn.Module, config: Any, ep_group: dist.ProcessGroup) -> None:

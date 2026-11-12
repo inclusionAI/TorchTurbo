@@ -1,11 +1,15 @@
 """TorchTurbo registration and lifecycle hooks for GLM-5.3-Flash."""
 
 import json
+from collections.abc import Callable
+from pathlib import Path
+from typing import Any
 
 import torch
 from transformers import AutoConfig, AutoModelForCausalLM, AutoProcessor
 
 from ...engine.config import ParameterGroup
+from ..modules.attention.ulysses import SequenceParallelInputSlicingSpec
 from ..base import TurboVLMModel
 from ..registry import register_model
 from ..weight_converter import BaseWeightConverter
@@ -45,8 +49,10 @@ def dequantize_block_fp8(
 
 
 class Glm5NextWeightConverter(BaseWeightConverter):
-    def __init__(self, model, parallel_context):
-        super().__init__(model, parallel_context)
+    def __init__(
+        self, model: torch.nn.Module, parallel_context: dict[str, Any], model_path: str,
+    ) -> None:
+        super().__init__(model, parallel_context, model_path)
         self.source_config = model.config
         self.config = model.config.text_config
         self.dtype = self.get_save_dtype(self.config)
@@ -86,7 +92,10 @@ class Glm5NextWeightConverter(BaseWeightConverter):
             ".gate.e_score_correction_bias"
         )
 
-    def decode_checkpoint_tensor(self, name, tensor, read_tensor):
+    def decode_checkpoint_tensor(
+        self, name: str, tensor: torch.Tensor,
+        read_tensor: Callable[[str], torch.Tensor],
+    ) -> torch.Tensor:
         """Called by the distributed loader on the reading rank, before broadcast."""
         if str(tensor.dtype).startswith("torch.float8_"):
             if not name.endswith(".weight"):
@@ -97,7 +106,7 @@ class Glm5NextWeightConverter(BaseWeightConverter):
             )
         return tensor.to(dtype=self.get_default_hf_dtype(name), copy=True)
 
-    def update_saved_config(self, save_path):
+    def update_saved_config(self, save_path: Path) -> None:
         # The saver copies source metadata; the saved weights are BF16/FP32 now.
         path = save_path / "config.json"
         config = (
@@ -158,8 +167,18 @@ class TurboGlm5NextForConditionalGeneration(
 
         return get_parallel_plan(**kwargs)
 
-    def get_weight_converter(self, parallel_context):
-        return Glm5NextWeightConverter(self, parallel_context)
+    def get_weight_converter(
+        self, parallel_context: dict[str, Any], model_path: str,
+    ) -> Glm5NextWeightConverter:
+        return Glm5NextWeightConverter(self, parallel_context, model_path)
+
+    def get_sequence_parallel_input_slicing_spec(self) -> SequenceParallelInputSlicingSpec:
+        from .modeling_glm5_3_flash import Glm5NextTextModel
+
+        # GLM slices hidden states after media fusion and global segment parsing.
+        return SequenceParallelInputSlicingSpec(
+            self.model.language_model, Glm5NextTextModel.forward, sliced_inputs=(),
+        )
 
     def on_parallelized(self, parallel_context):
         info = parallel_context["sp"]
@@ -170,9 +189,9 @@ class TurboGlm5NextForConditionalGeneration(
                 module.sp_group = info["sp_group"]
                 module.sp_size, module.sp_rank = info["sp_size"], info["sp_rank"]
 
-        from ...runtime import is_npu_available
+        from ...runtime import TurboDevice, get_device_runtime
 
-        if is_npu_available():
+        if get_device_runtime().turbo_device is TurboDevice.NPU:
             from .npu import patch_model
 
             patch_model(self)

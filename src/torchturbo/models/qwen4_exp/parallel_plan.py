@@ -33,8 +33,10 @@ def _replace_qwen4_moe(
         hf_config=text_config,
         ep_size=ep_info["ep_size"],
         num_moe_experts=text_config.num_experts,
+        moe_router_pre_softmax=not text_config.norm_topk_prob,
         moe_aux_loss_coeff=engine_config.moe.aux_loss_coeff,
         moe_z_loss_coeff=engine_config.moe.z_loss_coeff,
+        moe_token_dispatcher_type=engine_config.moe.token_dispatcher,
     )
     moe_layer = MoELayer(
         config=MoEConfig(**moe_config_kwargs),

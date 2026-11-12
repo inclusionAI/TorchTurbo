@@ -1231,7 +1231,12 @@ class Glm5NextTextModel(Glm5NextPreTrainedModel):
             self.embed_tokens(input_ids) if inputs_embeds is None else inputs_embeds
         )
         b, t = hidden.shape[:2]
-        segments = sequence_segments(attention_mask, position_ids, b, t)
+        cu_seq_lens = kwargs.get("cu_seq_lens_q")
+        if cu_seq_lens is not None:
+            boundaries = cu_seq_lens.detach().cpu().tolist()
+            segments = [list(zip(boundaries[:-1], boundaries[1:]))]
+        else:
+            segments = sequence_segments(attention_mask, position_ids, b, t)
         if self.sp_size > 1:
             if t % self.sp_size:
                 raise ValueError(

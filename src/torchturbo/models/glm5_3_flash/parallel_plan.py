@@ -1,20 +1,45 @@
 """FSDP2/EP placement for the language and vision towers."""
 
 import torch
+import torch.distributed as dist
 from ...parallel import FSDPPlanSpec, FSDPParallelPlan, FSDPPlacementSpec
 from ..modules.moe.config_converter import get_base_moe_config
 from ..modules.moe.moe_layer import MoELayer, MoEConfig, MoESubmodules
 from ..modules.moe.experts import GroupedMLP
 from ..modules.moe.module import ModuleSpec
 from ..modules.moe.router import TopKRouter
+from ..modules.moe.moe_utils import (
+    compute_routing_scores_for_aux_loss,
+    mask_padding_tokens,
+)
 from .modeling_glm5_3_flash import Glm5NextTextMoE
 
 
 class Glm5NextGroupedRouter(TopKRouter):
-    def routing(self, logits, input_ids=None):
+    def __init__(
+        self,
+        config: MoEConfig,
+        layer_number: int | None = None,
+        sp_group: dist.ProcessGroup | None = None,
+    ) -> None:
+        super().__init__(config, layer_number, sp_group)
+        self.register_buffer(
+            "local_tokens_per_expert", None, persistent=False,
+        )
+
+    def routing(
+        self,
+        logits: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
+        padding_mask: torch.Tensor | None = None,
+        accumulate_tokens_per_expert: bool = True,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # GLM uses top-2 for every group and normalizes even when top_k=1.
         # These differ from the generic router's group/top-k conventions.
-        scores = logits.reshape(-1, self.num_experts).float().sigmoid()
+        logits = self.apply_z_loss(
+            logits.reshape(-1, self.num_experts), padding_mask=padding_mask,
+        )
+        scores = logits.float().sigmoid()
         choice = scores + self.expert_bias
         groups = self.config.moe_router_num_groups
         group_k = self.config.moe_router_group_topk
@@ -44,21 +69,27 @@ class Glm5NextGroupedRouter(TopKRouter):
             1, selected, True
         )
         probabilities = torch.zeros_like(scores).scatter(1, selected, weights)
-        if self.enable_expert_bias and torch.is_grad_enabled():
+        if self.training and torch.is_grad_enabled() and self.config.moe_aux_loss_coeff > 0:
+            aux_map, aux_scores = compute_routing_scores_for_aux_loss(
+                logits, self.topk, self.score_function, padding_mask,
+            )
+            probabilities = self._apply_aux_loss(probabilities, aux_scores, aux_map)
+        if (
+            self.enable_expert_bias
+            and accumulate_tokens_per_expert
+            and torch.is_grad_enabled()
+        ):
             with torch.no_grad():
-                counts = routing_map.sum(0).float()
-                if not hasattr(self, "local_tokens_per_expert"):
-                    self.register_buffer(
-                        "local_tokens_per_expert",
-                        torch.zeros_like(counts),
-                        persistent=False,
-                    )
+                counts = mask_padding_tokens(routing_map, padding_mask).sum(0).float()
+                if self.local_tokens_per_expert is None:
+                    self.local_tokens_per_expert = torch.zeros_like(counts)
                 self.local_tokens_per_expert.add_(counts)
-        return probabilities, routing_map
+        return probabilities, routing_map, selected
 
 
 def _replace_moe_only(
-    original_module, hf_config, sp_info, ep_info, moe_submodules, **kwargs
+    original_module, hf_config, sp_info, ep_info, moe_submodules,
+    engine_config=None, **kwargs,
 ):
     if not isinstance(original_module, Glm5NextTextMoE):
         return original_module
@@ -74,6 +105,8 @@ def _replace_moe_only(
             moe_router_score_function=getattr(config, "scoring_func", "sigmoid"),
             moe_router_dtype="fp32",
             moe_router_enable_expert_bias=True,
+            moe_aux_loss_coeff=(engine_config.moe.aux_loss_coeff if engine_config else 0.0),
+            moe_z_loss_coeff=(engine_config.moe.z_loss_coeff if engine_config else 0.0),
             moe_swiglu_limit=[config.swiglu_limit] * config.num_hidden_layers,
         )
     )
@@ -82,8 +115,11 @@ def _replace_moe_only(
         ep_info["ep_group"],
         submodules=moe_submodules,
         layer_number=original_module.layer_idx,
+        sp_group=sp_info["sp_group"],
     )
-    result.router = Glm5NextGroupedRouter(moe_config, original_module.layer_idx)
+    result.router = Glm5NextGroupedRouter(
+        moe_config, original_module.layer_idx, sp_info["sp_group"],
+    )
     result.shared_experts = original_module.shared_experts
     return result
 

@@ -5,7 +5,7 @@ This module collects all tensor-level operations on LoRA weights:
 - **Initialization**: :func:`init_lora_tensor`, :func:`get_peft_init_config`
 - **Delta computation**: :func:`compute_lora_delta_linear`,
   :func:`compute_lora_delta_grouped_mlp_w1`,
-  :func:`compute_lora_delta_grouped_mlp_w2`
+  :func:`compute_lora_delta_grouped_mlp_w2`, :func:`compute_dora_magnitude`
 - **Delta map & merge**: :func:`build_lora_delta_map`,
   :func:`apply_lora_delta`
 """
@@ -31,10 +31,24 @@ logger = get_logger(__name__)
 
 
 def _gather(tensor: torch.Tensor) -> torch.Tensor:
-    """Gather a possibly-sharded DTensor into a full local tensor."""
-    if isinstance(tensor, DTensor):
+    """Gather a possibly-sharded DTensor, staging CPU-offloaded shards."""
+    if not isinstance(tensor, DTensor):
+        return tensor
+
+    compute_device = tensor.device_mesh.device_type
+    local = tensor.to_local()
+    if local.device.type == compute_device:
         return tensor.full_tensor()
-    return tensor
+
+    staged = DTensor.from_local(
+        local.to(compute_device),
+        tensor.device_mesh,
+        tensor.placements,
+        run_check=False,
+        shape=tensor.shape,
+        stride=tensor.stride(),
+    )
+    return staged.full_tensor()
 
 
 # ---------------------------------------------------------------------------
@@ -187,6 +201,16 @@ def build_lora_delta_map(model: torch.nn.Module) -> dict[str, tuple]:
 # ---------------------------------------------------------------------------
 
 
+def _adapter_delta_linear(lora_module: Any, adapter_name: str) -> torch.Tensor:
+    """Gather and scale one Linear adapter's weight update."""
+    weight_a = _gather(lora_module.lora_A[adapter_name].weight)
+    weight_b = _gather(lora_module.lora_B[adapter_name].weight)
+    delta = weight_b @ weight_a
+    if lora_module.fan_in_fan_out:
+        delta = delta.T
+    return delta * lora_module.scaling[adapter_name]
+
+
 @torch.no_grad()
 def compute_lora_delta_linear(lora_module: Any, weight_key: str) -> torch.Tensor | None:
     """Compute the LoRA delta for a standard ``lora.Linear`` layer.
@@ -207,21 +231,58 @@ def compute_lora_delta_linear(lora_module: Any, weight_key: str) -> torch.Tensor
         if adapter_name in merged:
             continue
 
-        weight_A = _gather(lora_module.lora_A[adapter_name].weight)
-        weight_B = _gather(lora_module.lora_B[adapter_name].weight)
-
-        adapter_delta = weight_B @ weight_A  # (out, r) @ (r, in) -> (out, in)
-
-        # fan_in_fan_out is rarely True for transformer models but
-        # handle it for correctness.
-        if getattr(lora_module, "fan_in_fan_out", False):
-            adapter_delta = adapter_delta.T
-
-        adapter_delta = adapter_delta * lora_module.scaling[adapter_name]
+        adapter_delta = _adapter_delta_linear(lora_module, adapter_name)
 
         delta = adapter_delta if delta is None else delta + adapter_delta
 
     return delta
+
+
+def merge_lora_linear(
+    base_tensor: torch.Tensor,
+    lora_module: Any,
+    weight_key: str,
+) -> torch.Tensor:
+    """Return a standard Linear weight with LoRA or DoRA adapters merged."""
+    if weight_key != "weight":
+        return base_tensor
+
+    merged = set(lora_module.merged_adapters)
+    result = base_tensor
+    for adapter_name in lora_module.r:
+        if adapter_name in merged:
+            continue
+
+        delta = _adapter_delta_linear(lora_module, adapter_name)
+        result = result + delta
+
+        if adapter_name in lora_module.lora_magnitude_vector:
+            magnitude = _gather(
+                lora_module.lora_magnitude_vector[adapter_name].weight
+            )
+            normalized = result.T if lora_module.fan_in_fan_out else result
+            weight_norm = torch.linalg.vector_norm(normalized, dim=1)
+            dora_factor = magnitude / weight_norm
+            dora_factor = dora_factor.view(-1, 1)
+            if lora_module.fan_in_fan_out:
+                dora_factor = dora_factor.T
+            result = dora_factor * result
+
+    return result
+
+
+@torch.no_grad()
+def compute_dora_magnitude(
+    lora_module: Any,
+    adapter_name: str,
+) -> torch.Tensor:
+    """Return the initial DoRA magnitude after base and LoRA weights load."""
+    base_weight = _gather(lora_module.base_layer.weight)
+    delta = _adapter_delta_linear(lora_module, adapter_name)
+    initialized_weight = base_weight + delta
+    if lora_module.fan_in_fan_out:
+        initialized_weight = initialized_weight.T
+    return torch.linalg.vector_norm(initialized_weight, dim=1)
 
 
 @torch.no_grad()
@@ -328,7 +389,4 @@ def apply_lora_delta(
         return base_tensor
 
     # --- Standard lora.Linear ---
-    delta = compute_lora_delta_linear(lora_module, weight_key)
-    if delta is None:
-        return base_tensor
-    return base_tensor + delta
+    return merge_lora_linear(base_tensor, lora_module, weight_key)

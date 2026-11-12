@@ -118,7 +118,10 @@ class MoonEPMegaMoeBackend(RoutedExpertsBackend):
         flat = hidden_states.reshape(-1, config.hidden_size)
         tokens = flat.shape[0]
         if tokens > self.token_bound:
-            raise ValueError("MoE input exceeds the configured token capacity.")
+            raise ValueError(
+                f"MoE input has {tokens} tokens, exceeding the configured "
+                f"capacity of {self.token_bound}."
+            )
         indices = indices.reshape(tokens, config.moe_router_topk).int()
         probs = probs.reshape(tokens, config.moe_router_topk).float()
         if tokens < self.token_bound:
@@ -143,7 +146,7 @@ class MoonEPMegaMoeBackend(RoutedExpertsBackend):
             weight1 = experts.weight1.view(config.num_moe_experts, config.hidden_size, -1)
             weight2 = experts.weight2.view(config.num_moe_experts, -1, config.hidden_size)
             projected = ops.grouped_matmul(routed, weight1, counts, trans_b=False)
-            activated = experts.activation_func_with_probs(projected, None)
+            activated = experts.activation_func(projected)
             projected = ops.grouped_matmul(activated, weight2, counts, trans_b=False)
             output = torch_npu.npu_moe_token_unpermute(projected, mapping, probs=probs)
             if tokens < self.token_bound:

@@ -5,7 +5,6 @@ from __future__ import annotations
 import torch
 
 from ...base import OpImpl, OpImplKind
-from ...packed_params import PackedParams
 from ...registry import register_op
 
 
@@ -38,12 +37,19 @@ class FlaKDA(OpImpl):
         initial_state: torch.Tensor | None = None,
         output_final_state: bool = False,
         use_qk_l2norm_in_kernel: bool = False,
+        use_beta_sigmoid_in_kernel: bool = True,
         use_gate_in_kernel: bool = False,
         safe_gate: bool = False,
         lower_bound: float | None = None,
-        packed_params: PackedParams | None = None,
+        cu_seqlens: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         from fla.ops.kda import chunk_kda
+
+        qk_head_dim = g.shape[-1]
+        v_head_dim = v.shape[-1] // beta.shape[-1]
+        q = q.unflatten(-1, (-1, qk_head_dim))
+        k = k.unflatten(-1, (-1, qk_head_dim))
+        v = v.unflatten(-1, (-1, v_head_dim))
 
         return chunk_kda(
             q=q,
@@ -57,8 +63,9 @@ class FlaKDA(OpImpl):
             initial_state=initial_state,
             output_final_state=output_final_state,
             use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            use_beta_sigmoid_in_kernel=use_beta_sigmoid_in_kernel,
             use_gate_in_kernel=use_gate_in_kernel,
             safe_gate=safe_gate,
             lower_bound=lower_bound,
-            cu_seqlens=None if packed_params is None else packed_params.cu_seqlens,
+            cu_seqlens=cu_seqlens,
         )

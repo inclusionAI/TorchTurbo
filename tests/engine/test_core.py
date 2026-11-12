@@ -402,6 +402,7 @@ class TestEngineSetup:
         engine.config = EngineConfig()
         engine.model = previous_model = TinyModel()
         engine.model_name_or_path = "previous_model"
+        engine.plugin_manager = Mock()
         engine.parallel_plan = None
         engine._checkpoint = None
         engine.backend = Mock(spec=BaseBackend)

@@ -66,7 +66,8 @@ def test_kda_preserves_packed_boundaries_and_local_parameters(
 
     def chunk_kda(**kwargs):
         kda_calls.append(kwargs)
-        return kwargs["v"], None
+        # o follows the [B, T, H, Dv] contract; rebuild from flat v.
+        return kwargs["v"].unflatten(-1, (kwargs["beta"].shape[-1], -1)), None
 
     def gated_norm(x, g, weight, bias, activation, **kwargs):
         assert bias is None
@@ -91,8 +92,18 @@ def test_kda_preserves_packed_boundaries_and_local_parameters(
         return full_heads.chunk(sp_size, dim=head_dim)[sp_rank]
 
     monkeypatch.setattr(
-        turbo_ops, "ops", SimpleNamespace(causal_conv1d=conv, kda=chunk_kda)
+        turbo_ops,
+        "ops",
+        SimpleNamespace(
+            causal_conv1d=conv,
+            kda=chunk_kda,
+        ),
     )
+    # Stub the full fla module chain: the patched forward imports
+    # ``fla.modules.fused_norm_gate`` at call time, and a real import would
+    # drag triton in (unavailable on mac dev hosts).
+    for name in ("fla", "fla.modules"):
+        monkeypatch.setitem(sys.modules, name, SimpleNamespace(__path__=[]))
     monkeypatch.setitem(
         sys.modules,
         "fla.modules.fused_norm_gate",
@@ -187,11 +198,15 @@ def test_kda_preserves_packed_boundaries_and_local_parameters(
     # final sequence); recurrent KDA shares the same boundaries.
     for call in conv_calls:
         assert call["packed_params"].cu_seqlens_list == expected
-    assert kda_calls[0]["packed_params"] is conv_calls[0]["packed_params"]
+    assert kda_calls[0]["cu_seqlens"] is conv_calls[0]["packed_params"].cu_seqlens
     for call in conv_calls:
         assert call["x"].shape == (1, 4, 4 // sp_size)
         expected_weight = module.q_conv1d.weight.chunk(sp_size, dim=0)[sp_rank]
         torch.testing.assert_close(call["weight"], expected_weight.squeeze(1))
+    # Flat [B, T, C] contract: the provider splits heads; SP shards
+    # them before the convolution.
+    local_heads = 2 // sp_size
+    assert kda_calls[0]["q"].shape == (1, 4, local_heads * 2)
     torch.testing.assert_close(
         kda_calls[0]["A_log"], module.A_log.chunk(sp_size)[sp_rank]
     )

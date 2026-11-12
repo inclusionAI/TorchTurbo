@@ -20,11 +20,19 @@ def _boolean(value: str) -> bool:
 def activate(argv: list[str]) -> bool:
     """Resolve the same CLI/environment switch as EngineConfig without Torch."""
     parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
-    parser.add_argument("--tt_mega_moe", type=_boolean, nargs="?", const=True, default=False)
+    parser.add_argument("--tt_mega_moe", type=_boolean, nargs="?", const=True, default=None)
+    parser.add_argument("--tt_config")
     args, _ = parser.parse_known_args(argv)
-    enabled = args.tt_mega_moe
-    if "TORCH_TURBO_MEGA_MOE" in os.environ:
-        enabled = _boolean(os.environ["TORCH_TURBO_MEGA_MOE"])
+    enabled = _boolean(os.environ.get("TORCH_TURBO_MEGA_MOE", "false"))
+    if args.tt_config:
+        from omegaconf import OmegaConf
+
+        file_config = OmegaConf.load(args.tt_config)
+        value = OmegaConf.select(file_config, "engine_config.mega_moe")
+        if value is not None:
+            enabled = _boolean(str(value))
+    if args.tt_mega_moe is not None:
+        enabled = args.tt_mega_moe
     if not enabled:
         return False
     spec = importlib.util.find_spec("tt_megamoe")

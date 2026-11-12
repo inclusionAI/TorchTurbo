@@ -70,9 +70,9 @@ def cache(user_function):
         if _cache_args is not None and _args_match(_cache_args, args, _cache_kwargs, kwargs):
             return _cache_value
 
+        result = user_function(*args, **kwargs)
         _cache_args = args
         _cache_kwargs = kwargs
-        result = user_function(*args, **kwargs)
         _cache_value = result
 
         return _cache_value

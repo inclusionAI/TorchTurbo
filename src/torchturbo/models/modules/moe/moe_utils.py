@@ -67,7 +67,7 @@ def z_loss_func(
         num_valid_tokens = valid_mask.sum()
         z_loss = z_loss_values.sum() / torch.clamp(num_valid_tokens, min=1)
     else:
-        z_loss = z_loss_values.mean()
+        z_loss = z_loss_values.sum() if logits.shape[0] == 0 else z_loss_values.mean()
 
     return z_loss * z_loss_coeff
 

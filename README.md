@@ -77,7 +77,8 @@ def get_parallel_plan() -> FSDPParallelPlan:
 The wrapper class returns this plan from `get_default_parallel_plan()`. The engine then merges `EngineConfig.parallel_plan` into it, including runtime `sp_size` and `ep_size` values supplied through environment variables, a configuration file, or CLI arguments.
 
 Vision balancing is configured on a compatible module's plan entry. For Bailing
-V3 VL, enable it on `model.visual` in the file passed to `--tt_config`:
+V3 VL and Qwen3.5 dense (including Qwen3.8-27B), enable it on `model.visual` in
+the file passed to `--tt_config`:
 
 ```yaml
 engine_config:
@@ -89,10 +90,20 @@ engine_config:
 ```
 
 `patch` weights whole media by patch count; `patch_sq` uses squared patch count.
-The model's Python plan supplies `VisionBalanceSpec(io=BailingVisionBalanceIO())`;
+The model's Python plan supplies a model-specific `VisionBalanceSpec(io=...)`;
 its default `mode=None` leaves balancing disabled. A mode-only file override
 preserves that I/O instance. Python callers use `VisionBalanceMode.PATCH` or
 `VisionBalanceMode.PATCH_SQ`; file values are converted to the enum when parsed.
+
+If the globally pooled media count (after SP deduplication) is smaller than
+the WORLD size, all ranks keep their original local inputs and outputs.
+This skips pixel/feature all-to-all exchanges, including their backward
+exchanges, while retaining the metadata gathers and the local tower call.
+For example, one text dummy per SP group takes this path when `sp_size > 1`.
+The condition is a global count check, not dummy-image detection: an equal
+or larger pool still uses balancing, and real-media batches can also fall
+back when the pool is small. No HCCL environment override is needed for
+this fallback.
 
 Models implement `BaseVisionBalanceIO` to read and replace call inputs, extract
 and restore all output streams, and build valid dummy media. `VisionBatch`
@@ -100,7 +111,13 @@ declares packed patch rows, media grids, and per-medium lengths for each output
 stream. `register_vision_balance` uses the instance to preserve the model's
 argument and return formats while exchanging media and restoring their order.
 The boundary must be called in the same order on every WORLD rank. Bailing V3 VL
-provides this implementation; other towers require their own I/O contract.
+and Qwen3.5 dense provide this implementation; other towers require their own
+I/O contract. Qwen3.5 restores both `last_hidden_state` and `pooler_output`.
+Its ms-swift template combines images and videos in one tower call and gives
+text-only batches dummy media, satisfying this collective call contract.
+Direct model callers must maintain the same contract when enabling balancing.
+For the dense 27B model, use `ep_size: 1`; vision balancing does not require
+expert parallelism and can be combined with `sp_size: 8`.
 
 ### Backend
 
@@ -338,7 +355,6 @@ docs/runs/
 | `TORCH_TURBO_PREFETCH_DIRECTION=forward_backward` | Set the passes in which prefetching is applied: `forward` or `forward_backward` (default) |
 | `TORCH_TURBO_FORWARD_PREFETCH_DEPTH=1` | Set the number of layers prefetched for each source during the forward pass (default: 1) |
 | `TORCH_TURBO_BACKWARD_PREFETCH_DEPTH=1` | Set the number of layers prefetched for each source during the backward pass (default: 1; applies only to `forward_backward`) |
-| `TORCH_TURBO_DEBUG=1` | Enable additional rank-0 debug output in the MoE layer |
 
 ## Command-Line Arguments
 

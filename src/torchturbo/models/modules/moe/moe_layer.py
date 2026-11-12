@@ -1,7 +1,14 @@
+  # Adapted from NVIDIA Megatron-LM:
+  # https://github.com/NVIDIA/Megatron-LM
+  #
+  # Copyright (c) 2019-2025, NVIDIA CORPORATION. All rights reserved.
+  # Licensed under the BSD 3-Clause License.
+  #
+  # Modified by the TorchTurbo contributors.
+
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Optional, Union
-import os
 
 import torch
 import torch.distributed as dist
@@ -11,9 +18,6 @@ from .moe_config import MoEConfig
 from .router import TopKRouter
 from .token_dispatcher import MoETokenDispatcher, MoEAlltoAllTokenDispatcher
 from .module import ModuleSpec, build_module
-from torchturbo.logging import get_logger
-
-logger = get_logger(__name__)
 
 
 @dataclass
@@ -24,6 +28,13 @@ class MoESubmodules:
     shared_experts: Union[ModuleSpec, type] = None
 
 
+@dataclass
+class MoERuntimeInputs:
+    padding_mask: torch.Tensor | None = None
+    # False while recomputation replays a forward that already counted its tokens.
+    accumulate_tokens_per_expert: bool = True
+
+
 class BaseMoELayer(torch.nn.Module, ABC):
     """Base class for a mixture of experts layer."""
 
@@ -32,7 +43,7 @@ class BaseMoELayer(torch.nn.Module, ABC):
         config: MoEConfig,
         ep_group: dist.ProcessGroup,
         layer_number: Optional[int] = None,
-    ):
+    ) -> None:
         super().__init__()
 
         ep_size = dist.get_world_size(ep_group)
@@ -63,11 +74,19 @@ class BaseMoELayer(torch.nn.Module, ABC):
         self.router: TopKRouter = None
         self.experts = None
         self.shared_experts = None
+        self.shared_expert = None
+        self.shared_expert_gate = None
         self.token_dispatcher: Optional[MoETokenDispatcher] = None
         self.layer_number = layer_number
+        self._runtime_inputs = MoERuntimeInputs()
+
+    def set_runtime_inputs(self, inputs: MoERuntimeInputs) -> None:
+        self._runtime_inputs = inputs
 
     @abstractmethod
-    def forward(self, hidden_states, input_ids=None):
+    def forward(
+        self, hidden_states: torch.Tensor, input_ids: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Forward method for the MoE layer."""
         pass
 
@@ -82,11 +101,10 @@ class MoELayer(BaseMoELayer):
         config: MoEConfig,
         ep_group: dist.ProcessGroup,
         submodules: Optional[MoESubmodules] = None,
-        use_fused_permute_unpermute: Optional[bool] = False,
-        use_te: Optional[bool] = False,
+        use_te: bool = False,
         layer_number: Optional[int] = None,
-    ):
-        self.use_fused_permute_unpermute = use_fused_permute_unpermute
+        sp_group: dist.ProcessGroup | None = None,
+    ) -> None:
         self.use_te = use_te
         self._routed_experts_backend = None
         self.submodules = submodules
@@ -95,7 +113,11 @@ class MoELayer(BaseMoELayer):
         )
 
         # Initialize router
-        self.router = TopKRouter(config=self.config, layer_number=self.layer_number)
+        self.router = TopKRouter(
+            config=self.config,
+            layer_number=self.layer_number,
+            sp_group=sp_group,
+        )
 
         # Initialize token dispatcher
         if config.moe_token_dispatcher_type == "alltoall":
@@ -125,85 +147,45 @@ class MoELayer(BaseMoELayer):
                 self.submodules.shared_experts, config=self.config
             )
 
-    def forward(self, hidden_states: torch.Tensor, input_ids=None):
-        # debug
-        rank = torch.distributed.get_rank()
+    def forward(
+        self, hidden_states: torch.Tensor, input_ids: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Route tokens, compute local experts, and combine their outputs."""
+        probs, routing_map, expert_indices, logits = self.router(
+            hidden_states, input_ids, self._runtime_inputs.padding_mask,
+            self._runtime_inputs.accumulate_tokens_per_expert,
+        )
+        logits = logits.view(-1, logits.shape[-1])
 
-        # process MoE
-        def custom_forward(hidden_states, input_ids=None):
-            hidden_states_dtype = hidden_states.dtype
-            probs, routing_map, logits = self.router(hidden_states, input_ids)
-            if self.config.moe_router_score_function == "softmax":
-                probs = probs / probs.sum(dim=-1, keepdim=True)
-            logits = logits.view(-1, logits.shape[-1])
-            if self._routed_experts_backend is not None:
-                output, mlp_bias = self._routed_experts_backend.route(
-                    self.experts, hidden_states, probs, routing_map
-                )
-            else:
-                (dispatched_input, tokens_per_expert, permuted_probs) = (
-                    self.token_dispatcher.token_permutation(
-                        hidden_states, probs, routing_map
-                    )
-                )
-                expert_output, mlp_bias = self.experts(
-                    dispatched_input, tokens_per_expert, permuted_probs
-                )
+        if self._routed_experts_backend is not None:
+            output, _ = self._routed_experts_backend.route(
+                self.experts, hidden_states, probs,
+                expert_indices=expert_indices,
+            )
+        else:
+            dispatcher = self.token_dispatcher
+            # Reuse stage variables so completed layouts are not kept alive here.
+            expert_tokens, expert_probs = dispatcher.dispatch_preprocess(
+                hidden_states, routing_map, probs, expert_indices=expert_indices,
+            )
+            expert_tokens, expert_probs = dispatcher.token_dispatch(expert_tokens, expert_probs)
+            expert_tokens, tokens_per_expert, expert_probs = dispatcher.dispatch_postprocess(
+                expert_tokens, expert_probs,
+            )
+            expert_tokens, bias = self.experts(expert_tokens, tokens_per_expert, expert_probs)
+            assert bias is None, "Bias is not supported in MoEAlltoAllTokenDispatcher"
+            expert_tokens = dispatcher.combine_preprocess(expert_tokens)
+            expert_tokens = dispatcher.token_combine(expert_tokens)
+            expert_tokens = dispatcher.combine_postprocess(expert_tokens)
+            output = expert_tokens
+        output = output.to(hidden_states.dtype)
 
-                if self.token_dispatcher.deferred_probs_to_unpermutation:
-                    num_tokens, _ = probs.shape
-                    probs_for_unpermutation = probs.masked_select(routing_map).view(
-                        num_tokens, -1
-                    )
-                    output, mlp_bias = self.token_dispatcher.token_unpermutation(
-                        expert_output, mlp_bias, probs=probs_for_unpermutation
-                    )
-                else:
-                    expert_output = expert_output * permuted_probs.unsqueeze(-1)
-                    output, mlp_bias = self.token_dispatcher.token_unpermutation(
-                        expert_output, mlp_bias
-                    )
-            output = output.to(hidden_states_dtype)
-
-            if hasattr(self, "shared_expert") and self.shared_expert is not None:
-                shared_expert_output = self.shared_expert(hidden_states)
-                shared_expert_output = (
-                    F.sigmoid(self.shared_expert_gate(hidden_states))
-                    * shared_expert_output
-                )
-                output = output + shared_expert_output
-
-            if hasattr(self, "shared_experts") and self.shared_experts is not None:
-                shared_expert_output = self.shared_experts(hidden_states)
-                output = output + shared_expert_output
-
-            if self._routed_experts_backend is None and rank == 0 and int(os.environ.get('TORCH_TURBO_DEBUG', '0')):
-                logger.debug_rank0(
-                    "hidden_states.shape %s hidden_states %s",
-                    hidden_states.shape, hidden_states,
-                )
-                logger.debug_rank0(
-                    "dispatched_input.shape %s dispatched_input %s",
-                    dispatched_input.shape, dispatched_input,
-                )
-                logger.debug_rank0(
-                    "tokens_per_expert.shape %s tokens_per_expert %s",
-                    tokens_per_expert.shape, tokens_per_expert,
-                )
-                logger.debug_rank0(
-                    "permuted_probs.shape %s permuted_probs %s",
-                    permuted_probs.shape, permuted_probs,
-                )
-                logger.debug_rank0(
-                    "before unpermutation: expert_output.shape %s expert_output %s",
-                    expert_output.shape, expert_output,
-                )
-                logger.debug_rank0(
-                    "after unpermutation: expert_output.shape %s expert_output %s",
-                    output.shape, output,
-                )
-
-            return output, mlp_bias, logits
-
-        output, mlp_bias, logits = custom_forward(hidden_states, input_ids)
+        if self.shared_expert is not None:
+            shared_expert_output = self.shared_expert(hidden_states)
+            shared_expert_output = (
+                F.sigmoid(self.shared_expert_gate(hidden_states)) * shared_expert_output
+            )
+            output = output + shared_expert_output
+        if self.shared_experts is not None:
+            output = output + self.shared_experts(hidden_states)
         return output, logits

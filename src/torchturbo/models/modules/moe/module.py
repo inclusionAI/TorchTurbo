@@ -1,3 +1,11 @@
+  # Adapted from NVIDIA Megatron-LM:
+  # https://github.com/NVIDIA/Megatron-LM
+  #
+  # Copyright (c) 2019-2025, NVIDIA CORPORATION. All rights reserved.
+  # Licensed under the BSD 3-Clause License.
+  #
+  # Modified by the TorchTurbo contributors.
+
 import types
 from dataclasses import dataclass, field
 from typing import Tuple, Union

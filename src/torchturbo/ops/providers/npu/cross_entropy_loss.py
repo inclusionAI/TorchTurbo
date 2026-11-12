@@ -33,8 +33,11 @@ class NpuCrossEntropyLoss(OpImpl):
     ):
         import torch_npu
 
+        # The fused op returns the loss and the log_prob saved for backward in
+        # its input dtype. With BF16 logits, both the reduced sum and the
+        # gradient would lose precision, so compute in FP32.
         loss = torch_npu.npu_cross_entropy_loss(
-            logits,
+            logits.float(),
             labels,
             reduction=reduction,
             ignore_index=ignore_index,

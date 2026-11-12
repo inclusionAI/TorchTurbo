@@ -10,12 +10,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from ...engine import EngineConfig
-from ...engine.args import TorchTurboArgs, string_to_bool
-from ...engine.config import (
-    ENV_MAP,
-    MixedPrecisionPolicy,
-)
+from ...engine import CPUOffloadConfig, CPUOffloadMode, EngineConfig
+from ...engine.args import TorchTurboArgs, get_arg_specs, string_to_bool
+from ...engine.utils import raise_if_evaluation_enabled
 from ...logging import get_logger
 
 
@@ -34,7 +31,7 @@ def build_config_from_lf_args(
     """Build an ``EngineConfig`` from LlamaFactory args.
 
     Priority (lowest → highest): defaults → LF args mapping → ``torchturbo_args``
-    → env vars(via ``EngineConfig.__post_init__``).
+    → env vars (merged by :func:`build_from_args`).
 
     Parameters
     ----------
@@ -56,26 +53,27 @@ def build_config_from_lf_args(
     The configured ``EngineConfig`` and raw args with LlamaFactory gradient
     checkpointing disabled.
     """
+    if training_args is not None:
+        raise_if_evaluation_enabled(
+            training_args, predict_with_generate=training_args.predict_with_generate
+        )
     _raise_if_unsupported_lf_args(finetuning_args, model_args, torchturbo_args)
 
     config, raw_args = _build_config_from_args(
         training_args, finetuning_args, model_args, torchturbo_args, raw_args
     )
-    # Note: env vars are already applied by EngineConfig.__post_init__
+    # Note: env vars are already merged inside build_from_args.
     if config.mega_moe:
         from ...optimizations.mega_moe.integration import configure_token_capacity
 
         if data_args is None or training_args is None:
             raise ValueError("LlamaFactory mega_moe requires data_args and training_args.")
-        if data_args.cutoff_len <= 0:
-            raise ValueError("LlamaFactory mega_moe requires a positive cutoff_len.")
-        # LF neat packing reserves one token; its collator pads to a multiple of 8.
+        # The collator flattens all rows and pads each one to a multiple of 8.
         sequence_length = data_args.cutoff_len + int(data_args.neat_packing)
         sequence_length = ((sequence_length + 7) // 8) * 8
-        batch_size = training_args.per_device_train_batch_size
-        if training_args.do_eval or training_args.do_predict:
-            batch_size = max(batch_size, training_args.per_device_eval_batch_size)
-        configure_token_capacity(config, sequence_length, batch_size)
+        configure_token_capacity(
+            config, sequence_length, training_args.per_device_train_batch_size
+        )
 
     logger.info_rank0(
         "Built EngineConfig from LlamaFactory args: backend=%s, mp=%s",
@@ -103,26 +101,26 @@ def _build_config_from_args(
     """
     from ...engine.config import build_from_args
 
-    tt = torchturbo_args  # shorthand
+    tt = torchturbo_args or TorchTurboArgs()  # shorthand
 
     # --- Mixed precision seed (bf16/fp16/fp8 from LF training args) ---
     # Only seed tt when the user did not pass --tt_mixed_precision; explicit tt
-    # value wins, env overrides still apply in EngineConfig.__post_init__.
+    # value wins; env overrides are merged later inside build_from_args.
     if tt.mixed_precision is None:
-        mixed_precision_hint = MixedPrecisionPolicy.FP32
+        mixed_precision_hint = "fp32"
         if training_args is not None:
             if getattr(training_args, "bf16", False):
-                mixed_precision_hint = MixedPrecisionPolicy.BF16
+                mixed_precision_hint = "bf16"
             elif getattr(training_args, "fp16", False):
-                mixed_precision_hint = MixedPrecisionPolicy.FP16
+                mixed_precision_hint = "fp16"
             if getattr(training_args, "fp8", False):
-                mixed_precision_hint = MixedPrecisionPolicy.FP8
-        tt.mixed_precision = mixed_precision_hint.value
+                mixed_precision_hint = "fp8"
+        tt.mixed_precision = mixed_precision_hint
 
-    # --- FSDP CPU offload: reconcile LF fsdp options with --tt_cpu_offload ---
+    # --- FSDP CPU offload: reconcile LF fsdp options with the file/adapter config ---
     # Single source of truth, shared with the early process-group init in the
     # adapter patch so the two never diverge. resolve_cpu_offload raises on an
-    # explicit --tt_cpu_offload=false that contradicts an LF-requested offload.
+    # explicit non-full mode that contradicts an LF-requested offload.
     fsdp_options = (
         getattr(training_args, "fsdp", []) if training_args is not None else []
     )
@@ -141,14 +139,6 @@ def _build_config_from_args(
         tt,
     )
     tt.gradient_checkpointing = ac_enabled
-
-    # --- Checkpoint paths (LF-native model/output_dir onto tt) ---
-    tt.model_path = (
-        getattr(model_args, "model_name_or_path", None) if model_args else None
-    )
-    tt.output_dir = (
-        getattr(training_args, "output_dir", None) if training_args else None
-    )
 
     config = build_from_args(tt)
     return config, raw_args
@@ -228,15 +218,6 @@ def _explicit_torchturbo_bool_arg(
     *,
     config_path: str | None = None,
 ) -> bool | None:
-    if config_path is not None:
-        for env_name, mapped_path in ENV_MAP.items():
-            if mapped_path != config_path:
-                continue
-            env_value = os.environ.get(env_name)
-            if env_value is not None:
-                return string_to_bool(env_value)
-            break
-
     flag = f"--tt_{name}"
     args = sys.argv[1:]
     i = 0
@@ -249,6 +230,22 @@ def _explicit_torchturbo_bool_arg(
                 return string_to_bool(str(args[i + 1]))
             return True
         i += 1
+
+    if config_path is not None:
+        config_file = getattr(torchturbo_args, "config_path", None) if torchturbo_args else None
+        if config_file:
+            from omegaconf import OmegaConf
+            file_conf = OmegaConf.load(config_file)
+            file_value = OmegaConf.select(file_conf.get("engine_config", file_conf), config_path)
+            if file_value is not None:
+                return string_to_bool(file_value)
+        for arg_spec in get_arg_specs():
+            if arg_spec.env_name is None or arg_spec.config_path != config_path:
+                continue
+            env_value = os.environ.get(arg_spec.env_name)
+            if env_value is not None:
+                return string_to_bool(env_value)
+            break
     return None
 
 
@@ -277,11 +274,11 @@ def fsdp_options_from_raw_args(raw_args: Any) -> Any:
 
 def resolve_cpu_offload(
     fsdp_options: Any,
-    torchturbo_args: TorchTurboArgs | None = None,
+    torchturbo_args: TorchTurboArgs,
     *,
     strict: bool = True,
-) -> bool:
-    """Resolve CPU offload from LF ``fsdp`` options plus ``--tt_cpu_offload``.
+) -> CPUOffloadConfig:
+    """Resolve CPU offload from LF ``fsdp`` options plus the file/adapter config.
 
     Single source of truth shared by ``_build_config_from_args`` (which feeds
     ``cpu_offload`` into the shared ``build_from_args``) and by early
@@ -290,9 +287,9 @@ def resolve_cpu_offload(
     (``training_args.fsdp``) or the raw string from
     :func:`fsdp_options_from_raw_args`.
 
-    With ``strict=True`` (config path) an explicit ``--tt_cpu_offload=false`` that
-    would disable an adapter-requested offload raises. Early PG init uses
-    ``strict=False`` — it only needs the boolean and must not move where that
+    With ``strict=True`` (config path) an explicit structured config that disables
+    parameter offload while LF requests it raises. Early PG init uses
+    ``strict=False`` -- it only needs the policy and must not move where that
     validation surfaces.
     """
     if isinstance(fsdp_options, str):
@@ -307,20 +304,22 @@ def resolve_cpu_offload(
     else:
         fsdp_tokens = []
 
-    cpu_offload = "offload" in fsdp_tokens
-
-    torchturbo_cpu_offload = _explicit_torchturbo_bool_arg(
-        "cpu_offload",
-        torchturbo_args,
-        config_path="backend_config.cpu_offload",
-    )
-    if torchturbo_cpu_offload is not None:
-        if strict and cpu_offload and not torchturbo_cpu_offload:
-            raise ValueError(
-                "TorchTurbo --tt_cpu_offload must not disable the adapter "
-                "FSDP offload setting: adapter=True, torchturbo=False."
-            )
-        cpu_offload = torchturbo_cpu_offload
+    adapter_offload = "offload" in fsdp_tokens
+    if strict and adapter_offload and torchturbo_args.cpu_offload_enabled is False:
+        raise ValueError(
+            "TorchTurbo cpu_offload must use mode='full' when the adapter "
+            "enables FSDP parameter offload"
+        )
+    cpu_offload = torchturbo_args.cpu_offload
+    if cpu_offload.enabled is None:
+        cpu_offload = CPUOffloadConfig(enabled=adapter_offload)
+    if strict and adapter_offload and (
+        not cpu_offload.enabled or cpu_offload.mode is not CPUOffloadMode.FULL
+    ):
+        raise ValueError(
+            "TorchTurbo cpu_offload must use mode='full' when the adapter "
+            "enables FSDP parameter offload"
+        )
     return cpu_offload
 
 
@@ -702,43 +701,30 @@ def preprocess_multimodal_pretrain(
     if not texts:
         return {"input_ids": [], "attention_mask": [], "labels": []}
 
-    # Expand <image> → <|vision_start|>{image_pad * seqlen}<|vision_end|>
-    # Each image's seqlen depends on its resolution after processing.
-    # We must compute it by running the image through the processor.
+    # Derive image token counts from the same media path used by the collator.
     vision_bos = "<|vision_start|>"
     vision_eos = "<|vision_end|>"
     image_token = getattr(template.mm_plugin, "image_token", None) or "<|image_pad|>"
 
-    image_processor = getattr(mm_processor, "image_processor", None)
-    merge_size = getattr(image_processor, "merge_size", 2) if image_processor else 2
-    merge_length = merge_size ** 2
-    image_max_pixels = getattr(mm_processor, "image_max_pixels", 768 * 768) if mm_processor else 768 * 768
-    image_min_pixels = getattr(mm_processor, "image_min_pixels", 32 * 32) if mm_processor else 32 * 32
     plugin = template.mm_plugin
 
     expanded = []
     for txt, img_paths in zip(texts, images):
         result_txt = txt
         for path in img_paths:
-            if image_processor is not None:
-                from PIL import Image as PILImage
-                try:
-                    img = PILImage.open(path.strip())
-                    if img.mode != "RGB":
-                        img = img.convert("RGB")
-                    # Use plugin's _preprocess_image for identical resize behavior
-                    img = plugin._preprocess_image(
-                        img,
-                        image_max_pixels=image_max_pixels,
-                        image_min_pixels=image_min_pixels,
-                    )
-                    processed = image_processor([img], return_tensors="pt")
-                    grid_thw = processed["image_grid_thw"][0]
-                    seqlen = int(grid_thw.prod().item()) // merge_length
-                except Exception:
-                    seqlen = 1
-            else:
-                seqlen = 1
+            media_inputs = plugin.get_mm_inputs(
+                images=[path.strip()],
+                videos=[],
+                audios=[],
+                imglens=[1],
+                vidlens=[0],
+                audlens=[0],
+                batch_ids=[[]],
+                processor=mm_processor,
+            )
+            grid_thw = media_inputs["image_grid_thw"][0]
+            merge_length = mm_processor.image_processor.merge_size ** 2
+            seqlen = int(grid_thw.prod().item()) // merge_length
             replacement = f"{vision_bos}{image_token * seqlen}{vision_eos}"
             result_txt = result_txt.replace(IMAGE_PLACEHOLDER, replacement, 1)
         expanded.append(result_txt)

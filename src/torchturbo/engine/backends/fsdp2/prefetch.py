@@ -56,6 +56,17 @@ class PrefetchChain:
     first_moe_index: int = 0
 
 
+@dataclass
+class _ModelPrefetchState:
+    """Prefetch state owned by one prepared root model."""
+
+    model: nn.Module
+    chains: List[PrefetchChain]
+    expert_forward_prefetch_targets: Dict[
+        "FSDPModule", List["FSDPModule"]
+    ]
+
+
 # ---------------------------------------------------------------------------
 # MoE detection
 # ---------------------------------------------------------------------------
@@ -140,14 +151,16 @@ def _source_for_node(
 # Manager
 # ---------------------------------------------------------------------------
 class FSDPPrefetchManager:
-    """Discovers MoE chains and applies a prefetch strategy to a wrapped model."""
+    """Discover MoE chains and manage prefetch targets for prepared models."""
 
     def __init__(self, config: FSDPConfig) -> None:
         self.config = config
         self.chains: List[PrefetchChain] = []
+        self._model_states: Dict[int, _ModelPrefetchState] = {}
         self._expert_forward_prefetch_targets: Dict[
             "FSDPModule", List["FSDPModule"]
         ] = {}
+        self._expert_forward_prefetch_suspend_depth: Dict["FSDPModule", int] = {}
 
     def setup(self, model: nn.Module) -> None:
         if model is None:
@@ -164,9 +177,7 @@ class FSDPPrefetchManager:
                 )
             return
 
-        self._clear_targets()
-        self.chains = []
-        self._expert_forward_prefetch_targets = {}
+        self._remove_model_state(model)
 
         if self.config.prefetch_strategy == FSDPPrefetchStrategy.NATIVE:
             return
@@ -176,20 +187,29 @@ class FSDPPrefetchManager:
             == FSDPPrefetchDirection.FORWARD_BACKWARD
         )
 
-        self.chains = self._discover_moe_chains(model)
-        if not self.chains:
+        chains = self._discover_moe_chains(model)
+        if not chains:
             if self.config.prefetch_strategy != FSDPPrefetchStrategy.AUTO:
                 logger.warning_rank0(
                     "FSDP prefetch: no eligible MoE chain discovered; skipping"
                 )
             return
-        self._log_discovery()
+        self._log_discovery(chains)
 
-        forward_targets, backward_targets = self._build_targets()
+        forward_targets, backward_targets = self._build_targets(chains)
 
-        self._flush_forward_targets(forward_targets)
+        expert_forward_targets = self._flush_forward_targets(
+            forward_targets, chains
+        )
         if enable_backward:
             self._flush_backward_targets(backward_targets)
+
+        self._model_states[id(model)] = _ModelPrefetchState(
+            model=model,
+            chains=chains,
+            expert_forward_prefetch_targets=expert_forward_targets,
+        )
+        self._sync_chains()
 
         logger.info_rank0(
             "FSDP prefetch configured: strategy=%s, forward=%s, backward=%s",
@@ -200,7 +220,29 @@ class FSDPPrefetchManager:
 
     def cleanup(self) -> None:
         self._clear_targets()
+        self.chains = []
+        self._model_states = {}
         self._expert_forward_prefetch_targets = {}
+        self._expert_forward_prefetch_suspend_depth = {}
+
+    def _remove_model_state(self, model: nn.Module) -> None:
+        state = self._model_states.get(id(model))
+        if state is None or state.model is not model:
+            return
+
+        del self._model_states[id(model)]
+        self._clear_targets(state.chains)
+        for source in state.expert_forward_prefetch_targets:
+            self._expert_forward_prefetch_targets.pop(source, None)
+            self._expert_forward_prefetch_suspend_depth.pop(source, None)
+        self._sync_chains()
+
+    def _sync_chains(self) -> None:
+        self.chains = [
+            chain
+            for state in self._model_states.values()
+            for chain in state.chains
+        ]
 
     def _discover_moe_chains(self, model: nn.Module) -> List[PrefetchChain]:
         """Discover prefetch chains from an FSDP-wrapped model.
@@ -255,13 +297,16 @@ class FSDPPrefetchManager:
 
         return chains
 
-    def _build_targets(self) -> tuple[
+    def _build_targets(
+        self, chains: Optional[List[PrefetchChain]] = None
+    ) -> tuple[
         Dict["FSDPModule", List["FSDPModule"]],
         Dict["FSDPModule", List["FSDPModule"]],
     ]:
         forward_targets: Dict["FSDPModule", List["FSDPModule"]] = {}
         backward_targets: Dict["FSDPModule", List["FSDPModule"]] = {}
-        for chain in self.chains:
+        target_chains = self.chains if chains is None else chains
+        for chain in target_chains:
             if not chain.nodes:
                 continue
             eff = self._resolve_strategy(chain)
@@ -405,42 +450,72 @@ class FSDPPrefetchManager:
             _add_target(backward_targets, nodes[i].experts, expert_targets)
 
     def _flush_forward_targets(
-        self, forward_targets: Dict["FSDPModule", List["FSDPModule"]]
-    ) -> None:
+        self,
+        forward_targets: Dict["FSDPModule", List["FSDPModule"]],
+        chains: Optional[List[PrefetchChain]] = None,
+    ) -> Dict["FSDPModule", List["FSDPModule"]]:
+        target_chains = self.chains if chains is None else chains
         expert_source_ids = {
             id(node.experts)
-            for chain in self.chains
+            for chain in target_chains
             for node in chain.nodes
             if node.experts is not None
         }
-        self._expert_forward_prefetch_targets = {}
+        expert_forward_targets: Dict["FSDPModule", List["FSDPModule"]] = {}
         for source, targets in forward_targets.items():
             deduped_targets = _dedup(targets)
             source.set_modules_to_forward_prefetch(deduped_targets)
             if id(source) in expert_source_ids:
-                self._expert_forward_prefetch_targets[source] = deduped_targets
+                expert_forward_targets[source] = deduped_targets
+        self._expert_forward_prefetch_targets.update(expert_forward_targets)
+        return expert_forward_targets
 
     @contextmanager
-    def suspend_expert_forward_prefetch(self) -> Iterator[None]:
+    def suspend_expert_forward_prefetch(
+        self, model: Optional[nn.Module] = None
+    ) -> Iterator[None]:
         """Temporarily disable expert-source forward prefetch.
 
         Used by activation-checkpoint recompute only. Normal forward still keeps
         expert lookahead; during backward recompute, nested expert FSDP units can
         still look like a normal forward and would otherwise prefetch later
-        experts at the wrong time.
+        experts at the wrong time. When ``model`` is given, targets belonging to
+        other prepared models remain active.
         """
-        saved_targets = list(self._expert_forward_prefetch_targets.items())
-        if not saved_targets:
+        if model is None:
+            sources = list(self._expert_forward_prefetch_targets)
+        else:
+            state = self._model_states.get(id(model))
+            if state is None or state.model is not model:
+                sources = []
+            else:
+                sources = list(state.expert_forward_prefetch_targets)
+        if not sources:
             yield
             return
 
         try:
-            for source, _ in saved_targets:
-                source.set_modules_to_forward_prefetch([])
+            for source in sources:
+                depth = self._expert_forward_prefetch_suspend_depth.get(
+                    source, 0
+                )
+                if depth == 0:
+                    source.set_modules_to_forward_prefetch([])
+                self._expert_forward_prefetch_suspend_depth[source] = depth + 1
             yield
         finally:
-            for source, targets in saved_targets:
-                source.set_modules_to_forward_prefetch(list(targets))
+            for source in sources:
+                depth = self._expert_forward_prefetch_suspend_depth.get(source)
+                if depth is None:
+                    continue
+                if depth > 1:
+                    self._expert_forward_prefetch_suspend_depth[source] = depth - 1
+                    continue
+
+                del self._expert_forward_prefetch_suspend_depth[source]
+                targets = self._expert_forward_prefetch_targets.get(source)
+                if targets is not None:
+                    source.set_modules_to_forward_prefetch(list(targets))
 
     def _flush_backward_targets(
         self, backward_targets: Dict["FSDPModule", List["FSDPModule"]]
@@ -448,14 +523,19 @@ class FSDPPrefetchManager:
         for source, targets in backward_targets.items():
             source.set_modules_to_backward_prefetch(_dedup(targets))
 
-    def _clear_targets(self) -> None:
-        for module in self._collect_chain_modules():
+    def _clear_targets(
+        self, chains: Optional[List[PrefetchChain]] = None
+    ) -> None:
+        for module in self._collect_chain_modules(chains):
             module.set_modules_to_forward_prefetch([])
             module.set_modules_to_backward_prefetch([])
 
-    def _collect_chain_modules(self) -> List["FSDPModule"]:
+    def _collect_chain_modules(
+        self, chains: Optional[List[PrefetchChain]] = None
+    ) -> List["FSDPModule"]:
         modules: List["FSDPModule"] = []
-        for chain in self.chains:
+        target_chains = self.chains if chains is None else chains
+        for chain in target_chains:
             if chain.bootstrap is not None:
                 modules.append(chain.bootstrap)
             for node in chain.nodes:
@@ -464,9 +544,14 @@ class FSDPPrefetchManager:
                     modules.append(node.experts)
         return _dedup(modules)
 
-    def _log_discovery(self) -> None:
-        logger.info_rank0("FSDP prefetch discovered %d chain(s):", len(self.chains))
-        for chain in self.chains:
+    def _log_discovery(
+        self, chains: Optional[List[PrefetchChain]] = None
+    ) -> None:
+        target_chains = self.chains if chains is None else chains
+        logger.info_rank0(
+            "FSDP prefetch discovered %d chain(s):", len(target_chains)
+        )
+        for chain in target_chains:
             n_experts = sum(1 for n in chain.nodes if n.experts is not None)
             logger.info_rank0(
                 "- %s: nodes=%d, experts=%d, bootstrap=%s",

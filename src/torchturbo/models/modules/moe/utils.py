@@ -1,7 +1,17 @@
+  # Adapted from NVIDIA Megatron-LM:
+  # https://github.com/NVIDIA/Megatron-LM
+  #
+  # Copyright (c) 2019-2025, NVIDIA CORPORATION. All rights reserved.
+  # Licensed under the BSD 3-Clause License.
+  #
+  # Modified by the TorchTurbo contributors.
+
 import math
 from typing import Optional
 
+import numpy as np
 import torch
+
 from torchturbo.runtime import get_device_runtime
 
 
@@ -29,7 +39,7 @@ def group_limited_topk(
     When using group-limited routing:
     1. Experts are divided into 'moe_router_num_groups' equal-sized groups
     2. For each token, 'moe_router_group_topk' groups are selected based on routing scores
-       (specifically, the sum of top-2 expert scores within each group)
+       (the sum of the top-(topk // group_topk) expert scores within each group)
     3. From these selected groups, 'moe_router_topk' individual experts are chosen
     Two common use cases:
     - Device-limited routing: Set 'moe_router_num_groups' equal to expert parallel size (EP)
@@ -48,10 +58,8 @@ def group_limited_topk(
     Returns:
         Tuple[torch.Tensor, torch.Tensor]: Probs and indices tensor.
     """
-    # Organize the experts into groups
-    # Select groups based on sum of top-(topk/group_topk) routing scores within each group
     group_scores = (
-        scores.view(num_tokens, num_groups, -1)
+        scores.view(num_tokens, num_groups, num_experts // num_groups)
         .topk(topk // group_topk, dim=-1)[0]
         .sum(dim=-1)
     )
@@ -63,7 +71,7 @@ def group_limited_topk(
     score_mask = (
         group_mask.unsqueeze(-1)
         .expand(num_tokens, num_groups, num_experts // num_groups)
-        .reshape(num_tokens, -1)
+        .reshape(num_tokens, num_experts)
     )
 
     masked_scores = scores.masked_fill(~score_mask.bool(), float("-inf"))
@@ -93,157 +101,26 @@ def get_capacity(
     return capacity
 
 
-def permute(
-    tokens,
-    routing_map,
-    probs: Optional[torch.Tensor] = None,
-    num_out_tokens: Optional[int] = None,
-    fused: bool = False,
-):
-    """Permute the tokens and probs based on the mask.
-    Tokens with the same designated expert will be grouped together.
-    The shape of mask is [tokens, num_experts], it indicates which experts were selected
-    by each token.
-
-    When drop_and_pad=True, in routing_map, the number of non-zeros in each column equals to
-    expert capacity. This function exploits this feature to use ops that support cuda graph.
-
+def maybe_move_tensor_to_cpu(
+    tensor: torch.Tensor | np.ndarray | None,
+    as_numpy: bool = False,
+    record_stream: bool = False,
+) -> torch.Tensor | np.ndarray | None:
+    """Move a tensor to CPU and optionally expose it as a numpy array.
     Args:
-        tokens (torch.Tensor): The input token tensor, [num_tokens, hidden].
-        routing_map (torch.Tensor): The sparse token to expert mapping, [num_tokens, num_experts].
-        num_out_tokens (int, optional): The number of output tokens. If None, it's set to
-                                        the number of input tokens.
-        fused (bool, optional): Whether use the fused permute function.
-        drop_and_pad (bool, optional): Whether or not the token dispatcher uses token-drop
-                                       and pads the number of tokens to the expert capacity.
-                                       If set to true, routing_map has a fixed number of non-zeros
-                                       in each column.
-    """
-    num_tokens, hidden = tokens.shape
-    num_experts = routing_map.shape[1]
-    # mask [num_tokens, num_experts] -> [num_experts, num_tokens]
-    routing_map = routing_map.bool().T.contiguous()
-
-    # Create a dense expert-to-token mapping from the sparse token-to-expert mapping
-    token_indices = (
-        torch.arange(num_tokens, device=routing_map.device)
-        .unsqueeze(0)
-        .expand(num_experts, -1)
-    )
-    sorted_indices = token_indices.masked_select(routing_map)
-
-    # use the mapping to permute the tokens
-    permuted_input = tokens.index_select(0, sorted_indices)
-
-    if probs is not None:
-        permuted_probs = probs.T.contiguous().masked_select(routing_map)
-    else:
-        permuted_probs = None
-
-    return permuted_input, permuted_probs, sorted_indices
-
-
-def sort_chunks_by_idxs(
-    input: torch.Tensor,
-    split_sizes: torch.Tensor,
-    sorted_idxs: torch.Tensor,
-    probs: Optional[torch.Tensor] = None,
-    fused: bool = False,
-):
-    """Split and sort the input tensor based on the split_sizes and sorted indices."""
-    input = torch.split(input, split_sizes.tolist(), dim=0)
-    output = torch.cat([input[i] for i in sorted_idxs.tolist()], dim=0)
-    if probs is not None:
-        probs = torch.split(probs, split_sizes.tolist(), dim=0)
-        permuted_probs = torch.cat([probs[i] for i in sorted_idxs.tolist()], dim=0)
-    else:
-        permuted_probs = None
-    return output, permuted_probs
-
-
-def unpermute(
-    permuted_tokens: torch.Tensor,
-    sorted_indices: torch.Tensor,
-    restore_shape: torch.Size,
-    probs: torch.Tensor = None,
-    routing_map: torch.Tensor = None,
-    fused: bool = False,
-):
-    """
-    Restore the original order of tokens after permutation. If probs are provided, it
-    will also apply them to the tokens before restoring the order.
-
-    When drop_and_pad=True, the tensors will have the following properties:
-      - In routing_map, the number of non-zeros in each column equals to expert capacity
-      - The size of sorted_indices equals to num_experts * capacity, each split of `capacity`
-        contains the indices of tokens routed to an expert.
-    This function exploits these features to use ops that support cuda graph.
-
-    Args:
-        permuted_tokens (torch.Tensor): The permuted token tensor.
-        sorted_indices (torch.Tensor): The indices used to sort the tokens.
-        restore_shape (torch.Size): The shape of the unpermuted tensor.
-        probs (torch.Tensor, optional): The unpermuted probs tensor,
-        routing_map (torch.Tensor, optional): Token to expert mapping, shape
-            [num_tokens, num_experts].
-        fused (bool, optional): Whether use the fused unpermute function.
-        drop_and_pad (bool, optional): Whether or not the token dispatcher uses token-drop
-                                       and pads the number of tokens to the expert capacity.
-
-    Returns:
-        torch.Tensor: The tokens restored to their original order.
-    """
-    _, hidden = restore_shape
-    input_dtype = permuted_tokens.dtype
-
-    if probs is not None:
-        assert routing_map is not None, "Mask must be provided to permute the probs."
-        permuted_probs = probs.T.contiguous().masked_select(routing_map.T.contiguous())
-        # Here may promote permuted_tokens to higher precision (fp32/fp64) if probs is in
-        # higher precision due to moe_router_dtype being enabled. This can lead to
-        # additional GPU memory usage. Use --moe-permute-fusion flag to avoid this extra memory
-        # allocation.
-        permuted_tokens = permuted_tokens * permuted_probs.unsqueeze(-1)
-
-    # Create an output tensor filled with zeros
-    output_tokens = torch.zeros(
-        restore_shape, dtype=permuted_tokens.dtype, device=permuted_tokens.device
-    )
-    if torch.are_deterministic_algorithms_enabled():
-        # Use index_add which is deterministic when deterministic algorithms are enabled
-        # and is CUDA graph compatible
-        output_tokens = torch.zeros(
-            restore_shape, dtype=permuted_tokens.dtype, device=permuted_tokens.device
-        )
-        # index_add is deterministic when torch.use_deterministic_algorithms(True) is set
-        # and is CUDA graph compatible unlike scatter_add
-        output_tokens.index_add_(0, sorted_indices, permuted_tokens)
-    else:
-        # Scatter add the permuted_input back to the original positions
-        output_tokens.scatter_add_(
-            0, sorted_indices.unsqueeze(1).expand(-1, hidden), permuted_tokens
-        )
-
-    return output_tokens.to(dtype=input_dtype)
-
-
-def maybe_move_tensor_to_cpu(tensor, as_numpy=False, record_stream=False):
-    """Move a tensor to CPU if it is on GPU.
-    Args:
-        tensor (torch.Tensor or None): The tensor to move to CPU.
+        tensor (torch.Tensor, np.ndarray or None): Device tensor or existing host metadata.
         as_numpy (bool): Whether to convert the tensor to a numpy array.
-        record_stream (bool): Whether to record the stream of the tensor, to prevent memory leak
-                              when the DtoH data transfer is on a side stream.
+        record_stream (bool): Keep device storage alive until the side-stream copy completes.
     """
     if torch.is_tensor(tensor) and tensor.device.type != "cpu":
         cpu_tensor = tensor.to(torch.device("cpu"), non_blocking=True)
-        if as_numpy:
-            cpu_tensor = cpu_tensor.numpy()
         if record_stream:
             current_stream = get_device_runtime().current_stream()
             if current_stream is not None:
                 tensor.record_stream(current_stream)
         tensor = cpu_tensor
+    if as_numpy and torch.is_tensor(tensor):
+        tensor = tensor.numpy()
     return tensor
 
 
@@ -259,34 +136,23 @@ def topk_softmax_with_capacity(
     use_hash_routing: bool = False,
     hash_table: Optional[torch.Tensor] = None,
     input_ids: Optional[torch.Tensor] = None,
-):
-    """Apply capacity and padding to the top-k selection.
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Select fixed-top-k experts and compute their routing probabilities.
     Args:
         logits (torch.Tensor): Logits tensor.
         topk (int): The number of experts to select for each token.
-        capacity_factor (float): The capacity factor of each expert. Will drop tokens if the number
-                               of tokens exceeds the capacity.
-        pad_to_capacity (bool): Whether to need padding in token drop mode. The probs for padded
-                               tokens will be 0.
-        drop_policy (str): The policy to drop tokens. Can be either "prob" or "position".
-                           If "prob", the tokens with the lowest probabilities will be dropped.
-                           If "position", tokens at the end of each batch will be dropped.
-        use_pre_softmax (bool): Whether to apply softmax or sigmoid before top-k selection.
+        use_pre_softmax (bool): Apply softmax before top-k instead of to selected logits.
         num_groups (int): Number of groups for routed experts.
         group_topk (int): Number of selected groups for each token.
         scaling_factor (float): Scaling factor of routing score in top-k selection.
-        score_function (str): The score function to use. Can be either "softmax" or "sigmoid".
+        score_function (str): "softmax", "sigmoid", or "sqrtsoftplus".
         expert_bias (torch.Tensor): The bias added to logits for expert routing.
 
     Returns:
-        Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-            - routing_probs (torch.Tensor): A tensor of shape [num_tokens, num_experts] containing
-              the routing probabilities for each token to each expert.
-            - routing_map (torch.Tensor): A mask tensor of shape [num_tokens, num_experts]
-              indicating which experts were selected for each token. True values represent
-              the selected experts.
-            - tokens_per_expert (torch.Tensor): A tensor of shape [num_experts] containing
-              the number of local tokens assigned to each expert before dropping and padding.
+        Dense weights, boolean assignment mask, and the selected expert IDs.
+        Both learned and hash routing return the compact top-k IDs in their
+        native order; the packed layout only needs a consistent pairing
+        between expert IDs, row indices, and gathered probabilities.
     """
     assert (
         logits.dim() == 2
@@ -307,53 +173,61 @@ def topk_softmax_with_capacity(
             return torch.topk(scores, k=topk, dim=1)
 
     if score_function == "softmax":
-        scores = torch.softmax(logits, dim=-1, dtype=torch.float32).type_as(logits)
         if use_hash_routing:
             assert (
                 hash_table is not None and input_ids is not None
             ), "Hash routing requires hash_table and input_ids."
             top_indices = hash_table[input_ids]
-            probs = torch.gather(scores, dim=1, index=top_indices)
-        elif use_pre_softmax:
-            probs, top_indices = compute_topk(scores, topk, num_groups, group_topk)
+        if use_pre_softmax:
+            scores = torch.softmax(logits, dim=-1, dtype=torch.float32)
+            if use_hash_routing:
+                probs = torch.gather(scores, dim=1, index=top_indices)
+            elif expert_bias is not None:
+                # Some model adapters use bias only for softmax expert selection.
+                _, top_indices = compute_topk(scores + expert_bias.float(), topk, num_groups, group_topk)
+                probs = torch.gather(scores, dim=1, index=top_indices)
+            else:
+                probs, top_indices = compute_topk(scores, topk, num_groups, group_topk)
         else:
-            top_scores, top_indices = compute_topk(logits, topk, num_groups, group_topk)
-            probs = torch.softmax(top_scores, dim=-1, dtype=torch.float32).type_as(logits)
+            if use_hash_routing:
+                top_scores = torch.gather(logits, dim=1, index=top_indices)
+            else:
+                top_scores, top_indices = compute_topk(logits, topk, num_groups, group_topk)
+            probs = torch.softmax(top_scores, dim=-1, dtype=torch.float32)
     elif score_function in ("sigmoid", "sqrtsoftplus"):
         if score_function == "sigmoid":
-            scores = torch.sigmoid(logits.float()).type_as(logits)
+            scores = torch.sigmoid(logits.float())
         else:
-            scores = torch.nn.functional.softplus(logits.float()).sqrt().type_as(logits)
+            scores = torch.nn.functional.softplus(logits.float()).sqrt()
 
         if use_hash_routing:
             assert (
                 hash_table is not None and input_ids is not None
             ), "Hash routing requires hash_table and input_ids."
             top_indices = hash_table[input_ids]
-            scores = torch.gather(scores, dim=1, index=top_indices).type_as(logits)
+            scores = torch.gather(scores, dim=1, index=top_indices)
         elif expert_bias is not None:
-            scores_for_routing = scores + expert_bias
+            scores_for_routing = scores + expert_bias.float()
             _, top_indices = compute_topk(
                 scores_for_routing, topk, num_groups, group_topk
             )
-            scores = torch.gather(scores, dim=1, index=top_indices).type_as(logits)
+            scores = torch.gather(scores, dim=1, index=top_indices)
         else:
             scores, top_indices = compute_topk(scores, topk, num_groups, group_topk)
-        probs = (
-            scores / (scores.sum(dim=-1, keepdim=True) + 1e-20) if topk > 1 else scores
-        )
+        probs = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20) if topk > 1 else scores
     else:
         raise ValueError(f"Invalid score_function: {score_function}")
 
     if scaling_factor:
         probs = probs * scaling_factor
 
+    probs = probs.type_as(logits)
+
     # TODO Try using element-wise operations instead of scatter?
     topk_masked_gates = torch.zeros_like(logits).scatter(1, top_indices, probs)
     topk_map = torch.zeros_like(logits).int().scatter(1, top_indices, 1).bool()
-    tokens_per_expert = topk_map.sum(dim=0)
 
-    return topk_masked_gates, topk_map, tokens_per_expert
+    return topk_masked_gates, topk_map, top_indices
 
 
 def ensure_divisibility(numerator, denominator):

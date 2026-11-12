@@ -8,20 +8,20 @@ work. Norms, activations, routing/top-k selection and communication are omitted.
 
 from __future__ import annotations
 
-import torch
+from ...engine.metrics.flops import BaseModelFlops, Component
 
-from .configuration_glm5_3_flash import Glm5NextConfig, Glm5NextTextConfig
+from .configuration_glm5_3_flash import Glm5NextConfig
 
 
-class Glm5NextFlops:
+class Glm5NextFlops(BaseModelFlops):
     """Forward work for valid text tokens, including each packed segment once."""
 
-    def __init__(self, config: Glm5NextConfig | Glm5NextTextConfig) -> None:
-        self.config = config.text_config if isinstance(config, Glm5NextConfig) else config
-
-    def components(self, seq_segments: list[int]) -> dict[str, int]:
-        """Return a model FLOP breakdown for flattened per-row segment lengths."""
-        c = self.config
+    def components(self) -> list[Component]:
+        """Return text FLOPs for the flattened packed input in the profile."""
+        if self.profile.image_grid_thw or self.profile.video_grid_thw:
+            raise NotImplementedError("GLM-5.3-Flash MFU currently supports text-only inputs.")
+        c = self.config.text_config if isinstance(self.config, Glm5NextConfig) else self.config
+        seq_segments = self.profile.seq_segments or [self.profile.seq_length]
         tokens = sum(seq_segments)
         h = c.hidden_size
         heads = c.num_attention_heads
@@ -29,9 +29,9 @@ class Glm5NextFlops:
         linear_heads, dim = c.linear_num_heads, c.linear_head_dim
         width = linear_heads * dim
         n_linear = c.layer_types.count("linear_attention")
-        n_sparse = c.layer_types.count("indexed_attention")
+        n_sparse = c.layer_types.count("full_attention")
         n_indexers = sum(
-            attn == "indexed_attention" and indexer == "full"
+            attn == "full_attention" and indexer == "full"
             for attn, indexer in zip(c.layer_types, c.indexer_types)
         )
         n_moe = c.mlp_layer_types.count("sparse")
@@ -71,7 +71,7 @@ class Glm5NextFlops:
         hc = c.hc_mult
         # Two coefficient projections and two HC residual-mixing matmuls.
         mhc = 4 * tokens * (hc * h * (2 * hc + hc * hc) + hc * hc * h)
-        return {
+        counts = {
             "kda/projections": kda_proj * n_linear,
             "kda/convolution": kda_conv * n_linear,
             "kda/state": kda_state * n_linear,
@@ -84,18 +84,4 @@ class Glm5NextFlops:
             "lm_head": 2 * tokens * h * c.vocab_size,
         }
 
-    def forward_flops(self, inputs: dict[str, torch.Tensor]) -> int:
-        """Estimate the full input before sequence-parallel slicing."""
-        if any(inputs.get(key) is not None for key in ("pixel_values", "pixel_values_videos")):
-            raise NotImplementedError("GLM-5.3-Flash MFU currently supports text-only inputs.")
-        from .modeling_glm5_3_flash import sequence_segments
-
-        source = inputs.get("input_ids")
-        if source is None:
-            source = inputs["inputs_embeds"]
-        batch, length = source.shape[:2]
-        segments = sequence_segments(
-            inputs.get("attention_mask"), inputs.get("position_ids"), batch, length
-        )
-        lengths = [end - start for row in segments for start, end in row]
-        return sum(self.components(lengths).values())
+        return [Component(name, count) for name, count in counts.items()]

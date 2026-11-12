@@ -38,7 +38,7 @@ def _processor_kwargs(config):
 
 
 class Glm5NextProcessor(Glm4vProcessor):
-    """Load the checkpoint's nested processor config on Transformers 4.x."""
+    """Load nested checkpoint metadata with the shared GLM-4V components."""
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):

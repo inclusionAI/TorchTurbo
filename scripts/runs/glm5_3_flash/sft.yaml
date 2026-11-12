@@ -1,0 +1,8 @@
+engine_config:
+  parallel_plan:
+    sp_size: 8
+    ep_size: 32
+  mega_moe: true
+  freeze_policy:
+    vision_tower: true
+    multi_modal_projector: true

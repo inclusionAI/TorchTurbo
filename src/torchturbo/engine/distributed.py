@@ -1,11 +1,13 @@
-"""Process-group initialization for the torchturbo engine."""
+"""Distributed training utilities for the TorchTurbo engine."""
 
 from __future__ import annotations
 
 from datetime import timedelta
 import os
 
+import torch
 import torch.distributed as dist
+from torch.distributed.tensor import DTensor
 
 from ..logging import get_logger
 from ..runtime import get_device_runtime
@@ -13,6 +15,18 @@ from ..runtime import get_device_runtime
 logger = get_logger(__name__)
 
 DEFAULT_PROCESS_GROUP_TIMEOUT = timedelta(seconds=1800)
+
+
+def assert_finite(value: torch.Tensor, name: str) -> None:
+    """Raise on all ranks if any local value is non-finite."""
+    value = value.detach()
+    if isinstance(value, DTensor):
+        value = value.to_local()
+    finite = torch.isfinite(value).all().to(dtype=torch.int32)
+    if dist.is_initialized() and dist.get_world_size() > 1:
+        dist.all_reduce(finite, op=dist.ReduceOp.MIN, group=dist.group.WORLD)
+    if not finite.item():
+        raise RuntimeError(f"Non-finite {name} on at least one rank; stopping training.")
 
 
 def init_process_group_if_needed(enable_cpu_backend: bool = False) -> bool:

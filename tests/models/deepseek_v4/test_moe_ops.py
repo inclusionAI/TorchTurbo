@@ -60,6 +60,7 @@ def make_config(**overrides):
 
 
 def test_generic_moe_plan_config_uses_routed_scaling_factor(monkeypatch):
+    from torchturbo.engine.config import EngineConfig
     from torchturbo.models.deepseek_v4 import parallel_plan
 
     class DummyMoE(torch.nn.Module):
@@ -79,9 +80,10 @@ def test_generic_moe_plan_config_uses_routed_scaling_factor(monkeypatch):
     moe_layer = parallel_plan._replace_moe_only(
         DummyMoE(),
         config,
-        sp_info={},
+        sp_info={"sp_group": None},
         ep_info={"ep_group": None, "ep_size": 1},
         moe_submodules=None,
+        engine_config=EngineConfig(),
     )
 
     assert moe_layer.router.config.moe_router_topk_scaling_factor == config.routed_scaling_factor

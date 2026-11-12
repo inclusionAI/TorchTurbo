@@ -135,7 +135,7 @@ def patch_kda_forward(
             g = self.f_proj(hidden_states)
         else:
             g = self.f_b_proj(self.f_a_proj(hidden_states))
-        beta = self.b_proj(hidden_states).float().sigmoid()
+        beta = self.b_proj(hidden_states).float()
         if sp_size > 1:
             # Launched before the convolutions so these small exchanges
             # finish while the convolutions run; the wait at the chunk
@@ -190,9 +190,6 @@ def patch_kda_forward(
             packed_params=packed_params,
         )
 
-        q = q.unflatten(-1, (-1, self.head_k_dim))
-        k = k.unflatten(-1, (-1, self.head_k_dim))
-        v = v.unflatten(-1, (-1, self.head_dim))
         g = g.unflatten(-1, (-1, self.head_dim))
 
         if sp_size > 1:
@@ -221,10 +218,11 @@ def patch_kda_forward(
             initial_state=None,
             output_final_state=True,
             use_qk_l2norm_in_kernel=True,
+            use_beta_sigmoid_in_kernel=True,
             use_gate_in_kernel=True,
             safe_gate=self.safe_gate,
             lower_bound=self.lower_bound,
-            packed_params=packed_params,
+            cu_seqlens=cu_seqlens,
         )
 
         if sp_size > 1:

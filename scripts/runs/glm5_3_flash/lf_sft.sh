@@ -19,11 +19,9 @@ SEQ_LEN=${SEQ_LEN:-65536}
 FINETUNING_TYPE=${FINETUNING_TYPE:-full}
 # training dataset (must be registered in ${DATASET_DIR}/dataset_info.json)
 DATASET=${DATASET:-science}
-sp_size=${SP_SIZE:-8}
-ep_size=${EP_SIZE:-32}
-mega_moe=${MEGA_MOE:-true}
-freeze_vision_tower=${FREEZE_VISION_TOWER:-true}
-freeze_multi_modal_projector=${FREEZE_MULTI_MODAL_PROJECTOR:-true}
+TEMPLATE=${TEMPLATE:-glm5}
+# Turbo engine flags live in the sibling YAML.
+TT_CONFIG=${TT_CONFIG:-"$(dirname "$0")/sft.yaml"}
 
 export HCCL_CONNECT_TIMEOUT=7200
 export HCCL_EXEC_TIMEOUT=7200
@@ -48,11 +46,6 @@ export MASTER_ADDR=${MASTER_ADDR:-127.0.0.1}
 export MASTER_PORT=${MASTER_PORT:-23556}
 export ASCEND_PROCESS_LOG_PATH=$OUTPUT_DIR/log
 
-MHC_VENDOR_DIR="${MHC_OPP_ROOT:-/usr/local/Ascend/ops-transformer}/vendors/dsv41exp_transformer"
-export ASCEND_CUSTOM_OPP_PATH="${MHC_VENDOR_DIR}${ASCEND_CUSTOM_OPP_PATH:+:${ASCEND_CUSTOM_OPP_PATH}}"
-export LD_LIBRARY_PATH="${MHC_VENDOR_DIR}/op_api/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
-export LD_LIBRARY_PATH=/usr/local/Ascend/ascend-toolkit/latest/opp/vendors/custom_transformer/op_api/lib/:${LD_LIBRARY_PATH}
-
 CUR_TIME=$(date "+%Y%m%d-%H%M%S")
 LOG_FILE=${LOG_FILE_PREFIX:-$OUTPUT_DIR/rank$NODE_RANK}-$CUR_TIME.log
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -75,11 +68,7 @@ echo $CUR_TIME >> $LOG_FILE
 echo $OUTPUT_DIR >> $LOG_FILE
 
 torchrun $DISTRIBUTED_ARGS $RUN_LF \
-    --tt_sp_size $sp_size \
-    --tt_ep_size $ep_size \
-    --tt_mega_moe "$mega_moe" \
-    --tt_freeze_vision_tower "$freeze_vision_tower" \
-    --tt_freeze_multi_modal_projector "$freeze_multi_modal_projector" \
+    --tt_config "$TT_CONFIG" \
     --report_to tensorboard \
     --disable_shuffling \
     --stage sft \
@@ -90,7 +79,7 @@ torchrun $DISTRIBUTED_ARGS $RUN_LF \
     --dataset $DATASET \
     --preprocessing_num_workers 16 \
     --cutoff_len ${SEQ_LEN} \
-    --template glm5 \
+    --template ${TEMPLATE} \
     --finetuning_type ${FINETUNING_TYPE} \
     --output_dir $OUTPUT_DIR \
     --overwrite_output_dir \

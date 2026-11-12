@@ -1,5 +1,6 @@
 """Packed MTP and DSpark training contracts on the CPU reference model."""
 
+import importlib
 import json
 from functools import partial
 
@@ -11,8 +12,17 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
 from torchturbo.models.deepseek_v4 import model as turbo_model
+from torchturbo.models.deepseek_v4 import modeling_deepseek_v4 as dsv4
 from torchturbo.models.deepseek_v4 import mtp as dspark_mtp
 from torchturbo.models.deepseek_v4.mtp import DeepseekV4MultiTokenPredictor
+from torchturbo.models.deepseek_v4.parallel_plan import _replace_moe_only
+from torchturbo.engine.config import EngineConfig
+from torchturbo.models.modules.moe.experts import GroupedMLP
+from torchturbo.models.modules.moe.module import ModuleSpec
+from torchturbo.models.modules.moe.moe_layer import MoELayer, MoESubmodules
+from torchturbo.models.modules.moe.moe_utils import MoEAuxLossAutoScaler
+from torchturbo.ops import OpPolicy, get_or_create_ops
+from torchturbo.runtime.cpu import CpuRuntime
 
 from .test_packed_inputs import (
     _make_model,
@@ -360,6 +370,74 @@ def test_dspark_without_anchors_trains_one_masked_block(length):
     for name, gradient in gradients.items():
         assert not gradient.any(), name
     assert all(torch.isfinite(value) for value in model.mtp.pop_metrics().values())
+
+
+@pytest.mark.skipif(not dist.is_gloo_available(), reason="Gloo is required")
+@pytest.mark.parametrize("aux_coeff,z_coeff", [(0.2, 0.0), (0.0, 0.3), (0.2, 0.3)])
+@pytest.mark.parametrize("checkpoint_mode", [None, False, True])
+def test_dspark_placeholder_blocks_do_not_train_router(
+    monkeypatch, tmp_path, aux_coeff, z_coeff, checkpoint_mode,
+):
+    runtime = CpuRuntime()
+    monkeypatch.setattr(importlib.import_module("torchturbo.ops.ops"), "_OPS", None)
+    monkeypatch.setattr(
+        importlib.import_module("torchturbo.runtime.runtime"), "_SELECTED_RUNTIME", runtime,
+    )
+    monkeypatch.setattr(MoEAuxLossAutoScaler, "loss_scale", 1.0)
+    get_or_create_ops(device_runtime=runtime, default_policy=OpPolicy.NATIVE)
+    dist.init_process_group(
+        "gloo", init_method=f"file://{tmp_path / 'dspark-router'}", rank=0, world_size=1,
+    )
+    try:
+        model = _make_mtp_model(block_size=2, num_stages=1)
+        model.config.num_hash_layers = 0
+        model.config.routed_scaling_factor = model.config.route_scale
+        monkeypatch.setattr(MoELayer, "forward", MoELayer.forward)
+        monkeypatch.setattr(
+            MoELayer, "_torchturbo_deepseek_v4_origin_forward", MoELayer.forward,
+            raising=False,
+        )
+        monkeypatch.setattr(dsv4.DeepseekV4RMSNorm, "forward", dsv4.DeepseekV4RMSNorm.forward)
+        turbo_model.TurboDeepseekV4ForCausalLM._pre_init_patches(model.config)
+        model.mtp[0].ffn = _replace_moe_only(
+            model.mtp[0].ffn, model.config,
+            {"sp_group": None}, {"ep_group": dist.group.WORLD, "ep_size": 1},
+            MoESubmodules(experts=ModuleSpec(module=GroupedMLP)),
+            EngineConfig.from_dict({"moe": {
+                "aux_loss_coeff": aux_coeff, "z_loss_coeff": z_coeff,
+            }}),
+        )
+        moe = model.mtp[0].ffn
+        torch.nn.init.normal_(moe.experts.weight1, std=0.02)
+        torch.nn.init.normal_(moe.experts.weight2, std=0.02)
+        if checkpoint_mode is not None:
+            forward = model.mtp[0].forward
+
+            def checkpointed_forward(*args, **kwargs):
+                return checkpoint(partial(forward, **kwargs), *args, use_reentrant=checkpoint_mode)
+
+            model.mtp[0].forward = checkpointed_forward
+        input_ids = torch.arange(1, 11).unsqueeze(0)
+        outputs = model(
+            input_ids=input_ids,
+            cu_seq_lens_q=torch.tensor([0, 10], dtype=torch.int32),
+        )
+        loss = outputs.dspark_loss_fn(torch.full_like(input_ids, -100))
+        loss.backward()
+
+        assert loss == 0
+        assert moe.router.weight.grad is not None
+        torch.testing.assert_close(moe.router.weight.grad, torch.zeros_like(moe.router.weight))
+        assert model.mtp[0].main_proj.weight.grad is not None
+        for name, parameter in model.mtp.named_parameters():
+            if parameter.grad is not None:
+                assert not parameter.grad.any(), name
+        metrics = moe.router.pop_metrics()
+        assert all(torch.isfinite(value) and value == 0 for value in metrics.values())
+        assert ("aux_loss" in metrics) == (aux_coeff > 0)
+        assert ("z_loss" in metrics) == (z_coeff > 0)
+    finally:
+        dist.destroy_process_group()
 
 
 def _dspark_sp_worker(rank, init_file, block_size, window):
