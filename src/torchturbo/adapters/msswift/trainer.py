@@ -28,6 +28,7 @@ so this module stays swift-free until a concrete trainer is actually built.
 from __future__ import annotations
 
 import os
+from contextlib import nullcontext
 from functools import partial
 
 import torch
@@ -41,6 +42,7 @@ from ...engine.distributed import assert_finite
 from ...engine.checkpoint import CheckpointFormat
 from ...engine.checkpoint.layout import validate_output_dir
 from ...logging import get_logger
+from ..garbage_collection import freeze_training_gc
 from . import engine_registry
 
 logger = get_logger(__name__)
@@ -208,8 +210,7 @@ class TurboTrainerMixin:
         return model
 
     def train(self, *args, **kwargs):
-        """Wrap swift's training loop with TorchTurbo profiling when
-        ``--tt_profiling`` is set. Mirrors the llamafactory adapter.
+        """Wrap swift training with optional profiling and GC freezing.
 
         swift owns the training loop, so the profiler is driven by an HF
         ``TrainerCallback`` whose
@@ -239,8 +240,12 @@ class TurboTrainerMixin:
                 profiling_enabled,
                 memory_snapshot_steps,
             )
+        gc_scope = nullcontext()
+        if engine is not None and engine.config.garbage_collection.mode == "freeze":
+            gc_scope = freeze_training_gc(self)
         try:
-            return super().train(*args, **kwargs)
+            with gc_scope:
+                return super().train(*args, **kwargs)
         finally:
             if profiling_enabled or memory_snapshot_steps is not None:
                 engine.stop_profiling()

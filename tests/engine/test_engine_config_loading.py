@@ -862,6 +862,26 @@ def test_config_example_loads():
     assert cfg.ops.overrides == {"rms_norm": "torch_rms_norm"}
     assert cfg.backend_config.cpu_offload.enabled is False
     assert cfg.optimizer.name == "muon"
+    assert cfg.garbage_collection.mode == "auto"
+
+
+def test_gc_mode_file_and_explicit_cli_override(tmp_path):
+    path = _write(
+        tmp_path, "gc.yaml", _engine_config("garbage_collection:\n  mode: freeze\n")
+    )
+    assert _build_from_argv(["--tt_config", path]).garbage_collection.mode == "freeze"
+    config = _build_from_argv(["--tt_config", path, "--tt_gc_mode", "auto"])
+    assert config.garbage_collection.mode == "auto"
+    assert EngineConfig.from_dict(config.to_dict()).garbage_collection.mode == "auto"
+
+
+@pytest.mark.parametrize("field", ["mode: invalid", "unknown: true"])
+def test_gc_mode_file_rejects_invalid_configuration(tmp_path, field):
+    path = _write(
+        tmp_path, "gc-invalid.yaml", _engine_config(f"garbage_collection:\n  {field}\n")
+    )
+    with pytest.raises((ValueError, TypeError), match="garbage_collection"):
+        _build_from_argv(["--tt_config", path])
 
 
 def test_cli_use_deterministic_algorithms_overrides_file(tmp_path):

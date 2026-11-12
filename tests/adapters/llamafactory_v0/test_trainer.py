@@ -7,6 +7,7 @@ import pytest
 import torch
 
 from torchturbo.engine.checkpoint import CheckpointFormat
+from torchturbo.engine.config import EngineConfig
 from torchturbo.adapters.llamafactory_v0.trainer import (
     LlamaFactoryInputCollator,
     TorchTurboDPOTrainer,
@@ -368,7 +369,7 @@ def test_train_checks_the_output_dir_before_training(
 
     trainer_cls = make_torchturbo_trainer(
         BaseTrainer,
-        engine=SimpleNamespace(model_name_or_path=str(source)),
+        engine=SimpleNamespace(model_name_or_path=str(source), config=EngineConfig()),
         stage="sft",
     )
     trainer = object.__new__(trainer_cls)

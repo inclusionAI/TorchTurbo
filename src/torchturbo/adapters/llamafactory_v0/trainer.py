@@ -14,6 +14,7 @@ from ...engine.checkpoint.layout import validate_output_dir
 from ...engine.distributed import assert_finite
 from ...logging import get_logger
 from ...models.modules.cpu_resident import CPUResidentParameter
+from ..garbage_collection import freeze_training_gc
 
 logger = get_logger(__name__)
 
@@ -387,8 +388,14 @@ class TorchTurboTrainerBase:
                 memory_snapshot_steps,
             )
 
+        gc_scope = (
+            freeze_training_gc(self)
+            if engine.config.garbage_collection.mode == "freeze"
+            else nullcontext()
+        )
         try:
-            result = super().train(*args, **kwargs)
+            with gc_scope:
+                result = super().train(*args, **kwargs)
         finally:
             if profiling_enabled or memory_snapshot_steps is not None:
                 engine.stop_profiling()

@@ -71,6 +71,10 @@ engine_config:
     enabled: true
     use_reentrant: false
 
+  garbage_collection:
+    # auto preserves Python's GC policy; freeze skips initialization survivors.
+    mode: auto
+
   # Engine-managed optimizer configuration.
   optimizer:
     # Optimizer selected by the engine. Currently only "muon" is supported.
