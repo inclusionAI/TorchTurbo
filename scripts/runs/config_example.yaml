@@ -73,7 +73,8 @@ engine_config:
 
   garbage_collection:
     # auto: Preserve the current Python GC behavior.
-    # freeze: Exclude existing objects from GC scans during training.
+    # step: Pause automatic GC during each optimizer step, then restore it.
+    # With step, collect fully if available host or device memory is below 10%.
     mode: auto
 
   # Engine-managed optimizer configuration.

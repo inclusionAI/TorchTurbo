@@ -211,7 +211,7 @@ class TurboTrainerMixin:
         return model
 
     def train(self, *args, **kwargs):
-        """Wrap swift training with optional profiling and GC freezing.
+        """Wrap swift training with optional profiling and GC scheduling.
 
         swift owns the training loop, so the profiler is driven by an HF
         ``TrainerCallback`` whose
@@ -235,15 +235,15 @@ class TurboTrainerMixin:
             else None
         )
         profiling_active = profiling_enabled or memory_snapshot_steps is not None
-        freeze_gc = engine is not None and engine.config.garbage_collection.mode == "freeze"
+        step_gc = engine is not None and engine.config.garbage_collection.mode == "step"
         with ExitStack() as scope:
             if profiling_active:
                 engine.start_profiling(
                     self.args.output_dir, profiling_enabled, memory_snapshot_steps
                 )
                 scope.callback(engine.stop_profiling)
-            collector = scope.enter_context(GarbageCollector()) if freeze_gc else None
-            if profiling_active or freeze_gc:
+            collector = scope.enter_context(GarbageCollector()) if step_gc else None
+            if profiling_active or step_gc:
                 callback = self._make_torchturbo_training_callback(
                     collector, profiling_active
                 )
@@ -260,16 +260,18 @@ class TurboTrainerMixin:
         engine = engine_registry.get_engine_or_none()
 
         class TorchTurboTrainingCallback(TrainerCallback):
-            def on_train_begin(
+            def on_step_begin(
                 self, args: Any, state: Any, control: Any, **kwargs: Any
             ) -> Any:
                 if collector is not None:
-                    collector.freeze()
+                    collector.begin_step()
                 return control
 
             def on_step_end(
                 self, args: Any, state: Any, control: Any, **kwargs: Any
             ) -> Any:
+                if collector is not None:
+                    collector.end_step()
                 if profiling_active and engine is not None:
                     engine.step_profiling()
                 return control

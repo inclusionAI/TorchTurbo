@@ -100,7 +100,7 @@ class TorchTurboArgs:
         Whether TorchTurbo should enable engine-owned activation
         checkpointing. Defaults to ``True``.
     gc_mode:
-        Cyclic GC policy: ``auto`` (default) or ``freeze``. ``None`` leaves
+        Cyclic GC policy: ``auto`` (default) or ``step``. ``None`` leaves
         the file-backed engine default unchanged.
     cpu_offload:
         Structured CPU offload policy (``CPUOffloadConfig``).
@@ -375,10 +375,11 @@ _TURBO_ARG_SPECS: tuple[TurboArgSpec, ...] = (
         args_name="gc_mode",
         cli_name="--tt_gc_mode",
         config_path="garbage_collection.mode",
-        choices=("auto", "freeze"),
+        choices=("auto", "step"),
         type=str,
         help="Training cyclic GC policy: auto (default) preserves Python's automatic "
-        "policy; freeze excludes initialization survivors from later scans.",
+        "policy; step pauses automatic GC within optimizer steps and collects "
+        "fully between steps when available host or device memory is below 10%.",
     ),
     TurboArgSpec(
         name="cpu_offload",

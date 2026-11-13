@@ -13,13 +13,13 @@ def test_gc_config_default_and_dictionary_roundtrip():
     from torchturbo.engine.config import EngineConfig
 
     assert EngineConfig().garbage_collection.mode == "auto"
-    config = EngineConfig.from_dict({"garbage_collection": {"mode": "freeze"}})
-    assert config.garbage_collection.mode == "freeze"
+    config = EngineConfig.from_dict({"garbage_collection": {"mode": "step"}})
+    assert config.garbage_collection.mode == "step"
     assert "garbage_collection" not in config.extra
-    assert EngineConfig.from_dict(config.to_dict()).garbage_collection.mode == "freeze"
+    assert EngineConfig.from_dict(config.to_dict()).garbage_collection.mode == "step"
     assert EngineConfig(
-        garbage_collection=GarbageCollectionConfig(mode="freeze")
-    ).garbage_collection.mode == "freeze"
+        garbage_collection=GarbageCollectionConfig(mode="step")
+    ).garbage_collection.mode == "step"
     with pytest.raises(ValueError, match="garbage_collection.mode"):
         EngineConfig.from_dict({"garbage_collection": {"mode": "invalid"}})
 

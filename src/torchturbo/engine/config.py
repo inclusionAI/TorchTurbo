@@ -154,13 +154,13 @@ class ActivationCheckpointingConfig:
 
 @dataclass
 class GarbageCollectionConfig:
-    """Cyclic GC policy for the training lifecycle."""
+    """Cyclic GC policy: Python defaults or collection between optimizer steps."""
 
-    mode: Literal["auto", "freeze"] = "auto"
+    mode: Literal["auto", "step"] = "auto"
 
     def __post_init__(self) -> None:
-        if self.mode not in ("auto", "freeze"):
-            raise ValueError("garbage_collection.mode must be auto or freeze")
+        if self.mode not in ("auto", "step"):
+            raise ValueError("garbage_collection.mode must be auto or step")
 
 
 # ---------------------------------------------------------------------------
@@ -649,7 +649,7 @@ class EngineConfig:
     garbage_collection: GarbageCollectionConfig = field(
         default_factory=GarbageCollectionConfig
     )
-    """Cyclic GC policy; freeze initialization survivors during training."""
+    """Cyclic GC policy; optionally defer collection to optimizer step boundaries."""
 
     comm: CommConfig = field(default_factory=CommConfig)
     """Communication optimization settings."""

@@ -867,15 +867,15 @@ def test_config_example_loads():
 
 def test_gc_mode_file_and_explicit_cli_override(tmp_path):
     path = _write(
-        tmp_path, "gc.yaml", _engine_config("garbage_collection:\n  mode: freeze\n")
+        tmp_path, "gc.yaml", _engine_config("garbage_collection:\n  mode: step\n")
     )
-    assert _build_from_argv(["--tt_config", path]).garbage_collection.mode == "freeze"
+    assert _build_from_argv(["--tt_config", path]).garbage_collection.mode == "step"
     config = _build_from_argv(["--tt_config", path, "--tt_gc_mode", "auto"])
     assert config.garbage_collection.mode == "auto"
     assert EngineConfig.from_dict(config.to_dict()).garbage_collection.mode == "auto"
 
 
-@pytest.mark.parametrize("field", ["mode: invalid", "unknown: true"])
+@pytest.mark.parametrize("field", ["mode: invalid", "mode: freeze", "unknown: true"])
 def test_gc_mode_file_rejects_invalid_configuration(tmp_path, field):
     path = _write(
         tmp_path, "gc-invalid.yaml", _engine_config(f"garbage_collection:\n  {field}\n")
