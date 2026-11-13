@@ -8,6 +8,7 @@ from torch import nn
 
 from ..engine.config import EngineConfig, ParameterGroup
 from ..logging import get_logger
+from ..runtime import TurboDevice, get_device_runtime
 from .weight_converter import BaseWeightConverter
 
 logger = get_logger(__name__)
@@ -64,7 +65,11 @@ class TurboModel:
         # flash_attention_2; the config setter propagates the value to
         # subconfigs (VLM text/vision towers included). Families with
         # special needs may override it in their own __init__.
-        config._attn_implementation = "flash_attention_2"
+        # Eager attention keeps CPU execution independent of accelerator kernels.
+        if get_device_runtime().turbo_device is TurboDevice.CPU:
+            config._attn_implementation = "eager"
+        else:
+            config._attn_implementation = "flash_attention_2"
 
         n_mtp = getattr(config, "num_nextn_predict_layers", 0)
         if engine_config.mtp.enabled:

@@ -379,6 +379,7 @@ class ShardedParamManager:
 
         param.save(collect)
 
+    @torch.no_grad()
     def _get_local_hf_state_dict(self, local_params):
         """Build state_dict containing only the parameters this rank needs to save."""
         start_time = time.perf_counter()

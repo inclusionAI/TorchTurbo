@@ -1,0 +1,116 @@
+{
+  "metrics": {
+    "loss": {
+      "1": 0.5967044830322266,
+      "2": 0.6187382936477661,
+      "3": 0.49318310618400574,
+      "4": 0.5242558717727661
+    },
+    "grad_norm": {
+      "1": 5.914552211761475,
+      "2": 4.010077953338623,
+      "3": 2.1807374954223633,
+      "4": 1.7974365949630737
+    }
+  },
+  "case": {
+    "UPDATE_GOLDEN": true,
+    "MODEL_ARGS": {},
+    "TRAIN_ARGS": {
+      "model": "/mnt/sfs_turbo/pretrained_models/bailing_v3/ling_tiny_v3_formal_256k_enhance_0420_wthink/merge-step-mean-0baeb1658f223ec4bcfa8d7cf6b7e242",
+      "dataset": "/mnt/sfs_turbo/torchturbo/datasets/am_think/science.jsonl",
+      "model_type": "turbo_bailing_hybrid",
+      "template": "ling_v3",
+      "check_model": false,
+      "add_non_thinking_prefix": true,
+      "loss_scale": "ignore_empty_think",
+      "tuner_type": "full",
+      "attn_impl": "flash_attn",
+      "torch_dtype": "bfloat16",
+      "bf16": true,
+      "num_train_epochs": 1,
+      "max_steps": 4,
+      "per_device_train_batch_size": 1,
+      "gradient_accumulation_steps": 1,
+      "optim": "adamw_torch",
+      "learning_rate": 1.25e-05,
+      "lr_scheduler_type": "cosine",
+      "warmup_ratio": 0.0,
+      "weight_decay": 0.1,
+      "max_grad_norm": 1.0,
+      "seed": 1234,
+      "data_seed": 1234,
+      "max_length": 4096,
+      "packing": true,
+      "packing_length": 4096,
+      "packing_num_proc": 1,
+      "dataset_num_proc": 96,
+      "dataloader_num_workers": 4,
+      "load_from_cache_file": true,
+      "split_dataset_ratio": 0.0,
+      "logging_strategy": "steps",
+      "logging_steps": 1,
+      "report_to": "tensorboard",
+      "add_version": false
+    },
+    "ENGINE_CONFIG": {
+      "backend": "fsdp2",
+      "mixed_precision": "bf16",
+      "parallel_plan": {
+        "sp_size": 4,
+        "ep_size": 8
+      },
+      "activation_checkpointing": {
+        "enabled": true,
+        "use_reentrant": true
+      },
+      "moe": {
+        "aux_loss_coeff": 1e-06
+      },
+      "loss_chunk": {
+        "enabled": true
+      },
+      "mtp": {
+        "enabled": false
+      }
+    },
+    "LAUNCH_ARGS": {
+      "nproc_per_node": 16,
+      "nnodes": 1,
+      "node_rank": 0,
+      "master_addr": "127.0.0.1",
+      "master_port": 29500
+    },
+    "ENV_VARS": {
+      "TOKENIZERS_PARALLELISM": "false",
+      "HF_HUB_OFFLINE": "1",
+      "HF_DATASETS_OFFLINE": "1",
+      "HCCL_CONNECT_TIMEOUT": "7200",
+      "HCCL_EXEC_TIMEOUT": "7200",
+      "HCCL_EVENT_TIMEOUT": "14500",
+      "ACL_DEVICE_SYNC_TIMEOUT": "14400",
+      "HCCL_OP_EXPANSION_MODE": "AI_CPU",
+      "ASCEND_GLOBAL_LOG_LEVEL": "3",
+      "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
+      "HCCL_ASYNC_ERROR_HANDLING": "0",
+      "HCCL_IF_BASE_PORT": "29972",
+      "GLOO_SOCKET_IFNAME": "eth0",
+      "GLOO_LOG_LEVEL": "DEBUG",
+      "MULTI_STREAM_MEMORY_REUSE": "1"
+    },
+    "FRAMEWORK": "swift",
+    "MODE": "train",
+    "TEST_TYPE": "frozen-start",
+    "COMPARE": true,
+    "METRICS": {
+      "loss": {
+        "atol": 1e-05,
+        "rtol": 0.001
+      },
+      "grad_norm": {
+        "atol": 1e-05,
+        "rtol": 0.001
+      }
+    }
+  }
+}
