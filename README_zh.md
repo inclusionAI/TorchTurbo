@@ -163,7 +163,7 @@ docker build \
 `scripts/runs/run_lf.py` 会显式激活 `llamafactory_v0`，再调用 LlamaFactory 的 `run_exp()`；   
 `scripts/runs/run_swift.py` 会解析 TorchTurbo 参数并激活 `msswift` 插件，再分发到所选训练 stage。
 
-使用指导详见：[Qwen3.5 MoE 训练指南](docs/runs/qwen3_5_moe/README_NPU.md)。
+公共准备步骤与各模型的运行示例见[训练指南](docs/runs/README_NPU.md)。
 
 ### 配置说明
 torchturbo 自有配置有三种配置方法，优先级从低到高：
@@ -283,6 +283,7 @@ torchrun --nproc_per_node=8 scripts/checkpoint/dcp_to_hf.py \
 docs/runs/
 └── qwen3_5_moe/
 └── bailing_v3/
+└── glm5_3/
 ...
 ```
 

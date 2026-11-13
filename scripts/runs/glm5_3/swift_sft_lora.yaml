@@ -1,0 +1,19 @@
+engine_config:
+  parallel_plan:
+    sp_size: 8
+    ep_size: 16
+
+  activation_checkpointing:
+    enabled: true
+    use_reentrant: false
+
+  backend_config:
+    cpu_offload:
+      enabled: true
+      mode: optimizer
+
+  loss_chunk:
+    enabled: true
+
+  mfu:
+    enabled: false
