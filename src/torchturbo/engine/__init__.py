@@ -43,6 +43,7 @@ from .config import (
     DSparkTrainingConfig,
     EngineConfig,
     FreezePolicy,
+    GarbageCollectionConfig,
     LossChunkConfig,
     MixedPrecisionPolicy,
     MoEConfig,
@@ -55,6 +56,7 @@ from .config import (
     QKClipConfig,
     build_from_args,
 )
+from .garbage_collection import GarbageCollector
 from .core import TorchTurboEngine
 from .distributed import init_process_group_if_needed
 from .metrics import MetricTracker
@@ -95,6 +97,8 @@ __all__ = [
     "DSparkTrainingConfig",
     "EngineConfig",
     "FreezePolicy",
+    "GarbageCollectionConfig",
+    "GarbageCollector",
     "LossChunkConfig",
     "MixedPrecisionPolicy",
     "MetricTracker",

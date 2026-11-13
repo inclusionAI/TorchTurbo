@@ -152,6 +152,17 @@ class ActivationCheckpointingConfig:
     use_reentrant: bool = False
 
 
+@dataclass
+class GarbageCollectionConfig:
+    """Cyclic GC policy: Python defaults or collection between optimizer steps."""
+
+    mode: Literal["auto", "step"] = "auto"
+
+    def __post_init__(self) -> None:
+        if self.mode not in ("auto", "step"):
+            raise ValueError("garbage_collection.mode must be auto or step")
+
+
 # ---------------------------------------------------------------------------
 # Communication optimization (common)
 # ---------------------------------------------------------------------------
@@ -635,6 +646,11 @@ class EngineConfig:
     )
     """Activation checkpointing settings."""
 
+    garbage_collection: GarbageCollectionConfig = field(
+        default_factory=GarbageCollectionConfig
+    )
+    """Cyclic GC policy; optionally defer collection to optimizer step boundaries."""
+
     comm: CommConfig = field(default_factory=CommConfig)
     """Communication optimization settings."""
 
@@ -687,6 +703,10 @@ class EngineConfig:
         )
         if self.backend_config is None:
             self.backend_config = self._default_backend_config()
+        if isinstance(self.garbage_collection, dict):
+            self.garbage_collection = GarbageCollectionConfig(**self.garbage_collection)
+        elif not isinstance(self.garbage_collection, GarbageCollectionConfig):
+            raise TypeError("garbage_collection must be a GarbageCollectionConfig or dict")
         if self.ops is None:
             self.ops = OpsConfig()
         if self.loss_chunk is None:
@@ -834,6 +854,7 @@ class EngineConfig:
             "fsdp",
             "backend_config",
             "activation_checkpointing",
+            "garbage_collection",
             "comm",
             "optimizer",
             "ops",
@@ -880,6 +901,7 @@ class EngineConfig:
             ops=ops,
             backend_config=backend_config,
             activation_checkpointing=ac,
+            garbage_collection=d.get("garbage_collection", {}),
             comm=comm,
             optimizer=optimizer,
             checkpoint=ckpt,
@@ -1138,6 +1160,7 @@ def build_from_args(
         ops=_build_ops_config(fields),
         backend_config=_build_fsdp_config(fields),
         activation_checkpointing=ActivationCheckpointingConfig(**ac_d),
+        garbage_collection=fields.get("garbage_collection", {}),
         comm=CommConfig(**comm_d),
         optimizer=_build_optimizer_config(fields),
         checkpoint=_build_checkpoint_config(fields),

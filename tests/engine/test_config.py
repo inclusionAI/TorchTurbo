@@ -8,6 +8,22 @@ import pytest
 os.environ.setdefault("TORCH_TURBO_DISABLE", "1")
 
 
+def test_gc_config_default_and_dictionary_roundtrip():
+    from torchturbo.engine import GarbageCollectionConfig
+    from torchturbo.engine.config import EngineConfig
+
+    assert EngineConfig().garbage_collection.mode == "auto"
+    config = EngineConfig.from_dict({"garbage_collection": {"mode": "step"}})
+    assert config.garbage_collection.mode == "step"
+    assert "garbage_collection" not in config.extra
+    assert EngineConfig.from_dict(config.to_dict()).garbage_collection.mode == "step"
+    assert EngineConfig(
+        garbage_collection=GarbageCollectionConfig(mode="step")
+    ).garbage_collection.mode == "step"
+    with pytest.raises(ValueError, match="garbage_collection.mode"):
+        EngineConfig.from_dict({"garbage_collection": {"mode": "invalid"}})
+
+
 def test_engine_config_env_injects_gradient_checkpointing(monkeypatch):
     from torchturbo.engine.args import TorchTurboArgs
     from torchturbo.engine.config import build_from_args
