@@ -1,5 +1,26 @@
 # NPU Training Guide
 
+## Overview
+
+This guide explains how to run NPU training with LLaMA-Factory or ms-swift. The workflow consists of five steps:
+
+1. **[Get the source code](#getting-the-source-code).** Get the training scripts, configurations, and Dockerfile.
+2. **[Prepare the model](#preparing-the-model).** Choose a model, training framework, and training task, then follow the model preparation instructions.
+3. **[Prepare the dataset](#preparing-the-dataset).** Download the dataset for the selected training task and follow the instructions for LLaMA-Factory or ms-swift.
+4. **[Build the image and start the container](#starting-the-container).** Build the Docker image and mount the model, dataset, and repository into the NPU container.
+5. **[Run training](#running-training).** Inside the container, install the dependencies and launch the selected training script. Adjust the training variables as needed.
+
+## Getting the Source Code
+
+Clone TorchTurbo on the training host and enter the repository directory:
+
+```bash
+git clone https://github.com/inclusionAI/TorchTurbo.git
+cd TorchTurbo
+```
+
+If the repository is already available, start from its root directory.
+
 ## Preparing the Model
 
 Install the Hugging Face CLI on your local machine:
@@ -10,19 +31,17 @@ pip install -U huggingface_hub
 
 If network access is restricted, use an HF mirror: `export HF_ENDPOINT=https://hf-mirror.com`.
 
-Select the appropriate model guide below for download instructions and training commands:
+Model preparation guides and training examples:
 
-| Model guide | LLaMA-Factory examples | ms-swift examples |
-|---|---|---|
-| [Bailing-MoE-V3](bailing_v3/README_NPU.md) | Text SFT (full), Text DPO, PT | Text SFT (full), Text DPO, PT |
-| [Qwen3.5-MoE](qwen3_5_moe/README_NPU.md) | Text SFT (full) | Multimodal SFT (full), Text DPO |
-| [GLM-5.3](glm5_3/README_NPU.md) | Text SFT (full, LoRA) | Text SFT (LoRA) |
-
-The downloaded model directory will be mounted into the container in [Starting the Container](#starting-the-container), with the in-container path `/models/<model_name>`.
+| Model | Preparation guide | LLaMA-Factory examples | ms-swift examples |
+|---|---|---|---|
+| Bailing-MoE-V3 | [Model Preparation](bailing_v3/README_NPU.md#model-preparation) | Text SFT (full), Text DPO, PT | Text SFT (full), Text DPO, PT |
+| Qwen3.5-MoE | [Model Preparation](qwen3_5_moe/README_NPU.md#model-preparation) | Text SFT (full) | Multimodal SFT (full), Text DPO |
+| GLM-5.3 | [Model Preparation](glm5_3/README_NPU.md#model-preparation) | Text SFT (full, LoRA) | Text SFT (LoRA) |
 
 ## Preparing the Dataset
 
-Download the dataset used by the selected training example. The examples below use `/path/to/datasets` on the host, mounted as `/datasets` inside the container.
+Download the dataset used by the selected training example.
 
 | Training task | Example datasets |
 |---|---|
@@ -194,6 +213,28 @@ The script uses `/datasets/olm-wikipedia-20221220/data` by default. Set `DATASET
 
 ## Starting the Container
 
+### Building the Image
+
+On the training host, build the image from the repository root:
+
+```bash
+docker build \
+    --platform linux/arm64 \
+    -f docker/npu/Dockerfile_aarch64 \
+    -t torchturbo:aarch64 \
+    .
+```
+
+### Running the Container
+
+Each `-v` argument uses the format `host_path:container_path`. Replace the host paths below with absolute paths on the training host. Keep the container paths as shown to match the training examples.
+
+| Host path | Directory to mount | Container path |
+|---|---|---|
+| `/path/to/models` | Parent directory of the downloaded model folders | `/models` |
+| `/path/to/torchturbo` | Root directory of the cloned TorchTurbo repository | `/torchturbo` |
+| `/path/to/datasets` | Parent directory of the downloaded dataset folders | `/datasets` |
+
 Mount the models, datasets, and this repository into a Docker container with NPU devices attached (the container name `env-torchturbo` is just an example):
 
 ```bash
@@ -212,10 +253,10 @@ docker run -it \
     -v /path/to/models:/models \
     -v /path/to/torchturbo:/torchturbo \
     -v /path/to/datasets:/datasets \
-    <image> bash
+    torchturbo:aarch64 bash
 ```
 
-The example above attaches 16 NPUs (`/dev/davinci0`-`/dev/davinci15`), matching the default `NPUS_PER_NODE=16` of the training scripts; adjust the devices according to the actual number of cards on your machine. The in-container model path is `/models/<model_name>`.
+The example above attaches 16 NPUs (`/dev/davinci0`-`/dev/davinci15`), matching the default `NPUS_PER_NODE=16` of the training scripts; adjust the devices according to the actual number of cards on your machine.
 
 Run dependency installation, data conversion, and training commands inside the container from the repository root:
 
@@ -225,7 +266,13 @@ cd /torchturbo
 
 ## Running Training
 
-Install the dependencies and start training using the commands in the model guide.
+Follow the model-specific examples below to install the dependencies and launch the selected training task.
+
+| Model | Training guide |
+|---|---|
+| Bailing-MoE-V3 | [Training Examples](bailing_v3/README_NPU.md#training-examples) |
+| Qwen3.5-MoE | [Training Examples](qwen3_5_moe/README_NPU.md#training-examples) |
+| GLM-5.3 | [Training Examples](glm5_3/README_NPU.md#training-examples) |
 
 ### Basic Variables
 

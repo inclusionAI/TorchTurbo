@@ -1,22 +1,18 @@
 # GLM-5.3 NPU
 
-## Preparing the Model
+See the [NPU Training Guide](../README_NPU.md) for dataset preparation, container setup, and common training options.
 
-Use the [Hugging Face CLI](../README.md#preparing-the-model) to download the GLM-5.3 BF16 model to your local machine:
+## Model Preparation
+
+Use the [Hugging Face CLI](../README_NPU.md#preparing-the-model) to download the GLM-5.3 BF16 model to your local machine:
 
 ```bash
 hf download zai-org/GLM-5.3-BF16 --local-dir /path/to/models/GLM-5.3-BF16
 ```
 
-## Preparing the Dataset
+## Training Examples
 
-The full SFT and both LoRA SFT examples use the [Science](../README.md#science) dataset.
-
-## Starting the Container
-
-Follow [Starting the Container](../README.md#starting-the-container) to mount the model, dataset, and repository. Run the commands below from `/torchturbo` inside the container.
-
-## Running Training
+The examples use the [Science](../README_NPU.md#science) dataset.
 
 ### SFT with LLaMA-Factory
 
@@ -50,5 +46,3 @@ bash scripts/runs/glm5_3/install_swift_deps.sh
 # Run training (with the default configuration)
 bash scripts/runs/glm5_3/swift_sft_lora.sh
 ```
-
-To change the model path, dataset, output directory, or sequence length, see [Basic Variables](../README.md#basic-variables).
