@@ -8,7 +8,13 @@ provider (priority=100) wins under `auto`.
 
 from __future__ import annotations
 
+import torch
+import torch.nn.functional as F
+
+from torchturbo.runtime import TurboDevice
+
 from ...base import OpImpl, OpImplKind
+from ...packed_params import PackedParams
 from ...registry import register_op
 
 
@@ -60,3 +66,48 @@ class FlaCausalConv1d(OpImpl):
             cu_seqlens=cu_seqlens,
         )
         return y, final_state
+
+
+@register_op(
+    op_name="causal_conv1d",
+    impl_name="torch_causal_conv1d",
+    kind=OpImplKind.NATIVE,
+    priority=0,
+    devices=(TurboDevice.CPU,),
+)
+class TorchCausalConv1d(OpImpl):
+    """Run depthwise causal convolution on independent CPU training sequences."""
+
+    def __call__(
+        self,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        bias: torch.Tensor | None = None,
+        *,
+        activation: str | None = None,
+        initial_state: torch.Tensor | None = None,
+        output_final_state: bool = False,
+        packed_params: PackedParams | None = None,
+    ) -> tuple[torch.Tensor, None]:
+        if initial_state is not None or output_final_state:
+            raise NotImplementedError("CPU causal convolution supports stateless training")
+        if activation not in (None, "silu", "swish"):
+            raise ValueError(f"Unsupported causal convolution activation: {activation}")
+        boundaries = (
+            packed_params.cu_seqlens_list
+            if packed_params is not None
+            else [0, x.size(1)]
+        )
+        outputs = []
+        for start, stop in zip(boundaries[:-1], boundaries[1:]):
+            output = F.conv1d(
+                x[:, start:stop].transpose(1, 2),
+                weight.unsqueeze(1),
+                bias,
+                padding=weight.size(-1) - 1,
+                groups=x.size(-1),
+            )[..., : stop - start]
+            if activation is not None:
+                output = F.silu(output)
+            outputs.append(output.transpose(1, 2))
+        return torch.cat(outputs, dim=1), None

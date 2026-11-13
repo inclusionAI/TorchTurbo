@@ -8,7 +8,14 @@ over this one (priority=0), so `auto` policy still routes NPU → AscendC.
 
 from __future__ import annotations
 
+from typing import Any
+
+import torch
+
+from torchturbo.runtime import TurboDevice
+
 from ...base import OpImpl, OpImplKind
+from ...packed_params import PackedParams
 from ...registry import register_op
 
 
@@ -63,3 +70,52 @@ class FlaGatedDeltaRule(OpImpl):
             use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
             cu_seqlens=cu_seqlens,
         )
+
+
+@register_op(
+    op_name="gated_delta_rule",
+    impl_name="torch_gated_delta_rule",
+    kind=OpImplKind.NATIVE,
+    priority=0,
+    devices=(TurboDevice.CPU,),
+)
+class TorchGatedDeltaRule(OpImpl):
+    """Run the Transformers GDN reference on independent CPU training sequences."""
+
+    def __call__(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        *,
+        initial_state: torch.Tensor | None = None,
+        output_final_state: bool = False,
+        use_qk_l2norm_in_kernel: bool = False,
+        packed_params: PackedParams | None = None,
+        **kwargs: Any,
+    ) -> tuple[torch.Tensor, None]:
+        from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
+            torch_chunk_gated_delta_rule,
+        )
+
+        if initial_state is not None or output_final_state:
+            raise NotImplementedError("CPU gated delta rule supports stateless training")
+        boundaries = (
+            packed_params.cu_seqlens_list
+            if packed_params is not None
+            else [0, q.size(1)]
+        )
+        outputs = []
+        for start, stop in zip(boundaries[:-1], boundaries[1:]):
+            output, _ = torch_chunk_gated_delta_rule(
+                q[:, start:stop],
+                k[:, start:stop],
+                v[:, start:stop],
+                g[:, start:stop],
+                beta[:, start:stop],
+                use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            )
+            outputs.append(output)
+        return torch.cat(outputs, dim=1), None

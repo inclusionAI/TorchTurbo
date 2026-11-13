@@ -1,0 +1,10 @@
+{
+  "data": {
+    "file_name": "data.json",
+    "formatting": "alpaca",
+    "columns": {
+      "prompt": "question",
+      "response": "answer"
+    }
+  }
+}
