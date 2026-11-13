@@ -124,7 +124,8 @@ def test_dpo_uses_engine_auxiliary_gradients_and_metrics(
     captured = {}
 
     def capture_logits(module, args, output):
-        captured["logits"] = output[1].reshape(-1, router.num_experts)
+        logits = output[-1]
+        captured["logits"] = logits.reshape(-1, router.num_experts)
 
     router.register_forward_hook(capture_logits)
     batch = _packed_batch()
@@ -167,3 +168,125 @@ def test_dpo_uses_engine_auxiliary_gradients_and_metrics(
     assert logs["aux_loss"] == pytest.approx(aux_loss.item())
     assert logs["aux_loss_scaled"] == pytest.approx(coefficient * aux_loss.item())
     assert reference.model.language_model.layers[0].mlp.router.pop_metrics() == {}
+
+
+def test_lora_reference_preserves_policy_moe_runtime(monkeypatch, cpu_moe):
+    from peft import LoraConfig, TaskType, get_peft_model
+
+    swift_dpo = pytest.importorskip("swift.rlhf_trainers.dpo_trainer")
+
+    torch.manual_seed(7)
+    engine = object.__new__(TorchTurboEngine)
+    engine.config = EngineConfig()
+    engine.config.mfu.enabled = False
+    engine.config.moe.aux_loss_coeff = 0.02
+    sp_info = {"sp_size": 1, "sp_rank": 0, "sp_group": None}
+    engine.backend = SimpleNamespace(
+        get_sp_info=lambda: sp_info,
+        get_parallel_context=lambda: {"sp": sp_info},
+        prepare_inputs=lambda model, inputs: inputs,
+    )
+    recorded_microbatches = []
+    engine._record_micro = recorded_microbatches.append
+    monkeypatch.setattr(engine_registry, "get_engine", lambda: engine)
+    scale_updates = []
+    set_loss_scale = MoEAuxLossAutoScaler.set_loss_scale
+
+    def record_loss_scale(scale):
+        scale_updates.append(scale)
+        set_loss_scale(scale)
+
+    monkeypatch.setattr(MoEAuxLossAutoScaler, "set_loss_scale", record_loss_scale)
+    base = _model(engine.config, sp_info)
+    router = base.model.language_model.layers[0].mlp.router
+    model = get_peft_model(
+        base,
+        LoraConfig(
+            r=2, lora_alpha=4, target_modules=["q_proj", "v_proj"],
+            task_type=TaskType.CAUSAL_LM,
+        ),
+    )
+    frozen = {
+        name: parameter.detach().clone()
+        for name, parameter in model.named_parameters()
+        if not parameter.requires_grad
+    }
+    adapters = {
+        name: parameter
+        for name, parameter in model.named_parameters()
+        if parameter.requires_grad
+    }
+    initial_adapters = {
+        name: parameter.detach().clone() for name, parameter in adapters.items()
+    }
+    assert adapters and all("lora_" in name for name in adapters)
+
+    class Trainer(TurboDPOTrainerMixin, swift_dpo.DPOTrainer):
+        pass
+
+    trainer = object.__new__(Trainer)
+    trainer.model = model
+    trainer.ref_model = None
+    trainer.ref_adapter_name = None
+    trainer.model_adapter_name = None
+    trainer._peft_has_been_casted_to_bf16 = False
+    trainer.accelerator = SimpleNamespace(
+        device=torch.device("cpu"), unwrap_model=lambda model: model,
+    )
+    trainer.args = SimpleNamespace(ld_alpha=None)
+    trainer.loss_type = ["sigmoid"]
+    trainer.label_pad_token_id = -100
+    trainer.current_gradient_accumulation_steps = 4
+    trainer.get_use_logits_to_keep = lambda: True
+    trainer.beta = 0.1
+    trainer.label_smoothing = 0.0
+    trainer.reference_free = False
+    trainer.f_divergence_type = "reverse_kl"
+
+    batch = _packed_batch()
+    initial_reference = trainer.compute_ref_log_probs(batch)
+    assert recorded_microbatches == []
+    assert scale_updates == []
+    assert router.pop_metrics() == {}
+    optimizer = torch.optim.SGD(adapters.values(), lr=0.1)
+
+    for step in range(2):
+        optimizer.zero_grad(set_to_none=True)
+        policy = trainer.concatenated_forward(model, batch)
+        policy_metrics = router.pop_metrics()
+        assert "aux_loss" in policy_metrics
+        assert len(recorded_microbatches) == step + 1
+        assert scale_updates == [0.25] * (step + 1)
+
+        reference = trainer.compute_ref_log_probs(batch)
+        torch.testing.assert_close(reference, initial_reference, rtol=0, atol=0)
+        assert model.training
+        assert router.training
+        assert len(recorded_microbatches) == step + 1
+        assert scale_updates == [0.25] * (step + 1)
+        assert MoEAuxLossAutoScaler.loss_scale == 0.25
+        assert router.pop_metrics() == {}
+
+        losses, _, _ = trainer.dpo_loss(
+            policy["chosen_logps"], policy["rejected_logps"], *reference,
+        )
+        (losses.mean() / trainer.current_gradient_accumulation_steps).backward()
+        assert any(
+            parameter.grad is not None and parameter.grad.abs().sum() > 0
+            for parameter in adapters.values()
+        )
+        for name, parameter in model.named_parameters():
+            if name in frozen:
+                assert parameter.grad is None
+                torch.testing.assert_close(parameter, frozen[name], rtol=0, atol=0)
+            elif parameter.grad is not None:
+                assert torch.isfinite(parameter.grad).all()
+        optimizer.step()
+
+    assert any(
+        not torch.equal(parameter, initial_adapters[name])
+        for name, parameter in adapters.items()
+    )
+    torch.testing.assert_close(
+        trainer.compute_ref_log_probs(batch), initial_reference, rtol=0, atol=0,
+    )

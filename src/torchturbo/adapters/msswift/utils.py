@@ -107,8 +107,8 @@ def _raise_if_unsupported(args: Any) -> None:
     if tuner_type not in {"full", "lora"}:
         unsupported.append(f"tuner_type={tuner_type!r}")
     if rlhf_type == "dpo":
-        if tuner_type != "full":
-            unsupported.append("DPO with tuner_type!=full")
+        if tuner_type == "lora" and vars(args).get("ref_adapters"):
+            unsupported.append("LoRA DPO with ref_adapters; use the frozen base reference")
         tt = get_torchturbo_args()
         if tt is not None and getattr(tt, "enable_mtp", False):
             unsupported.append("DPO with MTP")

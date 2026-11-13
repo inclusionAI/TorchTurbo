@@ -28,6 +28,8 @@ so this module stays swift-free until a concrete trainer is actually built.
 from __future__ import annotations
 
 import os
+from collections.abc import Iterator
+from contextlib import contextmanager
 from functools import partial
 
 import torch
@@ -392,7 +394,7 @@ class TurboTrainerMixin:
         # _save_model is a no-op above, so weights aren't double-written.
         super().save_model(output_dir, _internal_call=_internal_call)
 
-    def get_train_dataloader(self, skip_batches=0):
+    def get_train_dataloader(self, skip_batches=0, *, drop_last=True):
         engine = engine_registry.get_engine_or_none()
         if engine is None or self.train_dataset is None:
             return super().get_train_dataloader(skip_batches=skip_batches)
@@ -406,7 +408,7 @@ class TurboTrainerMixin:
             collate_fn=self.data_collator,
             num_workers=self.args.dataloader_num_workers,
             pin_memory=self.args.dataloader_pin_memory,
-            drop_last=True,
+            drop_last=drop_last,
         )
 
 
@@ -460,12 +462,26 @@ class TurboDPOTrainerMixin(TurboTrainerMixin):
         """Use Swift's preference-input preparation, not the SFT override."""
         return super(TurboTrainerMixin, self)._prepare_inputs(inputs)
 
+    @contextmanager
+    def null_ref_context(self) -> Iterator[None]:
+        """Evaluate the frozen base, then restore each module's training mode."""
+        training_modes = [(module, module.training) for module in self.model.modules()]
+        try:
+            self.model.eval()
+            with super().null_ref_context():
+                yield
+        finally:
+            for module, training in training_modes:
+                module.training = training
+
     def get_train_dataloader(self, *args, **kwargs):
         """Use Swift's preference sampler at sp=1 and Turbo's sampler for SP."""
         engine = engine_registry.get_engine_or_none()
         if engine is None or engine.get_sp_info().get("sp_size", 1) <= 1:
             return super(TurboTrainerMixin, self).get_train_dataloader(*args, **kwargs)
-        return super().get_train_dataloader(*args, **kwargs)
+        return super().get_train_dataloader(
+            *args, drop_last=self.args.dataloader_drop_last, **kwargs,
+        )
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         # Resolve directly to Swift's DPO loss implementation.
@@ -500,8 +516,14 @@ class TurboDPOTrainerMixin(TurboTrainerMixin):
         sp_size = sp_info["sp_size"]
 
         inputs = dict(batch)
-        # Swift's DPO loss reads neither field; keep them out of the model call.
-        for key in ("text_position_ids", "loss_scale"):
+        if ("ref_chosen_logps" in inputs) != ("ref_rejected_logps" in inputs):
+            raise ValueError(
+                "DPO reference cache requires both ref_chosen_logps and ref_rejected_logps."
+            )
+        # Reference log-probs belong to Swift's loss, not the model forward.
+        for key in (
+            "text_position_ids", "loss_scale", "ref_chosen_logps", "ref_rejected_logps",
+        ):
             inputs.pop(key, None)
         inputs = model.on_prepare_inputs(inputs)
         # Pad the token fields, labels included, to a multiple of the SP size.
