@@ -138,6 +138,7 @@ class RecordingCheckpointManager(RecordingLayout, BaseCheckpointManager):
         *,
         source_path,
         weight_converter,
+        hf_export_lora="merge",
     ):
         self.calls.append(("save_hf", output_dir, source_path, weight_converter))
 
@@ -406,6 +407,7 @@ class TestEngineSetup:
         engine.parallel_plan = None
         engine._checkpoint = None
         engine.backend = Mock(spec=BaseBackend)
+        engine.plugin_manager = Mock()
         checkpoint_manager = Mock(spec=BaseCheckpointManager)
         checkpoint_manager.load_hf.side_effect = checkpoint_load
         engine.backend.prepare_model.side_effect = backend_prepare

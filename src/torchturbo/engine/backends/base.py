@@ -66,6 +66,7 @@ class BaseCheckpointManager(ABC):
         *,
         source_path: str,
         weight_converter: BaseWeightConverter,
+        hf_export_lora: str = "merge",
     ) -> None:
         """Export HF weights under ``output_dir``."""
 
