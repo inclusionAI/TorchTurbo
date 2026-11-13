@@ -1229,8 +1229,8 @@ class FSDPDistributedMuon(Optimizer):
             if parameter_device.type == execution_runtime.device.type
             else execution_runtime.device
         )
-        # Offloaded device execution holds its buffers only inside step();
-        # every other policy keeps them allocated across steps.
+        # Offloaded device execution checks its budget on acquisition and keeps
+        # buffers after successful steps; explicit release still frees them.
         self._step_scoped_workspace = (
             self._offload.enabled and self._execution_device.type != "cpu"
         )
@@ -1283,10 +1283,9 @@ class FSDPDistributedMuon(Optimizer):
             # Momentum or parameters may already be updated. Retrying cannot
             # safely resume this step, even if queued streams have been joined.
             self._failed = True
-            raise
-        finally:
             if self._step_scoped_workspace:
                 self.release_workspace()
+            raise
         return loss
 
     def release_workspace(self) -> None:
