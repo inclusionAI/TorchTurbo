@@ -5,7 +5,7 @@ from contextlib import nullcontext
 
 import torch
 
-from .base import BaseProfiler, DeviceRuntime, TurboDevice
+from .base import BaseProfiler, DeviceRuntime, ProfilingConfig, TurboDevice
 
 
 # Ascend environment variable reference:
@@ -31,46 +31,124 @@ _NPU_DETERMINISTIC_ENV = {
 }
 
 
+# Accepted values for the NPU keys inside the opaque experimental_config
+# string. They mirror torch_npu.profiler.AiCMetrics and ProfilerLevel, which
+# are only importable on NPU hosts. Unknown keys or values are rejected here
+# so typos surface at parse time.
+_NPU_EXPERIMENTAL_VALUES = {
+    "aic_metrics": frozenset(
+        {
+            "AiCoreNone",
+            "PipeUtilization",
+            "ArithmeticUtilization",
+            "Memory",
+            "MemoryL0",
+            "MemoryUB",
+            "ResourceConflictRatio",
+            "L2Cache",
+            "MemoryAccess",
+        }
+    ),
+    "profiler_level": frozenset({"Level0", "Level1", "Level2"}),
+}
+
+
+def _parse_npu_experimental_config(raw: str) -> dict[str, str]:
+    """Parse the NPU experimental_config string into _ExperimentalConfig kwargs.
+
+    Format: ``key=value`` pairs separated by commas, e.g.
+    ``"aic_metrics=PipeUtilization,profiler_level=Level1"``.
+    """
+    overrides = {}
+    for pair in raw.split(","):
+        pair = pair.strip()
+        if not pair:
+            continue
+        if "=" not in pair:
+            raise ValueError(
+                f"Invalid NPU experimental_config entry {pair!r}; "
+                "expected key=value."
+            )
+        key, _, value = pair.partition("=")
+        key = key.strip()
+        value = value.strip()
+        if key not in _NPU_EXPERIMENTAL_VALUES:
+            raise ValueError(
+                f"Unknown NPU experimental_config key {key!r}; "
+                f"supported: {sorted(_NPU_EXPERIMENTAL_VALUES)}."
+            )
+        if value not in _NPU_EXPERIMENTAL_VALUES[key]:
+            raise ValueError(
+                f"Invalid NPU experimental_config {key}={value!r}; "
+                f"supported: {sorted(_NPU_EXPERIMENTAL_VALUES[key])}."
+            )
+        overrides[key] = value
+    return overrides
+
+
 class _NpuProfiler(BaseProfiler):
     def __init__(
         self,
         output_dir: str,
         worker_name: str,
         profiling_enabled: bool,
+        profiling_config: ProfilingConfig,
         memory_snapshot_steps: int | None,
     ) -> None:
         self._profiler = None
         if profiling_enabled:
             import torch_npu
 
+            experimental_kwargs = _parse_npu_experimental_config(
+                profiling_config.experimental_config
+            )
+            aic_metrics_name = experimental_kwargs.get("aic_metrics", "AiCoreNone")
+            profiler_level_name = experimental_kwargs.get("profiler_level")
+            profiler_level = torch_npu.profiler.ProfilerLevel.Level0
+            if profiler_level_name is not None:
+                profiler_level = getattr(
+                    torch_npu.profiler.ProfilerLevel, profiler_level_name
+                )
             experimental_config = torch_npu.profiler._ExperimentalConfig(
                 export_type=[torch_npu.profiler.ExportType.Text],
-                profiler_level=torch_npu.profiler.ProfilerLevel.Level0,
+                profiler_level=profiler_level,
                 mstx=False,
-                aic_metrics=torch_npu.profiler.AiCMetrics.AiCoreNone,
+                aic_metrics=getattr(
+                    torch_npu.profiler.AiCMetrics, aic_metrics_name
+                ),
                 l2_cache=False,
                 op_attr=False,
-                data_simplification=False,
+                # A single step is exported; drop the bulky sqlite/timeline
+                # intermediates.
+                data_simplification=True,
                 record_op_args=False,
                 gc_detect_threshold=None,
             )
 
+            # Training step N (1-based) runs inside the ProfilerStep#(N-1)
+            # record_function window, so profiling_step=N maps to
+            # skip_first=N-1. Without profiling_step, profile the first step.
+            if profiling_config.profiling_step is not None:
+                skip_first = profiling_config.profiling_step - 1
+            else:
+                skip_first = 0
+            schedule = torch_npu.profiler.schedule(
+                wait=0, warmup=0, active=1, repeat=1, skip_first=skip_first
+            )
             self._profiler = torch_npu.profiler.profile(
                 activities=[
                     torch_npu.profiler.ProfilerActivity.CPU,
                     torch_npu.profiler.ProfilerActivity.NPU,
                 ],
-                schedule=torch_npu.profiler.schedule(
-                    wait=0, warmup=10, active=1, repeat=1, skip_first=1
-                ),
+                schedule=schedule,
                 on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(
                     output_dir, worker_name=worker_name
                 ),
-                record_shapes=False,
-                profile_memory=False,
-                with_stack=False,
-                with_modules=False,
-                with_flops=False,
+                record_shapes=profiling_config.record_shapes,
+                profile_memory=profiling_config.profile_memory,
+                with_stack=profiling_config.with_stack,
+                with_modules=profiling_config.with_modules,
+                with_flops=profiling_config.with_flops,
                 experimental_config=experimental_config,
             )
         self._snapshot_path = os.path.join(
@@ -200,11 +278,13 @@ class NpuRuntime(DeviceRuntime):
         output_dir: str,
         worker_name: str,
         profiling_enabled: bool,
+        profiling_config: ProfilingConfig,
         memory_snapshot_steps: int | None,
     ) -> BaseProfiler:
         return _NpuProfiler(
             output_dir,
             worker_name,
             profiling_enabled,
+            profiling_config,
             memory_snapshot_steps,
         )

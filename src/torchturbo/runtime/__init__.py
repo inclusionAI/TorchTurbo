@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from .base import BaseProfiler, DeviceRuntime, TurboDevice
+from .base import BaseProfiler, DeviceRuntime, ProfilingConfig, TurboDevice
 from .runtime import (
     get_device_name,
     get_device_runtime,
@@ -18,5 +18,6 @@ __all__ = [
     "is_cuda_available",
     "is_device_available",
     "is_npu_available",
+    "ProfilingConfig",
     "TurboDevice",
 ]

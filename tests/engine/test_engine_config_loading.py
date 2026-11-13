@@ -176,6 +176,79 @@ def test_build_from_yaml_with_engineconfig_wrapper(tmp_path):
     assert cfg.activation_checkpointing.enabled is False
 
 
+def test_build_profiling_from_yaml(tmp_path):
+    yaml_text = """\
+engine_config:
+  profiling:
+    record_shapes: true
+    with_stack: true
+    experimental_config: "aic_metrics=PipeUtilization,profiler_level=Level1"
+    profiling_step: 3
+"""
+    cfg = _build_from_argv(
+        ["--tt_config", _write(tmp_path, "cfg.yaml", yaml_text)]
+    )
+
+    assert cfg.profiling.record_shapes is True
+    assert cfg.profiling.with_stack is True
+    assert (
+        cfg.profiling.experimental_config
+        == "aic_metrics=PipeUtilization,profiler_level=Level1"
+    )
+    assert cfg.profiling.profiling_step == 3
+    # Untouched knobs keep stock defaults.
+    assert cfg.profiling.profile_memory is False
+
+
+def test_profiling_experimental_config_is_opaque(tmp_path):
+    yaml_text = """\
+engine_config:
+  profiling:
+    experimental_config: "profiler_level=Level1"
+"""
+    cfg = _build_from_argv(
+        ["--tt_config", _write(tmp_path, "cfg.yaml", yaml_text)]
+    )
+
+    # The engine forwards experimental_config verbatim; the device runtime
+    # parses and validates it.
+    assert cfg.profiling.experimental_config == "profiler_level=Level1"
+    assert cfg.profiling.record_shapes is False
+
+
+def test_profiling_experimental_config_null_defaults_empty(tmp_path):
+    yaml_text = """\
+engine_config:
+  profiling:
+    experimental_config: null
+"""
+    cfg = _build_from_argv(
+        ["--tt_config", _write(tmp_path, "cfg.yaml", yaml_text)]
+    )
+
+    assert cfg.profiling.experimental_config == ""
+
+
+def test_profiling_backend_knobs_must_use_experimental_config(tmp_path):
+    yaml_text = """\
+engine_config:
+  profiling:
+    aic_metrics: PipeUtilization
+"""
+    with pytest.raises(ValueError, match="Unknown key"):
+        _build_from_argv(["--tt_config", _write(tmp_path, "cfg.yaml", yaml_text)])
+
+
+def test_profiling_unknown_key_rejected(tmp_path):
+    yaml_text = """\
+engine_config:
+  profiling:
+    detailed_kernel_info: true
+"""
+    with pytest.raises(ValueError, match="Unknown key"):
+        _build_from_argv(["--tt_config", _write(tmp_path, "cfg.yaml", yaml_text)])
+
+
 def test_build_from_json_with_engineconfig_wrapper(tmp_path):
     data = {
         "engine_config": {

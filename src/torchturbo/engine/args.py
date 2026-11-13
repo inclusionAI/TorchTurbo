@@ -650,8 +650,10 @@ _TURBO_ARG_SPECS: tuple[TurboArgSpec, ...] = (
         cli_name="--tt_profiling",
         type=string_to_bool,
         metavar="BOOL",
-        help="Enable NPU/CUDA profiling for the second step. "
-        "Outputs to {output_dir}/profiling/. "
+        help="Enable NPU/CUDA profiling for one optimizer step. "
+        "Outputs to {output_dir}/profiling/. Detail knobs (step selection, "
+        "record_shapes, backend experimental_config, ...) are configured "
+        "in the YAML under engine_config.profiling. "
         "Accepts --tt_profiling, ... true, or ... false.",
     ),
     TurboArgSpec(
