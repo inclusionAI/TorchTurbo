@@ -2143,6 +2143,44 @@ def test_muon_preflight_failure_can_be_corrected_before_retry():
     assert calls == ["update", "update"]
 
 
+def test_muon_offloaded_device_workspace_is_reused_until_explicit_release():
+    from torchturbo.engine.backends.fsdp2.optimizers.muon import (
+        FSDPDistributedMuon,
+    )
+
+    calls = []
+    workspace = SimpleNamespace(async_enabled=False, configured=False)
+    optimizer = SimpleNamespace(
+        _failed=False,
+        _step_scoped_workspace=True,
+        _workspace=workspace,
+        _compiled_buckets=(SimpleNamespace(has_redistribution=False),),
+        _preflight_step=lambda: None,
+        _run_synchronous=lambda: calls.append("update"),
+    )
+
+    def acquire_workspace():
+        calls.append("acquire")
+        if not workspace.configured:
+            calls.append("configure")
+            workspace.configured = True
+
+    def release_workspace():
+        calls.append("release")
+        workspace.configured = False
+
+    optimizer._acquire_workspace = acquire_workspace
+    optimizer.release_workspace = release_workspace
+
+    FSDPDistributedMuon.step(optimizer)
+    FSDPDistributedMuon.step(optimizer)
+    assert calls == ["acquire", "configure", "update", "acquire", "update"]
+
+    optimizer.release_workspace()
+    FSDPDistributedMuon.step(optimizer)
+    assert calls[-3:] == ["acquire", "configure", "update"]
+
+
 @pytest.mark.parametrize(
     ("overlap", "kinds", "expected_gathers"),
     [
