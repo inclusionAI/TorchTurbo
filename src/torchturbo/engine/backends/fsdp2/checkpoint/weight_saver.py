@@ -517,6 +517,7 @@ class ShardedParamManager:
 
         def write_metadata() -> None:
             self._copy_non_safetensor_files(self.src_path, save_path)
+            self.param_converter.update_saved_config(save_path)
             if self.processing_class is not None:
                 self.processing_class.save_pretrained(save_path)
             # The export keeps the source config; other training-time

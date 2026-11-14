@@ -126,6 +126,7 @@ def test_hf_export_copies_the_source_config(tmp_path):
     saver.local_params = set()
     saver.src_path = source
     saver.processing_class = None
+    saver.param_converter = SimpleNamespace(update_saved_config=lambda path: None)
     saver.model = SimpleNamespace(config=config)
     saver._src_metadata = {}
     export = tmp_path / "export"

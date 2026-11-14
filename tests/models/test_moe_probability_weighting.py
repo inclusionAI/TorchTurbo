@@ -65,8 +65,8 @@ def test_completed_dispatch_stages_release_their_activation_buffers(monkeypatch)
     references = {}
 
     def observe_stage(name, stage):
-        def observed(*args):
-            result = stage(*args)
+        def observed(*args, **kwargs):
+            result = stage(*args, **kwargs)
             tensors = result if isinstance(result, tuple) else (result,)
             references[name] = [weakref.ref(tensor) for tensor in tensors]
             return result

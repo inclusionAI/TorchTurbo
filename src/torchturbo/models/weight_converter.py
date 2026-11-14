@@ -1,4 +1,5 @@
 import json
+from collections.abc import Callable
 import struct
 from pathlib import Path
 
@@ -85,6 +86,18 @@ class BaseWeightConverter:
         if hf_name not in tensor_infos and hf_source_name in tensor_infos:
             return hf_source_name
         return None
+
+    def decode_checkpoint_tensor(
+        self,
+        name: str,
+        tensor: torch.Tensor,
+        read_tensor: Callable[[str], torch.Tensor],
+    ) -> torch.Tensor:
+        """Decode a physical checkpoint tensor before distributed loading."""
+        return tensor.clone()
+
+    def update_saved_config(self, save_path: Path) -> None:
+        """Update model-specific metadata after copying the source config."""
 
     def get_moe_config(self, model):
         for _, module in model.named_modules():
