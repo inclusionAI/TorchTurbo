@@ -162,7 +162,6 @@ class TorchTurboArgs:
     backend: str | None = None
     mixed_precision: str | None = None
     op_policy: str | None = None
-    mega_moe: bool = False
     optimizer_name: str | None = None
     use_deterministic_algorithms: bool = False
     sp_size: int | None = None
@@ -288,16 +287,6 @@ _TURBO_ARG_SPECS: tuple[TurboArgSpec, ...] = (
         metavar="POLICY",
         help="Default op dispatch policy (auto, native, custom). "
         "Replaces TORCH_TURBO_OP_POLICY.",
-    ),
-    TurboArgSpec(
-        name="mega_moe",
-        args_name="mega_moe",
-        cli_name="--tt_mega_moe",
-        env_name="TORCH_TURBO_MEGA_MOE",
-        config_path="mega_moe",
-        type=string_to_bool,
-        metavar="BOOL",
-        help="Enable the fused MoonEP/MegaMoE expert backend (default: false).",
     ),
     TurboArgSpec(
         name="optimizer_name",

@@ -38,7 +38,6 @@ engine_config:
 
   mixed_precision: bf16
   use_deterministic_algorithms: false
-  mega_moe: false  # Requires the MoonEP-enabled tt-megamoe runtime.
 
   ops:
     policy: auto

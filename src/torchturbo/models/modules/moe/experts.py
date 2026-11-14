@@ -47,7 +47,6 @@ class GroupedMLP(torch.nn.Module):
     ):
         super().__init__()
         self.config = config
-        self._execution_backend = None
         self.num_local_experts = num_local_experts
         self.layer_number = layer_number
         limit_list = getattr(config, "moe_swiglu_limit", None)
@@ -193,10 +192,6 @@ class GroupedMLP(torch.nn.Module):
         permuted_probs: torch.Tensor,
     ) -> tuple[torch.Tensor, None]:
         """Apply routing probabilities inside each expert before its second linear."""
-        if self._execution_backend is not None:
-            return self._execution_backend.execute(
-                self, permuted_local_hidden_states, tokens_per_expert, permuted_probs
-            ), None
         if self.config.moe_apply_probs_on_input:
             assert (
                 self.config.moe_router_topk == 1

@@ -4,7 +4,6 @@
 # Usage:
 #   bash scripts/runs/glm5_3_flash/install_lf_deps.sh
 #   bash scripts/runs/glm5_3_flash/lf_sft.sh
-# MEGAMOE_RUNTIME optionally selects a runtime with python/tt_megamoe.
 
 set -o pipefail
 set -eux

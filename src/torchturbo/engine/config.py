@@ -665,9 +665,6 @@ class EngineConfig:
     mfu: MfuConfig = field(default_factory=MfuConfig)
     """MFU/HFU reporting settings."""
 
-    mega_moe: bool = False
-    """Enable the fused MoonEP/MegaMoE expert backend."""
-
     gbs: int | None = None
     """Global batch size in micro-batch units (``--tt_gbs``). When set, the
     engine derives ``gradient_accumulation_steps = gbs * sp_size / world_size``
@@ -688,7 +685,6 @@ class EngineConfig:
         self.use_deterministic_algorithms = string_to_bool(
             self.use_deterministic_algorithms
         )
-        self.mega_moe = string_to_bool(self.mega_moe)
         if self.backend_config is None:
             self.backend_config = self._default_backend_config()
         if self.ops is None:
@@ -869,7 +865,6 @@ class EngineConfig:
             "freeze_policy",
             "diffusion",
             "mfu",
-            "mega_moe",
             "gbs",
             "plugin_paths",
             "extra",
@@ -895,7 +890,6 @@ class EngineConfig:
             freeze_policy=freeze_policy,
             diffusion=_build_diffusion_config(d),
             mfu=mfu_config,
-            mega_moe=d.get("mega_moe", False),
             gbs=d.get("gbs"),
             plugin_paths=list(d.get("plugin_paths") or []),
             extra=extra,
@@ -1153,7 +1147,6 @@ def build_from_args(
         loss_chunk=_build_loss_chunk_config(fields),
         freeze_policy=_build_freeze_policy(fields),
         mfu=_build_mfu_config(fields),
-        mega_moe=fields.get("mega_moe", False),
         diffusion=_build_diffusion_config(fields),
         gbs=fields.get("gbs"),
         plugin_paths=list(tt.plugins or []),

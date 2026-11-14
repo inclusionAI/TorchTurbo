@@ -25,8 +25,6 @@ def build_config_from_lf_args(
     model_args: Any = None,
     torchturbo_args: TorchTurboArgs | None = None,
     raw_args: Any = None,
-    *,
-    data_args: Any = None,
 ) -> tuple[EngineConfig, Any]:
     """Build an ``EngineConfig`` from LlamaFactory args.
 
@@ -63,17 +61,6 @@ def build_config_from_lf_args(
         training_args, finetuning_args, model_args, torchturbo_args, raw_args
     )
     # Note: env vars are already merged inside build_from_args.
-    if config.mega_moe:
-        from ...optimizations.mega_moe.integration import configure_token_capacity
-
-        if data_args is None or training_args is None:
-            raise ValueError("LlamaFactory mega_moe requires data_args and training_args.")
-        # The collator flattens all rows and pads each one to a multiple of 8.
-        sequence_length = data_args.cutoff_len + int(data_args.neat_packing)
-        sequence_length = ((sequence_length + 7) // 8) * 8
-        configure_token_capacity(
-            config, sequence_length, training_args.per_device_train_batch_size
-        )
 
     logger.info_rank0(
         "Built EngineConfig from LlamaFactory args: backend=%s, mp=%s",

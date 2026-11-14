@@ -204,7 +204,6 @@ class RunExpPatch(BasePatch):
                 model_args=model_args,
                 torchturbo_args=tt_args,
                 raw_args=raw_args,
-                data_args=data_args,
             )
 
             engine = TorchTurboEngine(config)

@@ -465,11 +465,6 @@ class FSDP2Backend(BaseBackend):
             logger.info_rank0("Applying PEFT LoRA to model")
             model = apply_peft(model, peft_config)
 
-        if self.config.mega_moe:
-            from ....optimizations.mega_moe.integration import install
-
-            install(model, self.config, self.get_ep_info()["ep_group"])
-
         # Models slice inputs at their declared boundary. Install slicing
         # first so activation checkpointing wraps it and remains effective.
         sp_info = self.get_sp_info()
