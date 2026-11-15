@@ -229,6 +229,21 @@ def test_parse_torchturbo_args_chunked_loss():
     assert remaining == ["--other"]
 
 
+def test_parse_torchturbo_args_swift_packing_max_sequences():
+    """The Swift packing cap is a runtime CLI flag, not an engine config input."""
+    from torchturbo.engine.args import parse_torchturbo_args
+
+    args, _ = parse_torchturbo_args([])
+    assert args.swift_packing_max_sequences is None
+
+    args, remaining = parse_torchturbo_args(
+        ["--tt_swift_packing_max_sequences", "1024", "--foo", "bar"]
+    )
+    assert args.swift_packing_max_sequences == 1024
+    assert args.config_overrides == {}
+    assert remaining == ["--foo", "bar"]
+
+
 def test_parse_torchturbo_args_mtp_log_loss():
     from torchturbo.engine.args import parse_torchturbo_args
 
