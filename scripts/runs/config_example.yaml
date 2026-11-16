@@ -71,6 +71,16 @@ engine_config:
     enabled: true
     use_reentrant: false
 
+  # Masked packed RL only; keeps the full context and all active head rows.
+  sparse_logits:
+    enabled: false
+
+  logprob_computation:
+    # Positive number of token rows per FP32 logprob/entropy chunk.
+    chunk_size: 1024
+    # Recompute chunk activations during backward; does not chunk lm_head.
+    checkpoint_chunks: false
+
   # Engine-managed optimizer configuration.
   optimizer:
     # Optimizer selected by the engine. Currently only "muon" is supported.

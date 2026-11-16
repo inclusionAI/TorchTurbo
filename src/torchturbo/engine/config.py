@@ -152,6 +152,48 @@ class ActivationCheckpointingConfig:
     use_reentrant: bool = False
 
 
+@dataclass
+class SparseLogitsConfig:
+    """Opt-in output-head row selection for masked packed RL losses.
+
+    The full context still enters the transformer. Each sequence-parallel
+    rank projects every loss-bearing row in its micro-batch without a row cap.
+    """
+
+    enabled: bool = False
+
+    def __post_init__(self) -> None:
+        if type(self.enabled) is not bool:
+            raise TypeError("sparse_logits.enabled must be a boolean.")
+
+
+@dataclass
+class LogprobComputationConfig:
+    """Memory controls for token log-probability and entropy computation."""
+
+    chunk_size: int = 1024
+    checkpoint_chunks: bool = False
+
+    def __post_init__(self) -> None:
+        if isinstance(self.chunk_size, bool):
+            raise TypeError("logprob_computation.chunk_size must be an integer.")
+        try:
+            self.chunk_size = int(self.chunk_size)
+        except (TypeError, ValueError) as exc:
+            raise TypeError(
+                "logprob_computation.chunk_size must be an integer."
+            ) from exc
+        if self.chunk_size <= 0:
+            raise ValueError("logprob_computation.chunk_size must be greater than 0.")
+
+        if isinstance(self.checkpoint_chunks, str):
+            self.checkpoint_chunks = string_to_bool(self.checkpoint_chunks)
+        elif not isinstance(self.checkpoint_chunks, bool):
+            raise TypeError(
+                "logprob_computation.checkpoint_chunks must be a boolean."
+            )
+
+
 # ---------------------------------------------------------------------------
 # Communication optimization (common)
 # ---------------------------------------------------------------------------
@@ -635,6 +677,14 @@ class EngineConfig:
     )
     """Activation checkpointing settings."""
 
+    sparse_logits: SparseLogitsConfig = field(default_factory=SparseLogitsConfig)
+    """Opt-in loss-mask output-head row selection for packed RL training."""
+
+    logprob_computation: LogprobComputationConfig = field(
+        default_factory=LogprobComputationConfig
+    )
+    """Token log-probability and entropy memory controls."""
+
     comm: CommConfig = field(default_factory=CommConfig)
     """Communication optimization settings."""
 
@@ -701,6 +751,22 @@ class EngineConfig:
             self.optimizer = OptimizerConfig(**self.optimizer)
         elif not isinstance(self.optimizer, OptimizerConfig):
             raise TypeError("optimizer must be an OptimizerConfig or dict")
+        if self.logprob_computation is None:
+            self.logprob_computation = LogprobComputationConfig()
+        elif isinstance(self.logprob_computation, dict):
+            self.logprob_computation = LogprobComputationConfig(
+                **self.logprob_computation
+            )
+        elif not isinstance(self.logprob_computation, LogprobComputationConfig):
+            raise TypeError(
+                "logprob_computation must be a dict or LogprobComputationConfig."
+            )
+        if self.sparse_logits is None:
+            self.sparse_logits = SparseLogitsConfig()
+        elif isinstance(self.sparse_logits, dict):
+            self.sparse_logits = SparseLogitsConfig(**self.sparse_logits)
+        elif not isinstance(self.sparse_logits, SparseLogitsConfig):
+            raise TypeError("sparse_logits must be a dict or SparseLogitsConfig.")
         if self.gbs is not None and self.gbs <= 0:
             raise ValueError(
                 f"gbs (--tt_gbs) must be a positive integer, got {self.gbs}."
@@ -834,6 +900,8 @@ class EngineConfig:
             "fsdp",
             "backend_config",
             "activation_checkpointing",
+            "sparse_logits",
+            "logprob_computation",
             "comm",
             "optimizer",
             "ops",
@@ -880,6 +948,8 @@ class EngineConfig:
             ops=ops,
             backend_config=backend_config,
             activation_checkpointing=ac,
+            sparse_logits=d.get("sparse_logits"),
+            logprob_computation=d.get("logprob_computation"),
             comm=comm,
             optimizer=optimizer,
             checkpoint=ckpt,
@@ -1138,6 +1208,8 @@ def build_from_args(
         ops=_build_ops_config(fields),
         backend_config=_build_fsdp_config(fields),
         activation_checkpointing=ActivationCheckpointingConfig(**ac_d),
+        sparse_logits=fields.get("sparse_logits"),
+        logprob_computation=fields.get("logprob_computation"),
         comm=CommConfig(**comm_d),
         optimizer=_build_optimizer_config(fields),
         checkpoint=_build_checkpoint_config(fields),
@@ -1197,6 +1269,10 @@ def _validate_config_file(data: Mapping[str, Any], parents: tuple[str, ...] = ()
         }
     )
     allowed.update(_dataclass_config_paths(OptimizerConfig, ("optimizer",)))
+    allowed.update(_dataclass_config_paths(SparseLogitsConfig, ("sparse_logits",)))
+    allowed.update(
+        _dataclass_config_paths(LogprobComputationConfig, ("logprob_computation",))
+    )
 
     for key, value in data.items():
         parts = (*parents, key)
