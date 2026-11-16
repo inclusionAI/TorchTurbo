@@ -36,8 +36,8 @@ TEST_CASES: list[TestCaseSpec] = [
         test_type="regular",
         compare=True,
         metrics={
-            "loss": {"atol": 0, "rtol": 0},
-            "grad_norm": {"atol": 0, "rtol": 0},
+            "loss": {"atol": 1.0e-6, "rtol": 1.0e-6},
+            "grad_norm": {"atol": 2.0e-4, "rtol": 1.0e-4},
         },
         platform="cpu",
     ),

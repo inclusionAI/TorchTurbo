@@ -37,7 +37,7 @@ abs(actual - golden) <= atol + rtol * abs(golden)
 - `atol`：绝对容差，允许固定大小的误差，主要用于基准接近零的情况。
 - `rtol`：相对容差；`0.001` 表示 0.1%，`0.1` 表示 10%。
 例如 `golden=2`、`atol=1e-5`、`rtol=0.1`，允许的绝对误差为 `0.20001`。容差配置位于 `test_suite/base_suite.py`。
-CPU 要求逐步数值完全一致；NPU 使用近似比较。
+CPU 使用只覆盖 x86/ARM 浮点差异的极小容差；NPU 使用近似比较。
 ## 模型生成
 对新功能或 PR 进行快速端到端验证时，可以使用随机初始化的小模型：当 YAML 未提供模型路径，并配置了 `MODEL_ARGS` 时，`gen_init_checkpoint.py` 会从 TorchTurbo 注册表取得对应模型类，按指定结构在 CPU 上构建并保存权重。初始化使用 `TRAIN_ARGS.seed`。模型配置、seed 和依赖环境固定后，可重复生成完全一致的初始权重。
 下面是构建小模型的核心函数：
