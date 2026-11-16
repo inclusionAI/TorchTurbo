@@ -16,8 +16,8 @@ OUTPUT_DIR=${OUTPUT_DIR:-/tmp/tbsf-sft/$(basename "$MODEL")}
 SEQ_LEN=${SEQ_LEN:-32768}
 # tuner type: 'full' | 'lora'
 FINETUNING_TYPE=${FINETUNING_TYPE:-full}
-# training dataset (ms-swift dataset id "repo#subset", or path to a local jsonl/parquet)
-DATASET=${DATASET:-BUAADreamer/llava-en-zh-2k#zh}
+# training dataset (ms-swift dataset id "repo:subset", or path to a local jsonl/parquet)
+DATASET=${DATASET:-hf::BUAADreamer/llava-en-zh-2k:zh}
 # turbo engine flags (sp/ep, freeze, cpu offload) live in the sibling yaml.
 TT_CONFIG=${TT_CONFIG:-"$(dirname "$0")/swift_mllm_sft.yaml"}
 
