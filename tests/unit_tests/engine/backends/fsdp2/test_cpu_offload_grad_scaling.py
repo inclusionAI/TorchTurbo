@@ -81,7 +81,7 @@ def test_cpu_offload_scaling_from_fresh_process(accelerator):
 import sys
 import torch
 from torchturbo.runtime import get_device_runtime
-from tests.engine.backends.fsdp2.test_cpu_offload_grad_scaling import _check_scaling
+from tests.unit_tests.engine.backends.fsdp2.test_cpu_offload_grad_scaling import _check_scaling
 
 torch.set_num_threads(1)
 runtime = get_device_runtime()
@@ -92,7 +92,7 @@ _check_scaling(runtime, torch.float32, False, shapes, repeats=10)
 """
     result = subprocess.run(
         [sys.executable, "-c", script, str(accelerator.current_device())],
-        cwd=Path(__file__).resolve().parents[4],
+        cwd=Path(__file__).resolve().parents[5],
         capture_output=True,
         text=True,
         timeout=180,

@@ -12,7 +12,7 @@ pytestmark = pytest.mark.cpu
 
 
 def _launcher_module():
-    path = Path(__file__).parents[3] / "scripts" / "runs" / "run_swift.py"
+    path = Path(__file__).parents[4] / "scripts" / "runs" / "run_swift.py"
     spec = importlib.util.spec_from_file_location("torchturbo_test_run_swift", path)
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None

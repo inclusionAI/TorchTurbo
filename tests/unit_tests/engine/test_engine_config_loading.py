@@ -859,7 +859,7 @@ def test_file_op_overrides_are_applied(tmp_path):
 
 
 def test_config_example_loads():
-    path = Path(__file__).parents[2] / "scripts" / "runs" / "config_example.yaml"
+    path = Path(__file__).parents[3] / "scripts" / "runs" / "config_example.yaml"
 
     cfg = _build_from_argv(["--tt_config", str(path)])
 

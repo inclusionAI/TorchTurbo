@@ -10,7 +10,7 @@ import transformers.integrations.flash_attention as flash_integration
 import transformers.modeling_flash_attention_utils as flash_utils
 import transformers.modeling_utils as hf_modeling
 
-from tests.engine.test_core import DummyBackend
+from tests.unit_tests.engine.test_core import DummyBackend
 from torchturbo.adapters.llamafactory_v0.patches import CreateRefModelPatch
 from torchturbo.adapters.llamafactory_v0.trainer import TorchTurboDPOTrainer
 from torchturbo.engine import EngineConfig, TorchTurboEngine

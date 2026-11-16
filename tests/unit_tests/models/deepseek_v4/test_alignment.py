@@ -32,8 +32,8 @@ except ModuleNotFoundError:
 
 os.environ.setdefault("TORCH_TURBO_DISABLE", "1")
 
-# __file__ = <repo>/tests/models/deepseek_v4/test_alignment.py
-REPO_ROOT = Path(__file__).resolve().parents[3]
+# __file__ = <repo>/tests/unit_tests/models/deepseek_v4/test_alignment.py
+REPO_ROOT = Path(__file__).resolve().parents[4]
 SRC_ROOT = REPO_ROOT / "src"
 INFER_REFERENCE_DIR = Path(__file__).resolve().parent / "inference"
 for path in (SRC_ROOT, REPO_ROOT):

@@ -34,7 +34,7 @@ except ModuleNotFoundError:
 
 os.environ.setdefault("TORCH_TURBO_DISABLE", "1")
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
+REPO_ROOT = Path(__file__).resolve().parents[4]
 SRC_ROOT = REPO_ROOT / "src"
 INFER_REFERENCE_DIR = Path(__file__).resolve().parent / "inference"
 for path in (SRC_ROOT, REPO_ROOT):

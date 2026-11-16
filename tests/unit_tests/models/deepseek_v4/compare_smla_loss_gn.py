@@ -30,7 +30,7 @@ from pathlib import Path
 
 import torch
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
+REPO_ROOT = Path(__file__).resolve().parents[4]
 SRC_ROOT = REPO_ROOT / "src"
 for _path in (SRC_ROOT, REPO_ROOT):
     if str(_path) not in sys.path:

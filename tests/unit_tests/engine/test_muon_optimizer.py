@@ -3318,7 +3318,7 @@ def test_kimi_recipe_annotates_only_special_parameters():
 
 def _load_kimi_recipe_module():
     recipe_path = (
-        Path(__file__).parents[2]
+        Path(__file__).parents[3]
         / "src"
         / "torchturbo"
         / "models"

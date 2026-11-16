@@ -27,7 +27,7 @@ def _package():
     name = "_torchturbo_cpu_resident_under_test"
     if name not in sys.modules:
         path = (
-            Path(__file__).resolve().parents[3]
+            Path(__file__).resolve().parents[4]
             / "src/torchturbo/models/modules/cpu_resident/__init__.py"
         )
         spec = importlib.util.spec_from_file_location(name, path)
