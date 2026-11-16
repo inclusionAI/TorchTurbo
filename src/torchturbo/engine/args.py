@@ -157,8 +157,6 @@ class TorchTurboArgs:
         or every training checkpoint. Defaults to every checkpoint.
     log_level:
         TorchTurbo log level. Defaults to ``LogLevel.INFO``.
-    swift_packing_max_sequences:
-        Optional backend limit for Swift-packed sequences before the cu_seq_lens boundary adjustment.
     """
 
     backend: str | None = None
@@ -195,7 +193,6 @@ class TorchTurboArgs:
     profiling: bool = False
     memory_snapshot_steps: int | None = None
     log_level: LogLevel = LogLevel.INFO
-    swift_packing_max_sequences: int | None = None
 
     # Block-diffusion (BD) fields — threaded into EngineConfig.diffusion by
     # build_config_from_lf_args(); only active for is_diffusion_model models.
@@ -666,16 +663,6 @@ _TURBO_ARG_SPECS: tuple[TurboArgSpec, ...] = (
         help="Number of optimizer steps to capture from training step 0. For "
         "example, 3 captures the first 3 optimizer steps. Outputs to "
         "{output_dir}/memory_snapshot/.",
-    ),
-    TurboArgSpec(
-        name="swift_packing_max_sequences",
-        args_name="swift_packing_max_sequences",
-        cli_name="--tt_swift_packing_max_sequences",
-        type=int,
-        metavar="N",
-        help="Backend limit for Swift-packed sequences per row; "
-        "one fewer sample is packed to include the cu_seq_lens boundary. "
-        "Unset disables the cap.",
     ),
     TurboArgSpec(
         name="log_level",

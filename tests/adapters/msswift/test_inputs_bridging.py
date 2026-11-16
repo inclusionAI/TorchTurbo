@@ -3,8 +3,7 @@
 from __future__ import annotations
 
 import os
-import sys
-from types import ModuleType, SimpleNamespace
+from types import SimpleNamespace
 
 import pytest
 
@@ -18,9 +17,6 @@ from torchturbo.adapters.msswift.inputs_bridging import (  # noqa: E402
     bridge_packed_inputs,
     bridge_swift_inputs,
 )
-from torchturbo.adapters.msswift import utils as msswift_utils  # noqa: E402
-from torchturbo.adapters.msswift.utils import apply_swift_packing_limit_patch  # noqa: E402
-from torchturbo.engine.args import TorchTurboArgs  # noqa: E402
 
 
 def _t(values):
@@ -154,66 +150,6 @@ def test_rejects_native_cu_with_different_sample_boundaries():
     inputs["cu_seq_lens_q"] = _t([0, 3, 5]).int()
     with pytest.raises(ValueError, match="original Swift sample boundaries"):
         bridge_packed_inputs(inputs, sequence_lengths=[2, 3])
-
-
-def _use_swift_packing_max(monkeypatch, value):
-    monkeypatch.setattr(
-        msswift_utils,
-        "get_torchturbo_args",
-        lambda: TorchTurboArgs(swift_packing_max_sequences=value),
-    )
-
-
-@pytest.mark.parametrize("value", [None, 0])
-def test_apply_swift_packing_limit_patch_passes_through_disabled_values(
-    monkeypatch, value
-):
-    _use_swift_packing_max(monkeypatch, value)
-
-    def original(sequences, packing_length, is_finished=True, strategy="binpack"):
-        return [["a", "b"]], []
-
-    swift = ModuleType("swift")
-    swift_dataset = ModuleType("swift.dataset")
-    swift_packaging = ModuleType("swift.dataset.packing")
-    swift_packaging.calculate_matched_group = original
-    swift.dataset = swift_dataset
-    swift_dataset.packing = swift_packaging
-    monkeypatch.setitem(sys.modules, "swift", swift)
-    monkeypatch.setitem(sys.modules, "swift.dataset", swift_dataset)
-    monkeypatch.setitem(sys.modules, "swift.dataset.packing", swift_packaging)
-
-    apply_swift_packing_limit_patch()
-
-    assert swift_packaging.calculate_matched_group([], 16) == ([["a", "b"]], [])
-
-
-def test_apply_swift_packing_limit_patch_caps_groups_and_pending(monkeypatch):
-    _use_swift_packing_max(monkeypatch, 4)
-
-    def original(sequences, packing_length, is_finished=True, strategy="binpack"):
-        return [["a", "b", "c", "d"], ["e", "f"]], ["g", "h", "i", "j"]
-
-    swift = ModuleType("swift")
-    swift_dataset = ModuleType("swift.dataset")
-    swift_packaging = ModuleType("swift.dataset.packing")
-    swift_packaging.calculate_matched_group = original
-    swift.dataset = swift_dataset
-    swift_dataset.packing = swift_packaging
-    monkeypatch.setitem(sys.modules, "swift", swift)
-    monkeypatch.setitem(sys.modules, "swift.dataset", swift_dataset)
-    monkeypatch.setitem(sys.modules, "swift.dataset.packing", swift_packaging)
-
-    apply_swift_packing_limit_patch()
-    assert swift_packaging.calculate_matched_group._torchturbo_packing_limit_patched is True
-
-    groups, pending = swift_packaging.calculate_matched_group([], 16, is_finished=False)
-    assert groups == [["a", "b", "c"], ["d"], ["e", "f"], ["g", "h", "i"]]
-    assert pending == ["j"]
-
-    groups, pending = swift_packaging.calculate_matched_group([], 16, is_finished=True)
-    assert groups == [["a", "b", "c"], ["d"], ["e", "f"], ["g", "h", "i"], ["j"]]
-    assert pending == []
 
 
 def test_packed_sample_starts_are_unsupervised():

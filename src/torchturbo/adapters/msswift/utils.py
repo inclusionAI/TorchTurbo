@@ -8,8 +8,6 @@ the launcher via :func:`set_torchturbo_args`).
 
 from __future__ import annotations
 
-from collections.abc import Sequence
-from functools import wraps
 from typing import Any
 
 from ...engine.config import EngineConfig, build_from_args
@@ -61,53 +59,6 @@ def build_config_from_swift_args(args: Any) -> EngineConfig:
         tt.moe_aux_loss_coeff = args.router_aux_loss_coef
 
     return build_from_args(tt)
-
-
-def apply_swift_packing_limit_patch() -> None:
-    """Patch ms-swift packing to honor the optional per-pack sequence cap."""
-    from swift.dataset import packing as swift_packing
-
-    original = swift_packing.calculate_matched_group
-    if getattr(original, "_torchturbo_packing_limit_patched", False):
-        return
-
-    @wraps(original)
-    def wrapped(
-        sequences,
-        packing_length: int,
-        is_finished: bool = True,
-        strategy: str = "binpack",
-    ) -> tuple[list[list[Any]], list[Any]]:
-        groups, pending = original(
-            sequences,
-            packing_length,
-            is_finished=is_finished,
-            strategy=strategy,
-        )
-        sequence_limit = getattr(
-            get_torchturbo_args(),
-            "swift_packing_max_sequences",
-            None,
-        )
-        if sequence_limit is None or sequence_limit <= 0:
-            return groups, pending
-
-        # cu_seq_lens always adds one leading boundary entry to the sample count.
-        sample_limit = sequence_limit - 1
-
-        def _chunk(items: Sequence[Any]) -> list[list[Any]]:
-            return [list(items[i:i + sample_limit]) for i in range(0, len(items), sample_limit)]
-
-        capped_groups = [chunk for group in groups for chunk in _chunk(group)]
-        pending_chunks = _chunk(pending)
-
-        if is_finished:
-            return capped_groups + pending_chunks, []
-        return capped_groups + pending_chunks[:-1], pending_chunks[-1] if pending_chunks else []
-
-    wrapped._torchturbo_packing_limit_patched = True
-    swift_packing.calculate_matched_group = wrapped
-    logger.info_rank0("ms-swift packing limit patch installed")
 
 
 def build_lora_config_from_swift_args(args: Any) -> Any | None:
