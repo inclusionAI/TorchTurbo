@@ -19,6 +19,11 @@ from torchturbo.models.qwen3_5 import modeling_qwen3_5 as dense
 from torchturbo.models.qwen3_5_moe import modeling_qwen3_5_moe as moe
 from torchturbo.ops.dispatcher import OpDispatcher
 from torchturbo.runtime.cpu import CpuRuntime
+from tests.support.distributed import destroy_process_group
+
+
+pytestmark = pytest.mark.cpu
+
 
 
 def _cpu_dispatch(op_name, *args, packed_params=None, **kwargs):
@@ -208,7 +213,7 @@ def _worker(rank, init_file):
     try:
         _run_cases(dist.group.WORLD)
     finally:
-        dist.destroy_process_group()
+        destroy_process_group()
 
 
 def test_gdn_sp1_matches_independent_packed_samples():

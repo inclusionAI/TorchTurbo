@@ -23,12 +23,16 @@ from torchturbo.models.modules.moe.moe_layer import MoELayer, MoESubmodules
 from torchturbo.models.modules.moe.moe_utils import MoEAuxLossAutoScaler
 from torchturbo.ops import OpPolicy, get_or_create_ops
 from torchturbo.runtime.cpu import CpuRuntime
+from tests.support.distributed import destroy_process_group
 
 from .test_packed_inputs import (
     _make_model,
     _parallelize,
     restore_attention_forwards,
 )
+
+
+pytestmark = pytest.mark.cpu
 
 
 def _make_mtp_model(block_size=0, num_stages=2):
@@ -437,7 +441,7 @@ def test_dspark_placeholder_blocks_do_not_train_router(
         assert ("aux_loss" in metrics) == (aux_coeff > 0)
         assert ("z_loss" in metrics) == (z_coeff > 0)
     finally:
-        dist.destroy_process_group()
+        destroy_process_group()
 
 
 def _dspark_sp_worker(rank, init_file, block_size, window):
@@ -487,7 +491,7 @@ def _dspark_sp_worker(rank, init_file, block_size, window):
             dist.all_reduce(grad)
             torch.testing.assert_close(grad / 2, reference_grad, atol=1e-6, rtol=1e-5)
     finally:
-        dist.destroy_process_group()
+        destroy_process_group()
 
 
 @pytest.mark.skipif(not dist.is_gloo_available(), reason="Gloo is required")

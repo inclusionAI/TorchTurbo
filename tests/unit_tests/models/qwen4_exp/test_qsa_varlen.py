@@ -59,6 +59,7 @@ def _inputs(batch_size, key_length, dtype, padding_only, head_dim):
     return inputs, ids
 
 
+@pytest.mark.cpu
 @pytest.mark.parametrize("checkpoint_mode", [None, False, True])
 @pytest.mark.parametrize("padding_only", [False, True])
 @pytest.mark.parametrize("batch_size", [1, 2])
@@ -98,6 +99,7 @@ def test_varlen_chunks_preserve_selection_and_independent_gradients(
         assert len(calls) >= 3
 
 
+@pytest.mark.npu
 @pytest.mark.skipif(
     os.getenv("TORCH_TURBO_TEST_QSA_VARLEN_NPU") != "1", reason="opt-in native NPU"
 )

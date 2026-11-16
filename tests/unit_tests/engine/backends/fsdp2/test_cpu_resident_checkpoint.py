@@ -33,6 +33,11 @@ from torchturbo.models.modules.cpu_resident import NodeSharedCPUResidentParamete
 from torchturbo.models.qwen4_exp.model import Qwen4ExpWeightConverter
 from torchturbo.models.qwen4_exp.ple import NGramEmbedding
 from torchturbo.runtime.cpu import CpuRuntime
+from tests.support.distributed import destroy_process_group
+
+
+pytestmark = pytest.mark.cpu
+
 
 
 class ResidentModel(nn.Module):
@@ -301,7 +306,7 @@ def _worker(rank, world_size, root):
             loader.load_weights()
         dist.barrier()
     finally:
-        dist.destroy_process_group()
+        destroy_process_group()
 
 
 @pytest.mark.parametrize("world_size", [2, 4])
@@ -321,7 +326,7 @@ def checkpoint_group(tmp_path, monkeypatch):
     try:
         yield init_device_mesh("cpu", (1,), mesh_dim_names=("edp",))
     finally:
-        dist.destroy_process_group()
+        destroy_process_group()
         NodeSharedCPUResidentParameter._node_group = None
 
 
@@ -413,7 +418,7 @@ def _cpu_export_metadata_failure_worker(rank, root):
             result = {"type": None, "message": "Export accepted missing source metadata"}
         (root / f"metadata-result-{rank}.json").write_text(json.dumps(result))
     finally:
-        dist.destroy_process_group()
+        destroy_process_group()
 
 
 def test_cpu_export_metadata_failure_reaches_every_rank(tmp_path):

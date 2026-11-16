@@ -17,6 +17,10 @@ from torchturbo.models.modules.attention.ulysses import (
 from torchturbo.utils.flash_attn_utils import get_unpad_data
 
 
+pytestmark = pytest.mark.cpu
+
+
+
 def test_kimi_fa2_integer_mask_produces_packed_boundaries():
     attention_mask = torch.tensor([[1, 1, 2, 2, 2, 0, 0, 0]])
 

@@ -16,11 +16,18 @@ from torchturbo.adapters.llamafactory_v0.trainer import TorchTurboDPOTrainer
 from torchturbo.engine import EngineConfig, TorchTurboEngine
 from torchturbo.engine.backends.fsdp2.backend import FSDP2Backend
 from torchturbo.engine.backends.fsdp2.config import FSDPConfig
+from torchturbo.engine.plugins import PluginManager
 from torchturbo.models.qwen4_exp import ple
 from torchturbo.models.qwen4_exp.model import TurboQwen4ExpForConditionalGeneration
 from torchturbo.runtime.cpu import CpuRuntime
 
 from .test_model import _patch_cpu_qsa, _small_config
+
+
+pytestmark = [
+    pytest.mark.cpu,
+]
+
 
 
 @pytest.fixture
@@ -53,6 +60,7 @@ def cpu_engine(monkeypatch, node_group):
     engine.backend.materialize = materializer.materialize
     engine.parallel_plan = None
     engine._checkpoint = None
+    engine.plugin_manager = PluginManager()
     return engine
 
 

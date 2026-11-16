@@ -16,6 +16,10 @@ from torchturbo.ops.dispatcher import OpDispatcher
 from torchturbo.runtime.cpu import CpuRuntime
 
 
+pytestmark = pytest.mark.cpu
+
+
+
 @pytest.mark.parametrize(
     "model_cls",
     [TurboQwen3_5ForConditionalGeneration, TurboQwen3_5MoeForConditionalGeneration],

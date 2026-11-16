@@ -8,6 +8,10 @@ import torch
 from torchturbo.models.weight_converter import BaseWeightConverter
 
 
+pytestmark = pytest.mark.cpu
+
+
+
 SOURCE = "model.language_model.embed_tokens.weight"
 TARGET = "lm_head.weight"
 

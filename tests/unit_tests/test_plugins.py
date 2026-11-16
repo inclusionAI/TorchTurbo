@@ -10,6 +10,10 @@ import types
 
 import pytest
 
+
+pytestmark = pytest.mark.cpu
+
+
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _PLUGINS_PATH = os.path.join(_REPO_ROOT, "src", "torchturbo", "engine", "plugins.py")
 

@@ -47,6 +47,10 @@ from torchturbo.parallel import (
 )
 
 
+pytestmark = pytest.mark.cpu
+
+
+
 @pytest.fixture(autouse=True)
 def _isolate_env(monkeypatch):
     """Keep every test hermetic against real ``TORCH_TURBO_*`` env vars."""

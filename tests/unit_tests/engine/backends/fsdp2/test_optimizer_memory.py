@@ -31,6 +31,10 @@ from torchturbo.runtime import get_device_runtime
 from torchturbo.runtime.cpu import CpuRuntime
 
 
+pytestmark = pytest.mark.cpu
+
+
+
 class _MpsMemoryRuntime(CpuRuntime):
     """Exercise actual host/device copies on developer Macs, without FSDP/MPS."""
 

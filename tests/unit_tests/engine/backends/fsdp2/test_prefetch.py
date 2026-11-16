@@ -25,6 +25,10 @@ from torchturbo.engine.backends.fsdp2.config import (
 )
 
 
+pytestmark = pytest.mark.cpu
+
+
+
 # ---------------------------------------------------------------------------
 # Fakes standing in for FSDP-wrapped modules / MoELayer
 # ---------------------------------------------------------------------------

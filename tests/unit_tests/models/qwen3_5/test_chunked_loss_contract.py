@@ -11,6 +11,11 @@ from torchturbo.models.qwen3_5.modeling_qwen3_5 import (
     Qwen3_5ForConditionalGeneration,
     Qwen3_5ModelOutputWithPast,
 )
+import pytest
+
+
+pytestmark = pytest.mark.cpu
+
 
 
 class _Backbone(nn.Module):

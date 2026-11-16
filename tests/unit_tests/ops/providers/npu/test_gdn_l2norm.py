@@ -6,6 +6,8 @@ import torch
 pytest.importorskip("torch_npu")
 pytest.importorskip("fla_npu")
 
+pytestmark = [pytest.mark.npu]
+
 from fla_npu.ops.triton import l2norm_bwd as upstream_bwd
 from fla_npu.ops.triton import l2norm_fwd as upstream_fwd
 from triton.runtime.jit import JITFunction

@@ -21,6 +21,10 @@ from torchturbo.models.qwen3_5.model import TurboQwen3_5ForConditionalGeneration
 from torchturbo.models.qwen3_5.modeling_qwen3_5 import Qwen3_5VisionModel
 from torchturbo.models.qwen3_5.vision_balance import Qwen3_5VisionBalanceIO
 from torchturbo.parallel import VisionBalanceMode, VisionBalanceSpec
+from tests.support.distributed import destroy_process_group
+
+
+pytestmark = pytest.mark.cpu
 
 
 def _tower():
@@ -207,7 +211,7 @@ def _distributed_round_trip(rank, init_file, world_size, sp_size):
                     assert observed[-1] == pixels.size(0)
                     torch.testing.assert_close(local.pooler_output, expected.pooler_output)
     finally:
-        dist.destroy_process_group()
+        destroy_process_group()
 
 
 @pytest.mark.parametrize("world_size, sp_size", [(2, 1), (2, 2), (4, 2), (8, 8)])

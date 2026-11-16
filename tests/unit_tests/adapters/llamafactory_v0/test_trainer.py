@@ -15,6 +15,10 @@ from torchturbo.adapters.llamafactory_v0.trainer import (
 )
 
 
+pytestmark = pytest.mark.cpu
+
+
+
 @pytest.mark.parametrize("sp_rank", [0, 1])
 @pytest.mark.parametrize("explicit_positions", [False, True])
 def test_dpo_leaves_padded_inputs_global_for_model_slicing(

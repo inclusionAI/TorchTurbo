@@ -6,6 +6,10 @@ import torch
 from torchturbo.models.glm_moe_dsa.modeling_glm_moe_dsa import GlmMoeDsaModel
 
 
+pytestmark = pytest.mark.cpu
+
+
+
 @pytest.mark.parametrize(("sp_size", "local_length"), [(1, 5), (1, 6), (2, 3), (3, 2)])
 def test_indexer_receives_global_packed_boundaries(sp_size, local_length):
     captured = []

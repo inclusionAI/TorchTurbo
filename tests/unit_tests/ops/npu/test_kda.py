@@ -12,6 +12,8 @@ from __future__ import annotations
 import pytest
 import torch
 
+pytestmark = pytest.mark.npu
+
 pytest.importorskip("fla_npu")
 
 from torchturbo.ops import OpPolicy, get_or_create_ops  # noqa: E402

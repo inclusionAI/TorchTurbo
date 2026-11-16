@@ -14,6 +14,10 @@ from torchturbo.engine.backends.fsdp2.backend import FSDP2Backend
 from torchturbo.runtime import DeviceRuntime, TurboDevice, get_device_runtime
 
 
+pytestmark = pytest.mark.cpu
+
+
+
 @pytest.fixture
 def accelerator() -> DeviceRuntime:
     runtime = get_device_runtime()

@@ -17,6 +17,11 @@ from torch import nn
 from torch.distributed.checkpoint.state_dict import get_optimizer_state_dict
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import DTensor, Shard, distribute_tensor
+from tests.support.distributed import destroy_process_group
+
+
+pytestmark = pytest.mark.cpu
+
 
 
 _HAS_GLOO = dist.is_available() and dist.is_gloo_available()
@@ -206,7 +211,7 @@ def _run_ep_checkpoint_test(
             trained, optimizer, None, checkpoint_dir
         )
     finally:
-        dist.destroy_process_group()
+        destroy_process_group()
 
 
 @pytest.mark.skipif(
@@ -261,7 +266,7 @@ def _run_shard_read_failure_test(
         with pytest.raises(OSError, match="rank-local shard read failure"):
             loader.load_weights()
     finally:
-        dist.destroy_process_group()
+        destroy_process_group()
 
 
 @pytest.mark.skipif(

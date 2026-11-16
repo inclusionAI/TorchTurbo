@@ -9,6 +9,10 @@ import pytest
 import torch
 
 
+pytestmark = pytest.mark.cpu
+
+
+
 @pytest.mark.parametrize("padding_side", ["left", "right"])
 @pytest.mark.parametrize("packing", ["unpacked", "ordinary", "ordinary_batched"])
 def test_native_image_training_keeps_mrope(tmp_path, padding_side, packing):

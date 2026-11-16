@@ -14,6 +14,11 @@ import pytest
 from torchturbo.engine.checkpoint import CheckpointFormat
 import torchturbo.engine as engine_module
 import torchturbo.engine.args as args_module
+from tests.support.distributed import destroy_process_group
+
+
+pytestmark = pytest.mark.cpu
+
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -384,7 +389,7 @@ def test_export_round_trip_with_saved_configuration(tmp_path, monkeypatch, use_d
         assert json.loads((source / "config.json").read_text())["n_positions"] == 1024
     finally:
         if dist.is_initialized():
-            dist.destroy_process_group()
+            destroy_process_group()
 
 
 def test_export_restores_structural_settings_and_rejects_ep_override():

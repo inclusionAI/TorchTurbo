@@ -20,6 +20,7 @@ def _install_fake_torch_npu(
     monkeypatch.setitem(sys.modules, "torch_npu", torch_npu)
 
 
+@pytest.mark.cpu
 @pytest.mark.parametrize("shape", [(1,), (2, 1)])
 def test_npu_cross_entropy_preserves_unreduced_shape(monkeypatch, shape):
     expected = torch.ones(shape)
@@ -34,6 +35,7 @@ def test_npu_cross_entropy_preserves_unreduced_shape(monkeypatch, shape):
     assert actual.shape == expected.shape
 
 
+@pytest.mark.cpu
 @pytest.mark.parametrize("reduction", ["sum", "mean"])
 def test_npu_cross_entropy_scalarizes_reduced_loss(monkeypatch, reduction):
     _install_fake_torch_npu(monkeypatch, lambda *args, **kwargs: torch.ones(1))
@@ -55,6 +57,7 @@ def _precision_inputs(dtype):
     return logits, labels
 
 
+@pytest.mark.cpu
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 def test_npu_cross_entropy_matches_float32_loss_and_gradients(monkeypatch, dtype):
     # CPU CE preserves its input dtype outside autocast, exposing premature
@@ -79,6 +82,7 @@ def test_npu_cross_entropy_matches_float32_loss_and_gradients(monkeypatch, dtype
     assert torch.count_nonzero(actual_grad[labels == -100]) == 0
 
 
+@pytest.mark.npu
 @pytest.mark.skipif(
     os.environ.get("TORCH_TURBO_TEST_NPU_CROSS_ENTROPY") != "1",
     reason="opt-in native NPU cross-entropy forward/backward",

@@ -15,6 +15,12 @@ from .test_model import _token_ids_to_mask
 from .test_qsa_attention import _cpu_varlen_kernel, _flash_kwargs
 
 
+pytestmark = [
+    pytest.mark.cpu,
+]
+
+
+
 @pytest.mark.parametrize("heads_per_kv", [1, 4, 12])
 @pytest.mark.parametrize("padding_only", [False, True])
 @pytest.mark.parametrize("batch_size", [1, 2])

@@ -13,6 +13,10 @@ from torchturbo.models.base import TurboModel
 from torchturbo.utils.flash_attn_utils import cu_seqlens_to_segment_ids
 
 
+pytestmark = pytest.mark.cpu
+
+
+
 class _NoScalarReads(TorchDispatchMode):
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):
         assert func != torch.ops.aten._local_scalar_dense.default

@@ -18,6 +18,12 @@ from torchturbo.models.qwen4_exp.model import TurboQwen4ExpForConditionalGenerat
 from .test_model import _small_config
 
 
+pytestmark = [
+    pytest.mark.cpu,
+]
+
+
+
 def _cpu_flash(query, key, value, attention_mask, query_length, is_causal, **kwargs):
     outputs = []
     cu_q, cu_k = kwargs["cu_seq_lens_q"], kwargs["cu_seq_lens_k"]

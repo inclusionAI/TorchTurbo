@@ -1,0 +1,15 @@
+# Python packages the CI lint step needs before it can run.
+#
+# Only two tools must be installed up front: ruff has no self-bootstrapping path
+# (its platform wheel must match the interpreter), and PyYAML cannot be bundled.
+# shellcheck, actionlint, and hadolint download themselves into
+# TORCHTURBO_LINT_TOOLS (default /tmp/torchturbo-lint-tools).
+#
+# This file is the single source of truth for those versions. Neither
+# `.github/workflows/ci-pr.yml` nor the lint modules repeat them.
+#
+#     python3 -m pip install -r requirements-lint.txt
+#     python3 scripts/ci/lint_select/lint_check.py
+
+ruff==0.6.9
+PyYAML==6.0.3

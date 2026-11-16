@@ -22,6 +22,10 @@ from torchturbo.engine.optimizers.lr_scheduler import create_lr_scheduler
 from torchturbo.runtime.cpu import CpuRuntime
 
 
+pytestmark = pytest.mark.cpu
+
+
+
 class RecordingLogger:
     def __init__(self):
         self.warnings = []

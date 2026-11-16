@@ -7,6 +7,8 @@ from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeRMSNorm
 
 pytest.importorskip("torch_npu")
 
+pytestmark = [pytest.mark.npu]
+
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_npu_rms_norm(dtype: torch.dtype) -> None:

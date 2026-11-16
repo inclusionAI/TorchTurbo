@@ -12,6 +12,10 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from torchturbo.models.modules.comm.comm import all_to_all
+from tests.support.distributed import destroy_process_group
+
+
+pytestmark = pytest.mark.cpu
 
 
 def _counts(world: int, case: str) -> list[list[int]]:
@@ -121,7 +125,7 @@ def _distributed_exchange(rank: int, init_file: str, world: int, backend: str) -
                     )
                     assert send == send_before and recv == recv_before
     finally:
-        dist.destroy_process_group()
+        destroy_process_group()
 
 
 @pytest.mark.parametrize(
@@ -176,4 +180,4 @@ def test_single_rank_empty_exchange_preserves_gradient(tmp_path: Path) -> None:
         result.sum().backward()
         assert rows.grad is not None and rows.grad.shape == rows.shape
     finally:
-        dist.destroy_process_group()
+        destroy_process_group()

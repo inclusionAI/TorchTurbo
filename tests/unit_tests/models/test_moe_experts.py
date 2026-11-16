@@ -16,6 +16,9 @@ from torchturbo.runtime.cpu import CpuRuntime
 from torchturbo.runtime.cuda import CudaRuntime
 
 
+pytestmark = pytest.mark.cpu
+
+
 class _CpuGroupedLinear(nn.Module):
     """CPU substitute for TE's separate expert weights and split-based linear API."""
 

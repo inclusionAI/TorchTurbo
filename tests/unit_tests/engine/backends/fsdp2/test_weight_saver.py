@@ -24,6 +24,11 @@ from torchturbo.models.qwen3_5_moe.configuration_qwen3_5_moe import (
     Qwen3_5MoeConfig,
     Qwen3_5MoeTextConfig,
 )
+from tests.support.distributed import destroy_process_group
+
+
+pytestmark = pytest.mark.cpu
+
 
 
 def _disable_mtp(config):
@@ -136,7 +141,7 @@ def test_hf_export_copies_the_source_config(tmp_path):
     try:
         saver.save_hf({}, export)
     finally:
-        dist.destroy_process_group()
+        destroy_process_group()
 
     expected = json.loads((source / "config.json").read_text())
     expected["num_nextn_predict_layers"] = 0

@@ -12,6 +12,10 @@ from torchturbo.engine.optimizers import MuonPlan, MuonRecipe, OptimizersContain
 from torchturbo.engine.optimizers.lr_scheduler import create_lr_scheduler
 
 
+pytestmark = pytest.mark.cpu
+
+
+
 def _make_optimizer(learning_rates=(2.5e-5, 1e-5)):
     model = torch.nn.Linear(2, 2)
     plan = MuonPlan(

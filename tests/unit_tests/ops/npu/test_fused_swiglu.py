@@ -6,6 +6,8 @@ import torch.nn.functional as F
 
 pytest.importorskip("torch_npu")
 
+pytestmark = [pytest.mark.npu]
+
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_npu_swiglu(dtype: torch.dtype) -> None:

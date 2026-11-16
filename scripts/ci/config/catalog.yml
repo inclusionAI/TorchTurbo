@@ -1,0 +1,202 @@
+schema_version: 1
+
+resources:
+  images:
+    cpu-default:
+      device: cpu
+      kind: host
+      ref: python:3.11
+      default: true
+    npu-default:
+      device: npu
+      kind: container
+      ref: swr.cn-north-12.myhuaweicloud.com/ascend/torchturbo_npu:base-latest
+      default: true
+
+  venvs:
+    default:
+      python: "3.11"
+      requirements: [scripts/ci/config/envs/default.txt]
+      constraints: auto
+    qwen4_exp:
+      python: "3.11"
+      requirements: [scripts/ci/config/envs/qwen4_exp.txt]
+      constraints: auto
+    lf:
+      python: "3.11"
+      requirements: [scripts/ci/config/envs/lf.txt]
+      constraints: auto
+    swift:
+      python: "3.11"
+      requirements: [scripts/ci/config/envs/swift.txt]
+      overrides: [scripts/ci/config/envs/swift_overrides.txt]
+      constraints: auto
+    qwen4_exp_swift:
+      python: "3.11"
+      extends: swift
+      constraints: auto
+
+  lanes:
+    cpu/default:
+      device: cpu
+      image: cpu-default
+      capacity_slots: 8
+      runner_variable: CI_CPU_RUNNER
+      runner: ubuntu-22.04-arm
+    npu/default-2:
+      device: npu
+      image: npu-default
+      capacity_slots: 2
+      runner_variable: CI_NPU_2_RUNNER
+      runner: linux-aarch64-a3-800i-2
+    npu/default-4:
+      device: npu
+      image: npu-default
+      capacity_slots: 4
+      runner_variable: CI_NPU_4_RUNNER
+      runner: linux-aarch64-a3-800i-4
+    npu/default-8:
+      device: npu
+      image: npu-default
+      capacity_slots: 8
+      runner_variable: CI_NPU_8_RUNNER
+      runner: linux-aarch64-a3-800i-8
+    npu/default-16:
+      device: npu
+      image: npu-default
+      capacity_slots: 16
+      runner_variable: CI_NPU_16_RUNNER
+      runner: linux-aarch64-a3-800i-16
+
+workloads:
+  pytest:
+    defaults:
+      job_timeout_minutes: {cpu: 40, npu: 360, gpu: 360}
+      step_timeout_seconds: {cpu: 2400, npu: 21600, gpu: 21600}
+    model_venvs:
+      qwen4_exp: qwen4_exp
+    framework_venvs:
+      lf: lf
+      swift: swift
+    combo_venvs:
+      qwen4_exp+swift: qwen4_exp_swift
+    overrides:
+      tests/unit_tests/models/bailing_moe_v3_vl/test_lf_image_parity.py:
+        venv: lf
+
+  model_e2e:
+    defaults:
+      job_timeout_minutes: 360
+      fetch_timeout: 1800
+      case_timeout: 7200
+      seq_len: 4096
+      finetuning_type: full
+    models:
+      qwen3_5:
+        run_dir: qwen3_5_dense
+        cases:
+          - id: qwen3_5-lf-text-sft
+            framework: lf
+            venv: lf
+            install: install_lf_deps.sh
+            train: lf_text_sft.sh
+            download: {hf_repo: Qwen/Qwen3.5-2B, layers: 0}
+            dataset: gsm8k
+            ranks: 8
+            parallelism: {sp: 2, ep: 1}
+      qwen3_5_moe:
+        run_dir: qwen3_5_moe
+        cases:
+          - id: qwen3_5_moe-lf-text-sft
+            framework: lf
+            venv: lf
+            install: install_lf_deps.sh
+            train: lf_text_sft.sh
+            download: {hf_repo: Qwen/Qwen3.5-35B-A3B, layers: 4}
+            dataset: gsm8k
+            ranks: 8
+            parallelism: {sp: 2, ep: 4}
+          - id: qwen3_5_moe-swift-mllm-sft
+            framework: swift
+            venv: swift
+            install: install_swift_deps.sh
+            train: swift_mllm_sft.sh
+            download: {hf_repo: Qwen/Qwen3.5-35B-A3B, layers: 4}
+            dataset: "BUAADreamer/llava-en-zh-2k#zh"
+            ranks: 8
+            parallelism: {sp: 2, ep: 4}
+          - id: qwen3_5_moe-swift-text-dpo
+            framework: swift
+            venv: swift
+            install: install_swift_deps.sh
+            train: swift_text_dpo.sh
+            download: {hf_repo: Qwen/Qwen3.5-35B-A3B, layers: 4}
+            dataset: "/datasets/orca_dpo_pairs/swift_orca_rlhf.jsonl"
+            ranks: 8
+            parallelism: {sp: 2, ep: 4}
+      bailing_hybrid:
+        run_dir: bailing_v3
+        cases:
+          - id: bailing_hybrid-lf-sft
+            framework: lf
+            venv: lf
+            install: install_lf_deps.sh
+            train: lf_sft.sh
+            download: {hf_repo: inclusionAI/Ling-3.0-tiny, layers: 0}
+            dataset: gsm8k
+            ranks: 8
+            parallelism: {sp: 2, ep: 4}
+          - id: bailing_hybrid-lf-flash-sft
+            framework: lf
+            venv: lf
+            install: install_lf_deps.sh
+            train: lf_sft.sh
+            download: {hf_repo: inclusionAI/Ling-3.0-flash, layers: 6}
+            dataset: gsm8k
+            ranks: 8
+            parallelism: {sp: 2, ep: 4}
+          - id: bailing_hybrid-lf-pt
+            framework: lf
+            venv: lf
+            install: install_lf_deps.sh
+            train: lf_pt.sh
+            download: {hf_repo: inclusionAI/Ling-3.0-tiny, layers: 0}
+            dataset: wikipedia_en
+            ranks: 8
+            parallelism: {sp: 2, ep: 4}
+          - id: bailing_hybrid-lf-dpo
+            framework: lf
+            venv: lf
+            install: install_lf_deps.sh
+            train: lf_dpo.sh
+            download: {hf_repo: inclusionAI/Ling-3.0-tiny, layers: 0}
+            dataset: orca_rlhf
+            ranks: 8
+            parallelism: {sp: 2, ep: 4}
+          - id: bailing_hybrid-swift-sft
+            framework: swift
+            venv: swift
+            install: install_swift_deps.sh
+            train: swift_sft.sh
+            download: {hf_repo: inclusionAI/Ling-3.0-tiny, layers: 0}
+            dataset: "/datasets/AM-Thinking-v1-Distilled/science.jsonl"
+            ranks: 8
+            parallelism: {sp: 2, ep: 4}
+          - id: bailing_hybrid-swift-pt
+            framework: swift
+            venv: swift
+            install: install_swift_deps.sh
+            train: swift_pt.sh
+            download: {hf_repo: inclusionAI/Ling-3.0-tiny, layers: 0}
+            dataset: "/datasets/olm-wikipedia-20221220/data"
+            ranks: 8
+            parallelism: {sp: 2, ep: 4}
+          - id: bailing_hybrid-swift-dpo
+            framework: swift
+            venv: swift
+            install: install_swift_deps.sh
+            train: swift_dpo.sh
+            download: {hf_repo: inclusionAI/Ling-3.0-tiny, layers: 0}
+            dataset: "/datasets/orca_dpo_pairs/swift_orca_rlhf.jsonl"
+            ranks: 8
+            parallelism: {sp: 2, ep: 4}

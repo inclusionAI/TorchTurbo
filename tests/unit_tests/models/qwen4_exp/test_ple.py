@@ -17,6 +17,12 @@ from torchturbo.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpTextPLELayer
 from torchturbo.utils.flash_attn_utils import cu_seqlens_to_segment_ids
 
 
+pytestmark = [
+    pytest.mark.cpu,
+]
+
+
+
 def new_reference() -> Qwen4ExpTextPLELayer:
     config = Qwen4ExpTextConfig(
         hidden_size=8,

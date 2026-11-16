@@ -23,6 +23,9 @@ from torchturbo.parallel import FSDPPlanSpec
 from torchturbo.runtime.cpu import CpuRuntime
 
 
+pytestmark = pytest.mark.cpu
+
+
 @pytest.fixture(autouse=True)
 def cpu_dispatch(monkeypatch):
     runtime = CpuRuntime()

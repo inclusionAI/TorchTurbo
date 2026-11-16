@@ -11,6 +11,12 @@ from torchturbo.engine.backends.fsdp2.config import CPUOffloadMode
 from torchturbo.models.qwen4_exp.ple import NGramEmbedding
 
 
+pytestmark = [
+    pytest.mark.cpu,
+]
+
+
+
 @pytest.mark.parametrize("full_offload", [False, True])
 def test_backend_materializes_resident_parameters_on_cpu(
     tmp_path, node_group, full_offload

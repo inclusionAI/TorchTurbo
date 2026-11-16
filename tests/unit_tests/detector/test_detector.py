@@ -7,6 +7,10 @@ from torchturbo.registry import BaseAdapter, clear_adapters, register_adapter
 from torchturbo.registry.registry import _adapters
 
 
+pytestmark = pytest.mark.cpu
+
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------

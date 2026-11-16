@@ -9,6 +9,10 @@ import pytest
 from .test_swift_integration import processor
 
 
+pytestmark = pytest.mark.cpu
+
+
+
 _CALL = {"name": "lookup", "arguments": {"query": "value", "count": 2}}
 _TOOLS = [
     {

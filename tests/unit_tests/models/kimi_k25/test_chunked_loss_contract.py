@@ -11,6 +11,11 @@ from torchturbo.models.kimi_k25.model import TurboKimiK25ForConditionalGeneratio
 from torchturbo.models.kimi_k25.modeling_kimi_k25 import (
     KimiK25ForConditionalGeneration,
 )
+import pytest
+
+
+pytestmark = pytest.mark.cpu
+
 
 
 class _LanguageModel(nn.Module):

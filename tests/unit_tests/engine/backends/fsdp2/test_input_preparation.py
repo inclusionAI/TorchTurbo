@@ -19,6 +19,10 @@ from torchturbo.models.modules.attention.ulysses import (
 from torchturbo.parallel import FSDPParallelPlan, FSDPPlanSpec
 
 
+pytestmark = pytest.mark.cpu
+
+
+
 def _backend(sp_size: int) -> FSDP2Backend:
     backend = FSDP2Backend.__new__(FSDP2Backend)
     backend.get_sp_info = lambda: {

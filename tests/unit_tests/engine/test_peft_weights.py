@@ -7,6 +7,11 @@ from peft import LoraConfig, get_peft_model
 from torch import nn
 
 from torchturbo.engine.peft.weights import compute_dora_magnitude, merge_lora_linear
+import pytest
+
+
+pytestmark = pytest.mark.cpu
+
 
 
 class LinearModel(nn.Module):

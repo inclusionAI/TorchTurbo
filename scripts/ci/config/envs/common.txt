@@ -1,0 +1,8 @@
+pytest>=7.0
+dill
+einops
+huggingface_hub
+pillow
+omegaconf>=2.3.0
+safetensors>=0.4.3
+PyYAML>=6.0

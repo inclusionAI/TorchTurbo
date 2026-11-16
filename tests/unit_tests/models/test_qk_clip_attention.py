@@ -16,6 +16,10 @@ from torchturbo.runtime.cuda import CudaRuntime
 from .flash_attention_fakes import lazy_flash_attention_kernels, process_flash_kwargs
 
 
+pytestmark = pytest.mark.cpu
+
+
+
 @pytest.fixture(autouse=True)
 def _cpu_ops(monkeypatch):
     monkeypatch.setattr(interface, "ops", OpDispatcher(device_runtime=CpuRuntime(), registry=registry))

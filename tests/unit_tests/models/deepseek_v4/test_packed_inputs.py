@@ -9,6 +9,11 @@ from torchturbo.models.deepseek_v4 import model as turbo_model
 from torchturbo.models.deepseek_v4 import modeling_deepseek_v4 as dsv4
 from torchturbo.models.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config
 from torchturbo.models.deepseek_v4.model import TurboDeepseekV4ForCausalLM
+from tests.support.distributed import destroy_process_group
+
+
+pytestmark = pytest.mark.cpu
+
 
 
 @pytest.fixture(autouse=True)
@@ -247,7 +252,7 @@ def _sp_worker(rank, init_file):
             future_grad = local.grad[:, ratio:] if rank == 0 else local.grad
             assert not future_grad.any()
     finally:
-        dist.destroy_process_group()
+        destroy_process_group()
 
 
 @pytest.mark.skipif(not dist.is_gloo_available(), reason="Gloo is required")

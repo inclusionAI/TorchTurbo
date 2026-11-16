@@ -15,6 +15,10 @@ from torchturbo.runtime.npu import NpuRuntime
 from .flash_attention_fakes import lazy_flash_attention_kernels
 
 
+pytestmark = pytest.mark.cpu
+
+
+
 @pytest.mark.parametrize("module", [None, SimpleNamespace()])
 def test_npu_attention_availability_requires_kernel_api(monkeypatch, module):
     monkeypatch.setitem(sys.modules, "torch_npu", module)

@@ -10,6 +10,10 @@ import torch
 from PIL import Image
 
 
+pytestmark = pytest.mark.cpu
+
+
+
 @pytest.fixture(scope="module")
 def processor():
     reference = os.environ.get("BAILING_VL_REFERENCE")

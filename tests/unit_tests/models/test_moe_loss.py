@@ -14,6 +14,11 @@ from torchturbo.models.modules.moe.moe_utils import (
     z_loss_func,
 )
 from torchturbo.models.modules.moe.router import TopKRouter
+from tests.support.distributed import destroy_process_group
+
+
+pytestmark = pytest.mark.cpu
+
 
 
 def _router_config(**kwargs):
@@ -354,7 +359,7 @@ def _run_sp_aux_loss_test(rank: int, world_size: int, init_file: str) -> None:
 
         torch.testing.assert_close(router.weight.grad, reference_weight.grad)
     finally:
-        dist.destroy_process_group()
+        destroy_process_group()
 
 
 def test_sp_aux_loss_matches_unsharded(tmp_path):
@@ -413,7 +418,7 @@ def _run_sp_z_loss_test(rank: int, world_size: int, init_file: str) -> None:
             reference_logits.grad.chunk(world_size)[rank] * world_size,
         )
     finally:
-        dist.destroy_process_group()
+        destroy_process_group()
 
 
 def test_sp_z_loss_matches_global_valid_token_mean(tmp_path):
@@ -482,7 +487,7 @@ def _run_sp_moe_runtime_inputs_test(
         assert prepared["input_ids"].shape == (1, 6)
         assert prepared["cu_seq_lens_q"] is cu
     finally:
-        dist.destroy_process_group()
+        destroy_process_group()
 
 
 def test_base_moe_runtime_inputs_match_sp_shard(tmp_path):
@@ -620,7 +625,7 @@ def _run_sp_group_isolation_test(rank: int, world_size: int, init_file: str) -> 
         torch.testing.assert_close(reported_loss, reference_loss)
         torch.testing.assert_close(local_logits.grad / 2, reference_local_grad)
     finally:
-        dist.destroy_process_group()
+        destroy_process_group()
 
 
 def test_sp_aux_loss_is_scoped_to_sp_group(tmp_path):

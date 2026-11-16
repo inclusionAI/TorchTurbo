@@ -19,6 +19,10 @@ from torchturbo.runtime.npu import _NPU_DETERMINISTIC_ENV, NpuRuntime
 import torchturbo.runtime.runtime as runtime_impl
 
 
+pytestmark = pytest.mark.cpu
+
+
+
 class FakeRuntime(DeviceRuntime):
     def __init__(self, turbo_device: TurboDevice, available: bool = True) -> None:
         self.turbo_device = turbo_device

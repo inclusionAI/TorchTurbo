@@ -34,6 +34,10 @@ from torchturbo.runtime.cpu import CpuRuntime
 from ..flash_attention_fakes import lazy_flash_attention_kernels, process_flash_kwargs
 
 
+pytestmark = pytest.mark.cpu
+
+
+
 def _config(layers=2):
     config = Qwen3_5TextConfig(
         vocab_size=17, hidden_size=8, intermediate_size=16,

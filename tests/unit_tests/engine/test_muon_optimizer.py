@@ -40,6 +40,10 @@ from torchturbo.models.modules.moe.moe_config import MoEConfig
 from torchturbo.utils.torch_utils import torch_version
 
 
+pytestmark = pytest.mark.cpu
+
+
+
 def test_batched_matrix_compute_view_round_trip_for_fused_columns():
     storage = torch.arange(2 * 3 * 8).reshape(2, 3, 8)
     view = BatchedMatrixComputeView(batch_size=2, column_groups=2).resolve(

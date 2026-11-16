@@ -11,6 +11,11 @@ from torchturbo.models.bailing_hybrid.modeling_bailing_moe_v3 import (
     BailingMoeV3ForCausalLM,
     MoeV3ModelOutputWithPast,
 )
+import pytest
+
+
+pytestmark = pytest.mark.cpu
+
 
 
 class _Backbone(nn.Module):

@@ -76,6 +76,10 @@ def test_bf16_experts_weight_activations_before_fc2(monkeypatch, use_lora, num_t
         torch.testing.assert_close(parameter.grad, ref_parameter.grad)
 
 
+pytestmark = pytest.mark.cpu
+
+
+
 @pytest.mark.parametrize("num_local_experts", [1, 2])
 def test_zero_token_forward_keeps_adapters_in_graph(num_local_experts):
     torch.manual_seed(0)

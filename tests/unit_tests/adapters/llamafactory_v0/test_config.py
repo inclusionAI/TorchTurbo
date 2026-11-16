@@ -6,6 +6,10 @@ import types
 
 import pytest
 
+
+pytestmark = pytest.mark.cpu
+
+
 os.environ.setdefault("TORCH_TURBO_DISABLE", "1")
 
 if "grouped_gemm" not in sys.modules:  # pragma: no cover - env shim

@@ -132,6 +132,7 @@ def _patch_cpu_qsa(monkeypatch) -> None:
     )
 
 
+@pytest.mark.cpu
 def test_parallel_forwards_are_bound_per_model_instance() -> None:
     first_owner = TurboQwen4ExpForConditionalGeneration(_small_config())
     second_owner = TurboQwen4ExpForConditionalGeneration(_small_config())
@@ -188,6 +189,7 @@ def test_parallel_forwards_are_bound_per_model_instance() -> None:
     assert second.layers[-1].self_attn.forward == second_qsa_forward
 
 
+@pytest.mark.cpu
 def test_packed_text_forward_uses_modeling_implementation() -> None:
     owner = TurboQwen4ExpForConditionalGeneration(_small_config())
     language_model = owner.model.language_model
@@ -206,6 +208,7 @@ def test_packed_text_forward_uses_modeling_implementation() -> None:
     assert spec.original_forward is Qwen4ExpTextModel.forward
 
 
+@pytest.mark.cpu
 @pytest.mark.parametrize("input_mode", ["keyword", "positional"])
 def test_packed_text_accepts_ids_without_redundant_ple_ids(monkeypatch, input_mode):
     config = _small_config()
@@ -224,6 +227,7 @@ def test_packed_text_accepts_ids_without_redundant_ple_ids(monkeypatch, input_mo
     torch.testing.assert_close(actual.last_hidden_state, expected)
 
 
+@pytest.mark.cpu
 def test_packed_text_rejects_embeddings_without_token_ids(monkeypatch):
     config = _small_config()
     config.text_config.layer_types = ["full_attention"] * 4
@@ -241,6 +245,7 @@ def test_packed_text_rejects_embeddings_without_token_ids(monkeypatch):
         text(inputs_embeds=embeddings, **kwargs)
 
 
+@pytest.mark.cpu
 def test_packed_text_rejects_attention_mask_with_cu_seq_lens():
     owner = TurboQwen4ExpForConditionalGeneration(_small_config()).eval()
     text = owner.model.language_model
@@ -258,6 +263,7 @@ def test_packed_text_rejects_attention_mask_with_cu_seq_lens():
         )
 
 
+@pytest.mark.cpu
 def test_qwen4_sp1_gdn_uses_packed_ops(monkeypatch) -> None:
     import torchturbo.ops as turbo_ops
     from torchturbo.ops.dispatcher import OpDispatcher
@@ -294,6 +300,7 @@ def test_qwen4_sp1_gdn_uses_packed_ops(monkeypatch) -> None:
     assert captured[0].cu_seqlens_list == [0, 3, 8]
 
 
+@pytest.mark.cpu
 def test_text_rms_norm_chunking_preserves_values_and_gradients() -> None:
     torch.manual_seed(0)
     reference = Qwen4ExpTextRMSNorm(16, group_size=4)
@@ -314,6 +321,7 @@ def test_text_rms_norm_chunking_preserves_values_and_gradients() -> None:
     torch.testing.assert_close(chunked.weight.grad, reference.weight.grad)
 
 
+@pytest.mark.npu
 def test_text_rms_norm_chunking_preserves_npu_bf16_gradients() -> None:
     pytest.importorskip("torch_npu")
     if not hasattr(torch, "npu") or not torch.npu.is_available():
@@ -339,6 +347,7 @@ def test_text_rms_norm_chunking_preserves_npu_bf16_gradients() -> None:
     torch.testing.assert_close(chunked.weight.grad.cpu(), reference.weight.grad.cpu())
 
 
+@pytest.mark.cpu
 def test_text_rms_norm_gated_chunking_preserves_values_and_gradients() -> None:
     torch.manual_seed(2)
     reference = Qwen4ExpTextRMSNormGated(16)
@@ -362,6 +371,7 @@ def test_text_rms_norm_gated_chunking_preserves_values_and_gradients() -> None:
     torch.testing.assert_close(chunked.weight.grad, reference.weight.grad)
 
 
+@pytest.mark.cpu
 def test_gated_norm_commutes_with_ulysses_vector_permutation() -> None:
     torch.manual_seed(3)
     norm_before = Qwen4ExpTextRMSNormGated(16)
@@ -386,6 +396,7 @@ def test_gated_norm_commutes_with_ulysses_vector_permutation() -> None:
     torch.testing.assert_close(norm_before.weight.grad, norm_after.weight.grad)
 
 
+@pytest.mark.cpu
 @pytest.mark.parametrize("sp_size", [2, 4, 8])
 def test_qsa_indexer_selects_only_local_queries(monkeypatch, sp_size) -> None:
     torch.manual_seed(7)
@@ -427,6 +438,7 @@ def test_qsa_indexer_selects_only_local_queries(monkeypatch, sp_size) -> None:
     assert len(calls) == sp_size
 
 
+@pytest.mark.cpu
 def test_qsa_indexer_preserves_pooled_key_dtype_under_autocast(monkeypatch) -> None:
     torch.manual_seed(23)
     config = _small_config().text_config
@@ -463,10 +475,12 @@ def test_qsa_indexer_preserves_pooled_key_dtype_under_autocast(monkeypatch) -> N
     torch.testing.assert_close(actual, expected[:, 12:])
 
 
+@pytest.mark.cpu
 def test_qwen4_exp_registers_with_torchturbo() -> None:
     assert get_model("qwen4_exp") is TurboQwen4ExpForConditionalGeneration
 
 
+@pytest.mark.cpu
 def test_qwen4_exp_advertises_flash_attention_support() -> None:
     with torch.device("meta"):
         TurboQwen4ExpForConditionalGeneration(_small_config())
@@ -475,6 +489,7 @@ def test_qwen4_exp_advertises_flash_attention_support() -> None:
     assert Qwen4ExpVisionModel._supports_flash_attn is True
 
 
+@pytest.mark.cpu
 def test_flash_init_keeps_original_container_and_submodel_backends(monkeypatch) -> None:
     import transformers.modeling_utils as hf_modeling
 
@@ -512,6 +527,7 @@ def test_flash_init_keeps_original_container_and_submodel_backends(monkeypatch) 
     assert config.vision_config._attn_implementation == "flash_attention_2"
 
 
+@pytest.mark.cpu
 def test_qsa_keeps_queries_local_and_gathers_kv_per_instance(monkeypatch) -> None:
     from torchturbo.models.qwen4_exp import qsa
 
@@ -560,6 +576,7 @@ def test_qsa_keeps_queries_local_and_gathers_kv_per_instance(monkeypatch) -> Non
     assert calls == ["indexer", "gather", "attention"] * 2
 
 
+@pytest.mark.cpu
 def test_qwen4_uses_upstream_multimodal_forward_with_ids_and_embeddings() -> None:
     model = TurboQwen4ExpForConditionalGeneration(_small_config()).eval()
     input_ids = torch.tensor([[1, 2, 3, 4]])
@@ -577,6 +594,7 @@ def test_qwen4_uses_upstream_multimodal_forward_with_ids_and_embeddings() -> Non
     assert output.logits.shape == (1, input_ids.shape[1], 256)
 
 
+@pytest.mark.cpu
 def test_qwen4_sp_input_contract_contains_only_real_qwen4_fields() -> None:
     model = TurboQwen4ExpForConditionalGeneration(_small_config())
     spec = model.get_sequence_parallel_input_slicing_spec()
@@ -591,6 +609,7 @@ def test_qwen4_sp_input_contract_contains_only_real_qwen4_fields() -> None:
     assert all(name != "text_position_ids" for name, _ in spec.padded_inputs)
 
 
+@pytest.mark.cpu
 def test_qwen4_exp_meta_construction_registers_frozen_table_parameters() -> None:
     config = _small_config()
     with torch.device("meta"):
@@ -608,6 +627,7 @@ def test_qwen4_exp_meta_construction_registers_frozen_table_parameters() -> None
     assert all(not parameter.requires_grad for parameter in parameters.values())
 
 
+@pytest.mark.cpu
 def test_latest_modeling_accepts_three_axis_mrope_positions(monkeypatch) -> None:
     position_ids = torch.tensor(
         [
@@ -633,6 +653,7 @@ def test_latest_modeling_accepts_three_axis_mrope_positions(monkeypatch) -> None
     assert output.logits.shape == (1, 5, 256)
 
 
+@pytest.mark.cpu
 def test_qsa_attention_matches_masked_reference_and_gradients(monkeypatch) -> None:
     captured = {}
 
@@ -700,6 +721,7 @@ def test_qsa_attention_matches_masked_reference_and_gradients(monkeypatch) -> No
         torch.testing.assert_close(actual.grad, reference.grad)
 
 
+@pytest.mark.cpu
 @pytest.mark.parametrize("query_chunk_size", [3, 256])
 def test_qsa_indexer_matches_packed_reference(monkeypatch, query_chunk_size) -> None:
     torch.manual_seed(1)
@@ -733,12 +755,14 @@ def test_qsa_indexer_matches_packed_reference(monkeypatch, query_chunk_size) -> 
     assert not (actual & ~packed_causal).any()
 
 
+@pytest.mark.cpu
 def test_qsa_indexer_keeps_upstream_forward() -> None:
     indexer = _new_qsa_indexer(_small_config().text_config, layer_idx=3)
 
     assert indexer.forward.__func__ is Qwen4ExpTextQSAIndexer.forward
 
 
+@pytest.mark.npu
 def test_npu_qsa_selection_matches_cpu() -> None:
     pytest.importorskip("torch_npu")
     if not hasattr(torch, "npu") or not torch.npu.is_available():
@@ -765,6 +789,7 @@ def test_npu_qsa_selection_matches_cpu() -> None:
     torch.testing.assert_close(actual.cpu(), expected)
 
 
+@pytest.mark.cpu
 def test_qwen4_exp_weight_converter_recognizes_ple_buffers() -> None:
     converter = object.__new__(Qwen4ExpWeightConverter)
     name = "model.language_model.layers.1.ple.ple_embedding.layer_multipliers"
@@ -772,6 +797,7 @@ def test_qwen4_exp_weight_converter_recognizes_ple_buffers() -> None:
     assert converter.convert_persist_buffer(name) == name
 
 
+@pytest.mark.cpu
 def test_qwen4_exp_rebuilds_meta_rotary_buffers(monkeypatch) -> None:
     model = None
     config = _small_config()
@@ -790,6 +816,7 @@ def test_qwen4_exp_rebuilds_meta_rotary_buffers(monkeypatch) -> None:
     assert model.model.visual.rotary_pos_emb.inv_freq.device.type == "cpu"
 
 
+@pytest.mark.cpu
 def test_qwen4_exp_text_sft_forward_backward(monkeypatch) -> None:
     torch.manual_seed(1)
     model = TurboQwen4ExpForConditionalGeneration(_small_config()).float().train()
@@ -819,6 +846,7 @@ def test_qwen4_exp_text_sft_forward_backward(monkeypatch) -> None:
     assert table.grad is None
 
 
+@pytest.mark.cpu
 def test_packed_qsa_ple_matches_independent_sequences(monkeypatch) -> None:
     """Packed execution must preserve the semantics of independent samples."""
     config = _small_config()
@@ -893,6 +921,7 @@ def test_packed_qsa_ple_matches_independent_sequences(monkeypatch) -> None:
         )
 
 
+@pytest.mark.npu
 def test_npu_packed_model_matches_independent_sequences(monkeypatch) -> None:
     pytest.importorskip("torch_npu")
     if not hasattr(torch, "npu") or not torch.npu.is_available():
@@ -958,6 +987,7 @@ def test_npu_packed_model_matches_independent_sequences(monkeypatch) -> None:
     torch.testing.assert_close(packed_logits.cpu(), independent_logits.cpu())
 
 
+@pytest.mark.cpu
 def test_qwen4_exp_accepts_ids_with_precomputed_embeddings() -> None:
     torch.manual_seed(2)
     model = TurboQwen4ExpForConditionalGeneration(_small_config()).float().eval()
@@ -976,6 +1006,7 @@ def test_qwen4_exp_accepts_ids_with_precomputed_embeddings() -> None:
     assert torch.isfinite(outputs.logits).all()
 
 
+@pytest.mark.cpu
 def test_qwen4_exp_packed_boundaries_are_cu_driven() -> None:
     cu_seqlens = torch.tensor([0, 3, 5], dtype=torch.int32)
 

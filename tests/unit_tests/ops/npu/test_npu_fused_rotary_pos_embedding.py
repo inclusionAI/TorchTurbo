@@ -5,6 +5,8 @@ import torch
 
 pytest.importorskip("torch_npu")
 
+pytestmark = [pytest.mark.npu]
+
 from torchturbo.ops.providers.npu.rotary_position_embedding import (
     NpuRotaryPositionEmbedding,
 )

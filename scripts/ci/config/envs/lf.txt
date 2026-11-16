@@ -1,0 +1,18 @@
+-r common.txt
+transformers==5.5.4
+safetensors==0.7.0
+deepspeed==0.16.0
+tensorboard
+psutil==7.2.2
+omegaconf
+pyparsing
+cycler
+kiwisolver
+peft==0.18.1
+torchvision==0.25.0
+torchaudio==2.10.0
+datasets==4.0.0
+accelerate==1.11.0
+trl==0.24.0
+matplotlib
+llamafactory==0.9.5

@@ -18,6 +18,10 @@ from torchturbo.utils import transformers_utils
 from torchturbo.utils.transformers_utils import patch_dynamic_module_loading
 
 
+pytestmark = pytest.mark.cpu
+
+
+
 @pytest.fixture(autouse=True)
 def patched_loading(monkeypatch):
     # Restore the loader and installation state after each test.

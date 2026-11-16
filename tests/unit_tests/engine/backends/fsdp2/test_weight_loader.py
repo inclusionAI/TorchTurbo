@@ -21,6 +21,10 @@ from torchturbo.engine.backends.fsdp2.config import FSDPConfig, CPUOffloadConfig
 from torchturbo.engine.backends.fsdp2.checkpoint.weight_loader import DistParamLoader
 
 
+pytestmark = pytest.mark.cpu
+
+
+
 class TinyModel(nn.Module):
     def __init__(self) -> None:
         super().__init__()

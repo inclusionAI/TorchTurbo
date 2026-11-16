@@ -6,6 +6,10 @@ from unittest import mock
 import pytest
 
 
+pytestmark = pytest.mark.cpu
+
+
+
 class TestPackageImport:
     """Test that importing torchturbo discovers built-in adapters."""
 

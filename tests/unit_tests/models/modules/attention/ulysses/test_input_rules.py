@@ -13,6 +13,10 @@ from torchturbo.models.modules.attention.ulysses import (
 )
 
 
+pytestmark = pytest.mark.cpu
+
+
+
 class _CaptureInputs(nn.Module):
     def forward(self, **kwargs):
         return kwargs

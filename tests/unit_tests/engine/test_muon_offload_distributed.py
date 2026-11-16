@@ -18,6 +18,9 @@ from torchturbo.engine.config import MuonOptimizerConfig
 from torchturbo.engine.optimizers import MuonPlan, MuonRecipe, OptimizersContainer
 from torchturbo.runtime import get_device_runtime
 from torchturbo.utils.torch_utils import torch_version
+from tests.support.distributed import destroy_process_group
+
+pytestmark = pytest.mark.multi_npu
 
 
 def _device_count():
@@ -131,7 +134,7 @@ def _run(rank, init_file, mode, fraction, overlap, dual_backend):
             del inference_allocation
             backend.restore_optimizer()
     finally:
-        dist.destroy_process_group()
+        destroy_process_group()
 
 
 @pytest.mark.skipif(

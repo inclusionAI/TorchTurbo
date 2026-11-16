@@ -16,6 +16,10 @@ from torchturbo.engine.config import MuonOptimizerConfig
 from torchturbo.engine.optimizers import MuonPlan, MuonRecipe, OptimizersContainer
 
 
+pytestmark = pytest.mark.cpu
+
+
+
 def _model() -> nn.ModuleDict:
     return nn.ModuleDict({"active": nn.Linear(3, 3), "unused": nn.Linear(3, 3)})
 

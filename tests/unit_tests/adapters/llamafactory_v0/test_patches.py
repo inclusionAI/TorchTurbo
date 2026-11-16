@@ -17,6 +17,10 @@ from torchturbo.adapters.llamafactory_v0.patches import (
 from torchturbo.models.qwen3_5_moe.lf_template import Qwen35DummyMediaPatch
 
 
+pytestmark = pytest.mark.cpu
+
+
+
 def _tokenizer(pad_token_id: int = 99):
     return SimpleNamespace(
         pad_token_id=pad_token_id,

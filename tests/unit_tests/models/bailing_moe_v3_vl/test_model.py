@@ -25,6 +25,11 @@ from torchturbo.models.bailing_moe_v3_vl.modeling_bailing_moe_v3_vl import (
 )
 from torchturbo.models.bailing_moe_v3_vl.vision_balance import BailingVisionBalanceIO
 from torchturbo.models.modules.vision.io import VisionBatch
+from tests.support.distributed import destroy_process_group
+
+
+pytestmark = pytest.mark.cpu
+
 
 
 def make_config(*, hybrid=False, mtp=0):
@@ -101,7 +106,7 @@ def single_rank_group(tmp_path):
     try:
         yield
     finally:
-        torch.distributed.destroy_process_group()
+        destroy_process_group()
 
 
 @pytest.mark.parametrize("argument_style", ["positional", "mixed", "keyword"])

@@ -22,6 +22,10 @@ from torchturbo.models.modules.moe.moe_config import MoEConfig
 from .test_model import make_config
 
 
+pytestmark = pytest.mark.cpu
+
+
+
 def _plan(model, *, qk_clip=False):
     with patch("torchturbo.engine.optimizers.muon.logger") as logger:
         plan = MuonPlan(

@@ -20,6 +20,10 @@ from torchturbo.models.qwen3_5.model import TurboQwen3_5ForConditionalGeneration
 from torchturbo.models.qwen3_5.swift_template import _make_kwarg_preserving_template_cls
 from torchturbo.models.qwen3_5.vision_balance import Qwen3_5VisionBalanceIO
 from torchturbo.parallel import VisionBalanceMode, VisionBalanceSpec
+from tests.support.distributed import destroy_process_group
+
+
+pytestmark = pytest.mark.cpu
 
 
 def _model():
@@ -179,7 +183,7 @@ def _distributed_swift_training(rank, init_file, world_size, sp_size):
                     assert len(exchanges) == expected_exchanges, (case, frozen, num_media)
     finally:
         dist.all_to_all_single = original_exchange
-        dist.destroy_process_group()
+        destroy_process_group()
 
 
 @pytest.mark.parametrize("world_size, sp_size", [(2, 1), (4, 2)])

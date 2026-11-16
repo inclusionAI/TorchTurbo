@@ -18,6 +18,10 @@ from torchturbo.models.modules.moe.moe_utils import MoEAuxLossAutoScaler
 from torchturbo.ops import get_or_create_ops
 from torchturbo.runtime.cpu import CpuRuntime
 
+
+pytestmark = pytest.mark.cpu
+
+
 _SCALING = 0.5
 
 

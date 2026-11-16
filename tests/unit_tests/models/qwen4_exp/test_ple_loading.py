@@ -18,6 +18,12 @@ from torchturbo.models.qwen4_exp.model import Qwen4ExpWeightConverter
 from .test_ple import adapted, new_reference
 
 
+pytestmark = [
+    pytest.mark.cpu,
+]
+
+
+
 def make_checkpoint(path, dtype=torch.float32, shard_sizes=None):
     reference = new_reference()
     rows = reference.ple_embedding.ngram_embedding.weight.detach().to(dtype)

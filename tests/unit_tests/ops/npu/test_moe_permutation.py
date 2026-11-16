@@ -9,7 +9,10 @@ from torchturbo.ops.moe import MoEPermutation
 from torchturbo.runtime import is_npu_available
 from torchturbo.runtime.npu import NpuRuntime
 
-pytestmark = pytest.mark.skipif(not is_npu_available(), reason="NPU is unavailable")
+pytestmark = [
+    pytest.mark.npu,
+    pytest.mark.skipif(not is_npu_available(), reason="NPU is unavailable"),
+]
 
 
 @pytest.fixture(autouse=True)

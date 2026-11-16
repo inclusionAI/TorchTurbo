@@ -8,6 +8,11 @@ directly, without FSDP2, copy identical random weights, and compare logits.
 import os
 import sys
 from pathlib import Path
+import pytest
+
+
+pytestmark = pytest.mark.cpu
+
 
 try:
     import torch

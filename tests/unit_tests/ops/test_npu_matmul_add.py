@@ -8,6 +8,11 @@ import torch
 from torchturbo.ops.providers.npu.matmul_add import (
     TorchNpuMatmulAdd,
 )
+import pytest
+
+
+pytestmark = pytest.mark.cpu
+
 
 
 def test_torch_npu_fallback_uses_in_place_addmm():

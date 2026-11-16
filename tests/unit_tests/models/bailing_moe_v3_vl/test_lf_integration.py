@@ -20,6 +20,10 @@ from torchturbo.models.bailing_moe_v3_vl.model import (
 from .test_model import make_config
 
 
+pytestmark = pytest.mark.cpu
+
+
+
 @pytest.fixture(scope="module")
 def components():
     reference = os.environ.get("BAILING_VL_REFERENCE")

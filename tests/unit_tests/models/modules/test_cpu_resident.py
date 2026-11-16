@@ -16,6 +16,11 @@ import torch.multiprocessing as mp
 from safetensors import safe_open
 from safetensors.torch import load_file, save_file
 from torch import nn
+from tests.support.distributed import destroy_process_group
+
+
+pytestmark = pytest.mark.cpu
+
 
 
 def _package():
@@ -44,7 +49,7 @@ def node_group(tmp_path_factory, monkeypatch):
     try:
         yield
     finally:
-        dist.destroy_process_group()
+        destroy_process_group()
         # Each test owns a separate distributed job in this pytest process.
         _package().NodeSharedCPUResidentParameter._node_group = None
 
@@ -448,7 +453,7 @@ def _io_worker(rank, init_file, directory):
             torch.testing.assert_close(value, torch.full(shape, 41.0))
         assert not list(root.glob("torchturbo-cpu-resident-*"))
     finally:
-        dist.destroy_process_group()
+        destroy_process_group()
 
 
 def test_source_shards_are_loaded_and_saved_by_assigned_node_ranks(tmp_path):
@@ -549,7 +554,7 @@ def _failure_worker(rank, init_file, directory):
         dist.barrier(group=group)
         torch.testing.assert_close(parameter, torch.full((2,), 7.0))
     finally:
-        dist.destroy_process_group()
+        destroy_process_group()
 
 
 def test_group_metadata_and_allocation_errors_reach_every_rank(tmp_path):
@@ -607,7 +612,7 @@ def _cleanup_worker(rank, init_file, directory):
             torch.testing.assert_close(parameter, torch.full((2,), 11.0))
             assert not list(root.glob("torchturbo-cpu-resident-*"))
     finally:
-        dist.destroy_process_group()
+        destroy_process_group()
 
 
 def test_cleanup_failures_preserve_group_agreement_and_allow_retry(tmp_path):
@@ -661,7 +666,7 @@ def _world_materialize_worker(rank, init_file, directory, reuse_mapping, failure
         torch.testing.assert_close(parameter, torch.full((3,), 7.0))
         assert not list(root.glob("torchturbo-cpu-resident-*"))
     finally:
-        dist.destroy_process_group()
+        destroy_process_group()
 
 
 @pytest.mark.parametrize("reuse_mapping", [False, True])
@@ -788,7 +793,7 @@ def _groups_worker(rank, init_file, directory):
         parameter.shard_sizes = (1, 2)
         parameter.save(lambda index, value: None)
     finally:
-        dist.destroy_process_group()
+        destroy_process_group()
 
 
 def test_internal_node_groups_are_reused_and_only_selected_node_saves(tmp_path):
@@ -842,7 +847,7 @@ def _world_load_worker(rank, init_file, directory, phase):
         assert parameter.shard_sizes == (2, 1)
         torch.testing.assert_close(parameter, torch.full((3,), 11.0).double())
     finally:
-        dist.destroy_process_group()
+        destroy_process_group()
 
 
 @pytest.mark.parametrize("phase", ["materialize", "reader"])
@@ -903,7 +908,7 @@ def _partition_worker(rank, init_file, directory):
         parameter.save(lambda index, value: writes.append(index))
         assert writes == ([0] if rank == 0 else [1])
     finally:
-        dist.destroy_process_group()
+        destroy_process_group()
 
 
 def test_shard_partition_and_callback_failures_are_collective_and_recoverable(tmp_path):
@@ -934,7 +939,7 @@ def _configuration_worker(rank, init_file, directory):
         ).materialize_()
         torch.testing.assert_close(value, torch.zeros(2))
     finally:
-        dist.destroy_process_group()
+        destroy_process_group()
 
 
 def test_node_configuration_errors_agree_before_subgroup_creation(tmp_path):

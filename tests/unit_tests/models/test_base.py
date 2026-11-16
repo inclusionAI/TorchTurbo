@@ -8,6 +8,10 @@ from torchturbo.models.base import TurboModel, TurboVLMModel
 from torchturbo.models.kimi_k25.model import TurboKimiK25ForConditionalGeneration
 
 
+pytestmark = pytest.mark.cpu
+
+
+
 @pytest.mark.parametrize("model_cls, media_keys", [
     (TurboModel, ()),
     (TurboVLMModel, (

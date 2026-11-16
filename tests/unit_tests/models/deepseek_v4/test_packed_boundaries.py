@@ -18,6 +18,10 @@ from torchturbo.models.deepseek_v4.packing_utils import (
 )
 
 
+pytestmark = pytest.mark.cpu
+
+
+
 def test_compression_keeps_unaligned_segment_boundaries():
     mask = torch.tensor([[1] * 127 + [2] * 129], dtype=torch.int32)
     positions = torch.tensor([list(range(127)) + list(range(129))])

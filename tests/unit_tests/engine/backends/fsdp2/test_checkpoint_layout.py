@@ -13,6 +13,10 @@ from torchturbo.engine.backends.fsdp2.checkpoint import layout as fsdp_layout
 from torchturbo.engine.checkpoint import CheckpointFormat, layout
 
 
+pytestmark = pytest.mark.cpu
+
+
+
 def _write_dcp(checkpoint_dir, name, *, complete, metadata=".metadata"):
     dcp_dir = checkpoint_dir / name
     dcp_dir.mkdir(parents=True)

@@ -42,6 +42,11 @@ from torchturbo.models.modules.attention.qk_clip import get_qk_clip_state
 from torchturbo.ops.providers.native.attention import TorchAttentionWithMaxLogits
 from torchturbo.parallel import FSDPParallelPlan, FSDPPlanSpec
 from torchturbo.runtime.cpu import CpuRuntime
+from tests.support.distributed import destroy_process_group
+
+
+pytestmark = pytest.mark.cpu
+
 
 
 class _MLAAttention(nn.Module):
@@ -534,7 +539,7 @@ def _run_nonfinite_checks(rank: int, world_size: int, init_file: str) -> None:
                         gradient = parameter.grad.to_local() if isinstance(parameter, DTensor) else parameter.grad
                         torch.testing.assert_close(gradient, torch.full_like(gradient, magnitude * scale))
     finally:
-        dist.destroy_process_group()
+        destroy_process_group()
 
 
 @pytest.mark.skipif(
@@ -743,7 +748,7 @@ def _run_distributed_qk_clip(rank: int, world_size: int, init_file: str) -> None
         assert get_qk_clip_state(local_module) is None
         assert "qk_clip_state" not in vars(local_module)
     finally:
-        dist.destroy_process_group()
+        destroy_process_group()
 
 
 @pytest.mark.skipif(
@@ -866,7 +871,7 @@ def _run_replicated_qk_clip(rank: int, world_size: int, init_file: str) -> None:
             for replica in replicas:
                 torch.testing.assert_close(replica, parameters)
     finally:
-        dist.destroy_process_group()
+        destroy_process_group()
 
 
 @pytest.mark.skipif(

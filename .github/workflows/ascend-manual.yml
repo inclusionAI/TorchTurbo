@@ -1,0 +1,50 @@
+name: Ascend-Manual-CI
+run-name: Ascend-Manual-CI ${{ inputs.target_job }} ${{ github.ref_name }}
+
+# Debug one exact job through the normal CI graph. Manual runs use the same
+# Catalog/Policy -> Plan -> Executor -> Gate pipeline as PR and nightly, but
+# reduce the Plan to one target job. No second planner or executor path.
+#
+# target_job is the Plan job id. Common values:
+#   pytest-core-cpu-cpu-default-default
+#   pytest-core-npu-npu-default-default
+#   model-e2e-bailing-hybrid-lf-sft
+#
+# Use mode=pr for PR scope, or mode=full to target a job that only nightly
+# selects (for example a nightly-only model E2E case). An unknown target fails
+# in Planner before any runner starts.
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'pr = PR policy; full = nightly policy'
+        required: true
+        default: 'pr'
+        type: choice
+        options:
+          - pr
+          - full
+      target_job:
+        description: 'exact Plan job id to execute'
+        required: true
+        default: 'pytest-core-cpu-cpu-default-default'
+        type: string
+
+concurrency:
+  group: ci-manual-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: read
+  actions: read
+
+jobs:
+  manual:
+    name: Ascend-Manual (${{ inputs.target_job }})
+    uses: ./.github/workflows/ascend-pr.yml
+    with:
+      mode: ${{ inputs.mode == 'full' && 'full' || 'pr' }}
+      target_job: ${{ inputs.target_job }}
+    secrets: inherit

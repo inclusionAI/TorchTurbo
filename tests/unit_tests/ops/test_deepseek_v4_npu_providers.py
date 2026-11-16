@@ -7,6 +7,11 @@ from types import ModuleType, SimpleNamespace
 from torchturbo.ops import OpDispatcher
 from torchturbo.ops.registry import registry
 from torchturbo.runtime import TurboDevice
+import pytest
+
+
+pytestmark = pytest.mark.cpu
+
 
 
 class _NpuRuntime:

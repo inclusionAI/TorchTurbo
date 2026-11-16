@@ -40,6 +40,11 @@ from torchturbo.models.base import TurboModel
 from torchturbo.models.modules.moe.moe_layer import BaseMoELayer, MoERuntimeInputs
 from torchturbo.models.modules.moe.moe_utils import MoEAuxLossAutoScaler
 from torchturbo.runtime.cpu import CpuRuntime
+from tests.support.distributed import destroy_process_group
+
+
+pytestmark = pytest.mark.cpu
+
 
 
 # ---------------------------------------------------------------------------
@@ -477,7 +482,7 @@ class TestEngineSetup:
             assert engine.backend.device == torch.device("cpu")
             assert engine.model is None
         finally:
-            dist.destroy_process_group()
+            destroy_process_group()
 
     def test_prepare_model_not_supported_type(self, dummy_engine):
         from transformers import PretrainedConfig

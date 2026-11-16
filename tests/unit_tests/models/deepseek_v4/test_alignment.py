@@ -345,6 +345,11 @@ def hadamard_transform_mock(x, scale=1.0):
 
 
 import types as _types
+import pytest
+
+
+pytestmark = pytest.mark.cpu
+
 
 _mock_fht = _types.ModuleType("fast_hadamard_transform")
 _mock_fht.hadamard_transform = hadamard_transform_mock

@@ -21,6 +21,10 @@ import deepseekv4_1  # noqa: E402
 import kimik26  # noqa: E402
 
 
+pytestmark = pytest.mark.cpu
+
+
+
 def _write_index(model_dir: Path, weight_map: dict[str, str]) -> None:
     index = {"metadata": {"source": "test"}, "weight_map": weight_map}
     (model_dir / "model.safetensors.index.json").write_text(

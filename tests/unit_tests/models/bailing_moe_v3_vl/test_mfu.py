@@ -8,6 +8,11 @@ from torchturbo.models.bailing_moe_v3_vl.modeling_bailing_moe_v3_vl import (
 )
 
 from .test_model import make_config
+import pytest
+
+
+pytestmark = pytest.mark.cpu
+
 
 
 def _profile(grid=None):

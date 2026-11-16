@@ -9,7 +9,7 @@ from math import ceil
 
 import torch
 
-from torchturbo.scripts.dequant.dequantize import DequantizationFormat, Dequantizer, TensorSource
+from dequantize import DequantizationFormat, Dequantizer, TensorSource
 
 
 class BailingMoeV3Format(DequantizationFormat):
@@ -110,7 +110,7 @@ class BailingMoeV3Format(DequantizationFormat):
 
 
 def main(argv: list[str] | None = None) -> None:
-    from torchturbo.scripts.dequant.converter import Converter
+    from converter import Converter
 
     parser = argparse.ArgumentParser(
         description="Convert a Ling FP8 checkpoint to BF16."

@@ -1,0 +1,3 @@
+-r common.txt
+transformers==5.5.4
+peft==0.18.1

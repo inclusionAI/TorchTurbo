@@ -8,6 +8,8 @@ import torch
 pytest.importorskip("torch_npu")
 pytest.importorskip("fla_npu")
 
+pytestmark = [pytest.mark.npu]
+
 from fla_npu.ops.triton import chunk_scaled_dot_kkt_fwd as upstream_kkt
 
 from torchturbo.ops.packed_params import build_packed_params

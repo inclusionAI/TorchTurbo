@@ -16,6 +16,10 @@ from torchturbo.models.modules.attention.ulysses import ulysses as ulysses_modul
 from .flash_attention_fakes import lazy_flash_attention_kernels, process_flash_kwargs
 
 
+pytestmark = pytest.mark.cpu
+
+
+
 class _AttnConfig:
     def __init__(self) -> None:
         self._attn_implementation = "flash_attention_2"

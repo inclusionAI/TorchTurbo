@@ -11,6 +11,11 @@ from torchturbo.models.glm_moe_dsa.model import TurboGlmMoeDsaForCausalLM
 from torchturbo.models.glm_moe_dsa.modeling_glm_moe_dsa import (
     GlmMoeDsaForCausalLM,
 )
+import pytest
+
+
+pytestmark = pytest.mark.cpu
+
 
 
 class _Backbone(nn.Module):

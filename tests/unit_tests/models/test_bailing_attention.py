@@ -12,6 +12,10 @@ from torchturbo.models.bailing_hybrid import attention
 from torchturbo.models.bailing_hybrid.naive_kda import RMSNormGated
 
 
+pytestmark = pytest.mark.cpu
+
+
+
 def test_rms_norm_patch_only_changes_supplied_class(monkeypatch):
     calls = []
 

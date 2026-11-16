@@ -13,6 +13,10 @@ import torch.nn.functional as F
 from torchturbo.ops.providers.cuda import attention as cuda_attention
 
 
+pytestmark = pytest.mark.cpu
+
+
+
 @pytest.fixture(autouse=True)
 def reset_availability_cache() -> Iterator[None]:
     cuda_attention.is_transformer_engine_available.cache_clear()

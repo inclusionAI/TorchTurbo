@@ -3,6 +3,11 @@ from contextlib import contextmanager
 import torch
 
 from torchturbo.models.modules.attention.ulysses import ulysses
+import pytest
+
+
+pytestmark = pytest.mark.cpu
+
 
 
 class _Work:

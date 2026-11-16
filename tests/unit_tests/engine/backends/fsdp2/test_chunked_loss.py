@@ -19,6 +19,10 @@ from torchturbo.ops import get_or_create_ops
 from torchturbo.runtime.cpu import CpuRuntime
 
 
+pytestmark = pytest.mark.cpu
+
+
+
 @pytest.fixture(autouse=True)
 def _process_ops(monkeypatch):
     monkeypatch.setattr(importlib.import_module("torchturbo.ops.ops"), "_OPS", None)

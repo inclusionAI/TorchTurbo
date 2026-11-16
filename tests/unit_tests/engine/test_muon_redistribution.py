@@ -22,10 +22,13 @@ from torchturbo.engine.optimizers.muon import (
 from torchturbo.utils.torch_utils import torch_version
 
 
-pytestmark = pytest.mark.skipif(
-    torch_version() < (2, 10, 0),
-    reason="Muon layout planning requires PyTorch 2.10 or newer",
-)
+pytestmark = [
+    pytest.mark.cpu,
+    pytest.mark.skipif(
+        torch_version() < (2, 10, 0),
+        reason="Muon layout planning requires PyTorch 2.10 or newer",
+    ),
+]
 
 
 def _matrix_layout(

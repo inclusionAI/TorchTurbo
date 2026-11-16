@@ -16,6 +16,10 @@ from torchturbo.models.modules.loss import (
 from torchturbo.ops import get_or_create_ops
 from torchturbo.runtime.cpu import CpuRuntime
 
+
+pytestmark = pytest.mark.cpu
+
+
 IGNORE = -100
 
 

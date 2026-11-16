@@ -13,9 +13,14 @@ from torch.utils.checkpoint import checkpoint
 
 from torchturbo.models.qwen4_exp import ple as impl
 from torchturbo.utils.flash_attn_utils import cu_seqlens_to_segment_ids
+from tests.support.distributed import destroy_process_group
 
 from .test_ple import adapted, new_reference
 from .test_ple_distributed import _init_process_group
+
+
+pytestmark = pytest.mark.cpu
+
 
 
 def _check_cancellation(rank, dtype, length, boundaries, reentrant):
@@ -105,7 +110,7 @@ def _run_cancellation(rank, init_file, dtype):
             for reentrant in (None, False, True):
                 _check_cancellation(rank, dtype, length, boundaries, reentrant)
     finally:
-        dist.destroy_process_group()
+        destroy_process_group()
 
 
 def _check_conv_gradients(rank, dtype, length, needs_grad):
@@ -174,7 +179,7 @@ def _run_conv_gradients(rank, init_file):
                     _check_conv_gradients(rank, dtype, length, needs_grad)
             _check_conv_gradients(rank, dtype, 4, (rank % 2 == 0, True))
     finally:
-        dist.destroy_process_group()
+        destroy_process_group()
 
 
 @pytest.mark.skipif(

@@ -9,6 +9,11 @@ from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeForCausalLM
 
 from torchturbo.engine.backends.fsdp2.backend import FSDP2Backend
 from torchturbo.models.qwen3_moe.model import TurboQwen3MoeForCausalLM
+import pytest
+
+
+pytestmark = pytest.mark.cpu
+
 
 
 class _Backbone(nn.Module):

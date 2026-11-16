@@ -11,6 +11,9 @@ from torchturbo.models.modules.moe.utils import topk_softmax_with_capacity
 from torchturbo.runtime import is_cuda_available, is_npu_available
 
 
+pytestmark = pytest.mark.cpu
+
+
 @pytest.mark.parametrize("device", ["cpu", "cuda", "npu"])
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("router_dtype", [None, "fp32", "fp64"])

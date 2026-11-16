@@ -31,6 +31,10 @@ from torchturbo.ops import OpPolicy, get_or_create_ops
 from torchturbo.parallel import FSDPParallelPlan, FSDPPlanSpec
 from torchturbo.runtime.cpu import CpuRuntime
 import torchturbo.runtime.runtime as runtime_module
+from tests.support.distributed import destroy_process_group
+
+
+pytestmark = pytest.mark.cpu
 
 
 def _adapter_cases():
@@ -152,7 +156,7 @@ def _check_adapter_losses(rank: int, init_file: str) -> None:
                 assert ("aux_loss" in metrics) == (aux_coeff > 0), context
                 assert ("z_loss" in metrics) == (z_coeff > 0), context
     finally:
-        dist.destroy_process_group()
+        destroy_process_group()
 
 
 @pytest.mark.skipif(

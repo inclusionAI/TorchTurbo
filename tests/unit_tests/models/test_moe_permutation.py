@@ -19,6 +19,9 @@ from torchturbo.runtime.cuda import CudaRuntime
 from torchturbo.runtime.npu import NpuRuntime
 
 
+pytestmark = pytest.mark.cpu
+
+
 def _configure_ops(monkeypatch, runtime, default_policy=OpPolicy.AUTO, overrides=None):
     monkeypatch.setattr(runtime_module, "_SELECTED_RUNTIME", runtime)
     monkeypatch.setattr(importlib.import_module("torchturbo.ops.ops"), "_OPS", None)

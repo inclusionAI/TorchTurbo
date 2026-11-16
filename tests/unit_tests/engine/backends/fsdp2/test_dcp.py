@@ -18,6 +18,10 @@ from torchturbo.engine.optimizers import OptimizerClassPlan
 from torchturbo.runtime.cpu import CpuRuntime
 
 
+pytestmark = pytest.mark.cpu
+
+
+
 def _checkpoint() -> DcpCheckpoint:
     # Plain tensors are never sharded on the edp mesh, so no key gets an EP
     # suffix. DCP supports single-process CPU save/load without a process group.

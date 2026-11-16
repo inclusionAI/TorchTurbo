@@ -26,6 +26,10 @@ from torchturbo.ops import OpPolicy, get_or_create_ops
 from torchturbo.parallel import FSDPPlanSpec
 from torchturbo.runtime.cpu import CpuRuntime
 from torchturbo.utils.torch_utils import torch_version
+from tests.support.distributed import destroy_process_group
+
+
+pytestmark = pytest.mark.cpu
 
 
 @pytest.fixture
@@ -43,7 +47,7 @@ def cpu_mesh(tmp_path, monkeypatch):
         yield init_device_mesh("cpu", (1,))
     finally:
         if dist.is_initialized():
-            dist.destroy_process_group()
+            destroy_process_group()
 
 
 class LastChildForward(nn.Module):

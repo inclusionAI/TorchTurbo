@@ -7,6 +7,10 @@ import torch
 import pytest
 
 
+pytestmark = pytest.mark.cpu
+
+
+
 def _mask_factory(use_sliding_window):
     import transformers.models.qwen3_moe.modeling_qwen3_moe as qwen3_moe_model
 

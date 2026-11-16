@@ -28,6 +28,10 @@ from torchturbo.runtime.cuda import CudaRuntime
 from torchturbo.runtime.npu import NpuRuntime
 
 
+pytestmark = pytest.mark.cpu
+
+
+
 def _reference_rms_norm(hidden_states, weight, eps):
     input_dtype = hidden_states.dtype
     hidden_states = hidden_states.to(torch.float32)

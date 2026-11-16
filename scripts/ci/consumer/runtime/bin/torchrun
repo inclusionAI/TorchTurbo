@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+: "${VIRTUAL_ENV:?torchrun requires VIRTUAL_ENV}"
+exec "$VIRTUAL_ENV/bin/python" -m torch.distributed.run "$@"

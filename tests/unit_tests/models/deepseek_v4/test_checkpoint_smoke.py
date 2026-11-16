@@ -22,6 +22,10 @@ except ModuleNotFoundError:
 
 import pytest
 
+
+pytestmark = pytest.mark.cpu
+
+
 os.environ.setdefault("TORCH_TURBO_DISABLE", "1")
 
 REPO_ROOT = Path(__file__).resolve().parents[3]

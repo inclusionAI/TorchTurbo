@@ -13,6 +13,7 @@ def _gdn_module():
     return gdn
 
 
+@pytest.mark.cpu
 def test_packed_params_builds_reusable_offsets_and_chunk_indices():
     cu_seqlens = torch.tensor([0, 65, 128], dtype=torch.int32)
 
@@ -24,6 +25,7 @@ def test_packed_params_builds_reusable_offsets_and_chunk_indices():
     assert packed.chunk_indices_list["64"] == [0, 0, 0, 1, 1, 0]
 
 
+@pytest.mark.cpu
 def test_packed_params_cache_is_owned_by_the_caller():
     calls = []
 
@@ -40,6 +42,7 @@ def test_packed_params_cache_is_owned_by_the_caller():
     assert calls == [cu_seqlens]
 
 
+@pytest.mark.cpu
 def test_kda_metadata_cache_reuses_boundaries_and_refreshes_mutations():
     from torchturbo.ops.providers.npu.kda import _prepare_kda_metadata
 
@@ -58,6 +61,7 @@ def test_kda_metadata_cache_reuses_boundaries_and_refreshes_mutations():
     _prepare_kda_metadata.cache_clear()
 
 
+@pytest.mark.cpu
 def test_kda_metadata_preserves_empty_sequence_numbering():
     from torchturbo.ops.providers.npu.kda import _prepare_kda_metadata
 
@@ -69,6 +73,7 @@ def test_kda_metadata_preserves_empty_sequence_numbering():
     _prepare_kda_metadata.cache_clear()
 
 
+@pytest.mark.npu
 def test_causal_conv_consumes_prevalidated_offsets_without_host_conversion():
     gdn = _gdn_module()
     packed = build_packed_params(torch.tensor([0, 3], dtype=torch.int32))
@@ -81,6 +86,7 @@ def test_causal_conv_consumes_prevalidated_offsets_without_host_conversion():
     assert offsets is packed.cu_seqlens_list
 
 
+@pytest.mark.npu
 def test_gdr_consumes_packed_params_directly(monkeypatch):
     gdn = _gdn_module()
     calls = []
@@ -109,6 +115,7 @@ def test_gdr_consumes_packed_params_directly(monkeypatch):
     assert args[11] is packed.chunk_indices_list
 
 
+@pytest.mark.npu
 def test_gdr_backward_intermediate_saving_is_opt_in(monkeypatch):
     gdn = _gdn_module()
     calls = []

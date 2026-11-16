@@ -24,6 +24,10 @@ from torchturbo.utils import flash_attn_utils
 from .flash_attention_fakes import lazy_flash_attention_kernels
 
 
+pytestmark = pytest.mark.cpu
+
+
+
 def _configure_ops(monkeypatch, runtime):
     dispatcher = OpDispatcher(device_runtime=runtime, registry=registry)
     monkeypatch.setattr(interface, "ops", dispatcher)

@@ -21,6 +21,10 @@ from torchturbo.models.modules.vision.balance import (
 )
 
 
+pytestmark = pytest.mark.cpu
+
+
+
 def _meta(src, index, patches, mode, merge_unit=4):
     return _MediaMeta(
         src=src,

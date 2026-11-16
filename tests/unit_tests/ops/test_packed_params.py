@@ -4,6 +4,7 @@ import torch
 from torchturbo.ops.packed_params import get_packed_params
 
 
+@pytest.mark.cpu
 def test_padding_metadata_preserves_prefix_and_reuses_host_offsets():
     cu = torch.tensor([0, 2, 5], dtype=torch.int32)
 
@@ -17,6 +18,7 @@ def test_padding_metadata_preserves_prefix_and_reuses_host_offsets():
     assert get_packed_params(cu, 5).cu_seqlens_list == [0, 2, 5]
 
 
+@pytest.mark.cpu
 def test_cached_padding_metadata_tracks_boundary_mutations():
     cu = torch.tensor([0, 2, 5], dtype=torch.int32)
     before = get_packed_params(cu, 6)
@@ -29,6 +31,7 @@ def test_cached_padding_metadata_tracks_boundary_mutations():
     assert after.cu_seqlens_list == [0, 3, 5, 6]
 
 
+@pytest.mark.cpu
 def test_invalid_boundaries_do_not_replace_cached_metadata():
     cu = torch.tensor([0, 2, 5], dtype=torch.int32)
     packed = get_packed_params(cu, 6)
@@ -41,11 +44,13 @@ def test_invalid_boundaries_do_not_replace_cached_metadata():
     assert get_packed_params(cu, 6) is packed
 
 
+@pytest.mark.cpu
 def test_missing_boundaries_do_not_build_metadata():
     assert get_packed_params(None, 6) is None
     assert get_packed_params(None, 6, device=torch.device("cpu")) is None
 
 
+@pytest.mark.gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_cpu_boundaries_share_metadata_on_the_target_device_and_track_mutation():
     cu = torch.tensor([0, 2, 5], dtype=torch.int32)
@@ -79,6 +84,7 @@ def test_cpu_boundaries_share_metadata_on_the_target_device_and_track_mutation()
     assert returned_to_cpu.cu_seqlens_list == updated.cu_seqlens_list
 
 
+@pytest.mark.cpu
 def test_inference_boundaries_do_not_require_a_mutation_counter():
     with torch.inference_mode():
         cu = torch.tensor([0, 2, 5], dtype=torch.int32)

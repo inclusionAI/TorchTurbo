@@ -13,6 +13,10 @@ from torchturbo.engine.utils import (
 )
 
 
+pytestmark = pytest.mark.cpu
+
+
+
 def test_validate_signature_requires_explicit_keyword_with_exact_default():
     def supported(*, flag=False):
         pass

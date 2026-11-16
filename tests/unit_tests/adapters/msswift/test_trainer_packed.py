@@ -20,6 +20,10 @@ from torchturbo.models.modules.attention.ulysses import (  # noqa: E402
     ulysses_pad_inputs,
 )
 
+
+pytestmark = pytest.mark.cpu
+
+
 # (prompt, chosen response, rejected response) for each preference pair.
 _PAIRS = [
     ([1, 2], [3, 4], [9]),

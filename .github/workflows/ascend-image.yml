@@ -1,0 +1,190 @@
+name: Ascend-Image-CI
+run-name: Ascend-Image-CI ${{ inputs.runner || 'ubuntu-22.04-arm' }}
+
+# Build the L1 base image and publish it to SWR.
+# Manual dispatch only: one build can take 4-5 hours and many GB of bandwidth.
+# Image tags are content-addressed: base-<year-week>-c<content-hash>.
+# All logic lives in scripts/ci/tools/image.py so it can run locally.
+
+on:
+  # Disabled for now. Uncomment to restore the nightly build.
+  # schedule:
+  #   - cron: '0 13 * * *'
+
+  workflow_dispatch:
+    inputs:
+      force_rebuild:
+        description: 'Rebuild even when the content tag already exists'
+        required: true
+        default: false
+        type: boolean
+      should_push:
+        description: 'false = validate the build without publishing'
+        required: true
+        default: true
+        type: boolean
+      runner:
+        description: 'Runner for the image build'
+        required: true
+        default: 'ubuntu-22.04-arm'
+        type: choice
+        options:
+          - ubuntu-22.04-arm
+          - linux-aarch64-cpu-24
+          - linux-aarch64-cpu-4
+      max_jobs:
+        description: 'MAX_JOBS; auto = min(nproc, memory-GB / 3)'
+        required: true
+        default: 'auto'
+      use_cache:
+        description: 'Enable the GitHub Actions build cache'
+        required: true
+        default: true
+        type: boolean
+
+# Do not run two image builds concurrently.
+concurrency:
+  group: image-ci-base
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  REGISTRY: swr.cn-north-12.myhuaweicloud.com
+  REPOSITORY: ascend/torchturbo_npu
+  DOCKERFILE: docker/npu/Dockerfile_aarch64
+  PLATFORM: linux/arm64
+  MOVING_TAG: base-latest
+
+jobs:
+  build-base:
+    name: Ascend-Image-Build (${{ inputs.runner || 'ubuntu-22.04-arm' }})
+    runs-on: ${{ inputs.runner || 'ubuntu-22.04-arm' }}
+    # Hosted runners stop at 6 hours; leave time for cleanup and summary.
+    timeout-minutes: 350
+    outputs:
+      image: ${{ steps.tag.outputs.ref || steps.tag.outputs.full_tag }}
+      digest: ${{ steps.build.outputs.digest }}
+      built: ${{ steps.tag.outputs.build }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check runner
+        env:
+          RUNNER_LABEL: ${{ inputs.runner || 'ubuntu-22.04-arm' }}
+        run: python3 -m scripts.ci.tools.image env
+
+      - name: Resolve content tag
+        id: tag
+        env:
+          FORCE: ${{ inputs.force_rebuild }}
+          SHOULD_PUSH: ${{ inputs.should_push }}
+        run: python3 -m scripts.ci.tools.image tag
+
+      - name: Log in to SWR
+        if: steps.tag.outputs.build == 'true' && steps.tag.outputs.should_push == 'true'
+        env:
+          SWR_USER: ${{ secrets.SWR_USERNAME }}
+          SWR_PASS: ${{ secrets.SWR_PASSWORD }}
+        run: |
+          set -uo pipefail
+          if [ -z "${SWR_USER:-}" ] || [ -z "${SWR_PASS:-}" ]; then
+            echo "::error::SWR_USERNAME / SWR_PASSWORD are not configured"
+            exit 1
+          fi
+          if ! printf '%s' "$SWR_PASS" | docker login "$REGISTRY" -u "$SWR_USER" \
+                 --password-stdin >/tmp/login.log 2>&1; then
+            echo "::error::docker login failed"
+            tail -10 /tmp/login.log || true
+            exit 1
+          fi
+          echo "::notice::docker login succeeded (${REGISTRY})"
+
+      - name: Create buildx builder
+        id: builder
+        if: steps.tag.outputs.build == 'true'
+        run: |
+          set -uo pipefail
+          NAME="imageci-$$"
+          # The default docker driver cannot export GHA build cache.
+          if docker buildx create --name "$NAME" --driver docker-container --use \
+                 >/dev/null 2>&1; then
+            docker buildx inspect --bootstrap >/dev/null 2>&1 || true
+            echo "name=$NAME" >> "$GITHUB_OUTPUT"
+            echo "builder ready: $NAME (docker-container)"
+          else
+            echo "::warning::docker-container builder failed; GHA build cache disabled"
+            echo "name=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build and push
+        id: build
+        if: steps.tag.outputs.build == 'true'
+        # Fail earlier than the job timeout when a network-bound layer hangs.
+        timeout-minutes: 320
+        env:
+          TAG_IMM: ${{ steps.tag.outputs.immutable }}
+          MAX_JOBS: ${{ inputs.max_jobs || 'auto' }}
+          SHOULD_PUSH: ${{ steps.tag.outputs.should_push }}
+          USE_CACHE: ${{ inputs.use_cache }}
+          BUILDER: ${{ steps.builder.outputs.name }}
+        run: python3 -m scripts.ci.tools.image build
+
+      - name: Upload build log
+        if: always() && steps.tag.outputs.build == 'true'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-${{ github.run_number }}
+          path: /tmp/build.log
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: Verify image
+        id: verify
+        if: steps.tag.outputs.build == 'true' && steps.tag.outputs.should_push == 'true'
+        env:
+          TAG_IMM: ${{ steps.tag.outputs.immutable }}
+        run: python3 -m scripts.ci.tools.image verify
+
+      # Publish the current image reference for PR jobs.
+      - name: Publish image reference
+        if: always() && steps.tag.outputs.should_push == 'true'
+        env:
+          TAG_IMM: ${{ steps.tag.outputs.immutable }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: python3 -m scripts.ci.tools.image publish
+
+      - name: Upload image reference
+        if: always() && steps.tag.outputs.should_push == 'true'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          # Keep this name stable; consumers select the latest artifact.
+          name: base-image-ref
+          path: /tmp/image-ref/image-ref.txt
+          # Keep long enough to cover holidays; PR falls back to base-latest.
+          retention-days: 90
+          overwrite: true
+
+      - name: Summary
+        if: always()
+        env:
+          TAG_IMM: ${{ steps.tag.outputs.immutable }}
+          RUNNER_LABEL: ${{ inputs.runner || 'ubuntu-22.04-arm' }}
+          BUILT: ${{ steps.tag.outputs.build }}
+          SHOULD_PUSH: ${{ steps.tag.outputs.should_push }}
+          USE_CACHE: ${{ inputs.use_cache }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+          MEDIA_TYPE: ${{ steps.verify.outputs.media_type }}
+          ELAPSED: ${{ steps.build.outputs.elapsed }}
+        run: python3 -m scripts.ci.tools.image summary
+
+      - name: Cleanup
+        if: always()
+        continue-on-error: true
+        env:
+          BUILDER: ${{ steps.builder.outputs.name }}
+        run: python3 -m scripts.ci.tools.image cleanup

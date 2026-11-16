@@ -23,6 +23,10 @@ from torchturbo.parallel import (
 from torchturbo.engine.utils import match_fqn
 
 
+pytestmark = pytest.mark.cpu
+
+
+
 def test_standalone_world_shard_spec_is_valid():
     spec = FSDPPlanSpec(standalone_world_shard=True)
 

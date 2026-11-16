@@ -16,6 +16,10 @@ from torchturbo.engine.checkpoint.metadata import (
 from torchturbo.engine.config import EngineConfig
 
 
+pytestmark = pytest.mark.cpu
+
+
+
 class LinearModel(nn.Module):
     def __init__(self):
         super().__init__()

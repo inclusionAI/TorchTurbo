@@ -15,6 +15,9 @@ from torchturbo.runtime.cuda import CudaRuntime
 from torchturbo.runtime.npu import NpuRuntime
 
 
+pytestmark = pytest.mark.cpu
+
+
 def test_native_combine_allocates_output_without_copying_packed_activations():
     dispatcher = OpDispatcher(device_runtime=CpuRuntime(), registry=registry)
     num_tokens, topk, hidden_size = 256, 8, 128

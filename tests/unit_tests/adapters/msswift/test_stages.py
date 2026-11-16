@@ -8,6 +8,11 @@ from __future__ import annotations
 
 import os
 import sys
+import pytest
+
+
+pytestmark = pytest.mark.cpu
+
 
 os.environ.setdefault("TORCH_TURBO_DISABLE", "1")
 

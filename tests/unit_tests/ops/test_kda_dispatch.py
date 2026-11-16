@@ -26,6 +26,9 @@ from torchturbo.runtime import TurboDevice
 from torchturbo.runtime.cpu import CpuRuntime
 
 
+pytestmark = pytest.mark.cpu
+
+
 @pytest.fixture(autouse=True)
 def _reset_state(monkeypatch):
     monkeypatch.setattr(runtime_impl, "_SELECTED_RUNTIME", None)

@@ -29,9 +29,14 @@ from torchturbo.models.qwen4_exp import ple as impl
 from torchturbo.models.qwen4_exp.configuration_qwen4_exp import Qwen4ExpTextConfig
 from torchturbo.utils.flash_attn_utils import cu_seqlens_to_segment_ids
 from torchturbo.utils.torch_utils import torch_version
+from tests.support.distributed import destroy_process_group
 
 from .test_ple import adapted, new_reference, row_ids
 from .test_ple_loading import load_tables, make_checkpoint
+
+
+pytestmark = pytest.mark.cpu
+
 
 
 def _init_process_group(rank: int, world_size: int, init_file: str) -> None:
@@ -172,7 +177,7 @@ def _run_sp(rank: int, init_file: str) -> None:
         for length, boundaries in ((3, (0, 1, 11)), (1, (0, 4))):
             _check_sp(dist.group.WORLD, 2, length, boundaries)
     finally:
-        dist.destroy_process_group()
+        destroy_process_group()
 
 
 def _new_loading_text():
@@ -227,7 +232,7 @@ def _run_loading(rank: int, init_file: str, source: str, storage: str, fail: boo
         dist.barrier()
         assert list(Path(storage).iterdir()) == []
     finally:
-        dist.destroy_process_group()
+        destroy_process_group()
 
 
 def _short_conv_fp32(self, hidden_states, past_key_values):
@@ -299,7 +304,7 @@ def _run_fsdp(rank: int, init_file: str) -> None:
             )
         assert table.dtype == torch.float32
     finally:
-        dist.destroy_process_group()
+        destroy_process_group()
 
 
 @pytest.mark.skipif(

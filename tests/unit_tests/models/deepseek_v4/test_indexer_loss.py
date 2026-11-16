@@ -8,6 +8,7 @@ import torch.multiprocessing as mp
 from torchturbo.models.deepseek_v4 import model as turbo_model
 from torchturbo.models.deepseek_v4 import modeling_deepseek_v4 as dsv4
 from torchturbo.models.modules.moe.moe_utils import MoEAuxLossAutoScaler
+from tests.support.distributed import destroy_process_group
 
 from .test_packed_inputs import (
     _make_model,
@@ -15,6 +16,10 @@ from .test_packed_inputs import (
     _parallelize,
     restore_attention_forwards,
 )
+
+
+pytestmark = pytest.mark.cpu
+
 
 
 @pytest.fixture(autouse=True)
@@ -231,7 +236,7 @@ def _sp_auxiliary_worker(rank, init_file, lengths, padding):
             gradient /= 2
             torch.testing.assert_close(gradient, reference[name], atol=1e-6, rtol=2e-4)
     finally:
-        dist.destroy_process_group()
+        destroy_process_group()
 
 
 @pytest.mark.skipif(not dist.is_gloo_available(), reason="Gloo is required")

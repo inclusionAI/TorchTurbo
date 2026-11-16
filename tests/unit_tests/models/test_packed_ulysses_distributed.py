@@ -23,8 +23,13 @@ from torchturbo.models.modules.attention.ulysses.ulysses import (
 )
 from torchturbo.ops import OpDispatcher, registry
 from torchturbo.runtime.cpu import CpuRuntime
+from tests.support.distributed import destroy_process_group
 
 from .flash_attention_fakes import lazy_flash_attention_kernels, process_flash_kwargs
+
+
+pytestmark = pytest.mark.cpu
+
 
 
 def _cpu_varlen_attention(
@@ -179,7 +184,7 @@ def _run_packed_attention(rank: int, init_file: str) -> None:
             ):
                 _check_packed_attention(rank, num_valid_tokens, is_causal, collect_maxima)
     finally:
-        dist.destroy_process_group()
+        destroy_process_group()
 
 
 @pytest.mark.skipif(

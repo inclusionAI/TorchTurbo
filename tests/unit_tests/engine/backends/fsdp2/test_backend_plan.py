@@ -29,6 +29,10 @@ from torchturbo.parallel import (
 )
 
 
+pytestmark = pytest.mark.cpu
+
+
+
 class TaggedModule(nn.Module):
     def __init__(self, tag: str) -> None:
         super().__init__()

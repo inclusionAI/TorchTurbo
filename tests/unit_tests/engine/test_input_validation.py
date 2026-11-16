@@ -6,6 +6,10 @@ import torch
 from torchturbo.engine.utils import assert_packed_inputs, get_packed_boundaries
 
 
+pytestmark = pytest.mark.cpu
+
+
+
 def _batch():
     return {
         "input_ids": torch.tensor([[11, 12, 21, 22, 23, 99]]),

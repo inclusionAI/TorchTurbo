@@ -13,6 +13,10 @@ from torchturbo.registry import (
 from torchturbo.registry.registry import _adapters
 
 
+pytestmark = pytest.mark.cpu
+
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------

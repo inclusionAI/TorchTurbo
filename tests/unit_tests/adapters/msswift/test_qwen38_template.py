@@ -22,6 +22,9 @@ from torchturbo.models.qwen3_5.swift_qwen3_8 import Qwen3_8Template
 from torchturbo.models.qwen3_5.swift_template import register
 
 
+pytestmark = [pytest.mark.cpu, pytest.mark.integration]
+
+
 @pytest.fixture
 def tokenizer():
     vocab = {word: i for i, word in enumerate(sorted(pre_tokenizers.ByteLevel.alphabet()))}

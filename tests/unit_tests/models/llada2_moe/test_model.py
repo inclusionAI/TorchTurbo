@@ -17,6 +17,11 @@ from torchturbo.models.llada2_moe.modeling_llada2_moe import LLaDA2MoeRMSNorm
 from torchturbo.models.registry import get_model
 from torchturbo.ops import get_or_create_ops
 from torchturbo.runtime.cpu import CpuRuntime
+import pytest
+
+
+pytestmark = pytest.mark.cpu
+
 
 
 class _FakeRotaryEmbedding(nn.Module):

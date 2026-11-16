@@ -16,6 +16,9 @@ from torchturbo.runtime import TurboDevice
 from torchturbo.models.modules.moe.utils import maybe_move_tensor_to_cpu
 
 
+pytestmark = pytest.mark.cpu
+
+
 @pytest.mark.parametrize("as_numpy", [False, True])
 def test_cpu_counts_honor_host_representation(as_numpy):
     counts = torch.tensor([3, 0, 5])

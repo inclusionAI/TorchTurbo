@@ -5,6 +5,10 @@ import os
 
 import pytest
 
+
+pytestmark = pytest.mark.cpu
+
+
 os.environ.setdefault("TORCH_TURBO_DISABLE", "1")
 
 

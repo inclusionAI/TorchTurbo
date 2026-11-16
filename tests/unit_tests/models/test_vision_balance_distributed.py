@@ -20,6 +20,11 @@ from torchturbo.models.modules.vision import (
     register_vision_balance,
 )
 from torchturbo.parallel import VisionBalanceMode, VisionBalanceSpec
+from tests.support.distributed import destroy_process_group
+
+
+pytestmark = pytest.mark.cpu
+
 
 
 @dataclass
@@ -187,7 +192,7 @@ def _distributed_round_trip(rank: int, init_file: str, sp_size: int) -> None:
                     torch.testing.assert_close(local.raw, expected.raw)
                     torch.testing.assert_close(local.pooled, expected.pooled)
     finally:
-        dist.destroy_process_group()
+        destroy_process_group()
 
 
 @pytest.mark.parametrize("sp_size", [1, 2])

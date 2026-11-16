@@ -8,6 +8,10 @@ from torch import nn
 from torchturbo.models.bailing_hybrid.model import TurboBailingMoeV3ForCausalLM
 
 
+pytestmark = pytest.mark.cpu
+
+
+
 class _FakeRotaryEmbedding(nn.Module):
     def __init__(self) -> None:
         super().__init__()

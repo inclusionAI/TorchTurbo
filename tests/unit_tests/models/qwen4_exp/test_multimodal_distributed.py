@@ -22,10 +22,15 @@ from torchturbo.models.modules.cpu_resident import CPUResidentParameter
 from torchturbo.models.qwen4_exp.model import TurboQwen4ExpForConditionalGeneration
 from torchturbo.ops import OpPolicy, get_or_create_ops
 from torchturbo.runtime.cpu import CpuRuntime
+from tests.support.distributed import destroy_process_group
 
 from .test_model import _small_config
 from .test_multimodal import _cpu_flash
 from .test_ple_distributed import _init_process_group
+
+
+pytestmark = pytest.mark.cpu
+
 
 
 def _check_full_model_sp(rank, init_file, modality, reentrant):
@@ -59,7 +64,7 @@ def _check_full_model_sp(rank, init_file, modality, reentrant):
             )
             _compare_full_model_sp(rank, modality, reentrant, monkeypatch)
     finally:
-        dist.destroy_process_group()
+        destroy_process_group()
 
 
 def _compare_full_model_sp(rank, modality, reentrant, monkeypatch):

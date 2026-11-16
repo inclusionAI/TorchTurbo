@@ -27,6 +27,10 @@ from torchturbo.ops import OpDispatcher, registry
 from torchturbo.runtime.cpu import CpuRuntime
 
 
+pytestmark = pytest.mark.cpu
+
+
+
 def _attention(model_name: str) -> nn.Module:
     config_kwargs = {
         "hidden_size": 4,

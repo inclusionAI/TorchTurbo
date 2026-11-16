@@ -22,6 +22,11 @@ from torchturbo.engine.backends.fsdp2.checkpoint.dcp import DcpCheckpoint
 from torchturbo.models.modules.cpu_resident import (
     NodeSharedCPUResidentParameter,
 )
+from tests.support.distributed import destroy_process_group
+
+
+pytestmark = pytest.mark.cpu
+
 
 
 class ResidentStateModel(nn.Module):
@@ -48,7 +53,7 @@ def single_rank_group(tmp_path, monkeypatch):
         yield
     finally:
         NodeSharedCPUResidentParameter._node_group = None
-        dist.destroy_process_group()
+        destroy_process_group()
 
 
 def _shared_model(root):
@@ -305,7 +310,7 @@ def _round_trip_worker(rank, world_size, root):
         assert initialized.table.shard_sizes is None
     finally:
         NodeSharedCPUResidentParameter._node_group = None
-        dist.destroy_process_group()
+        destroy_process_group()
 
 
 @pytest.mark.parametrize("world_size", [2, 4])
@@ -394,7 +399,7 @@ def _zero_shards_worker(rank, root):
         assert model.table.shard_sizes is None
     finally:
         NodeSharedCPUResidentParameter._node_group = None
-        dist.destroy_process_group()
+        destroy_process_group()
 
 
 def test_node_shared_dcp_zero_shards_and_chunk_geometry(tmp_path):
@@ -493,7 +498,7 @@ def _native_layout_failure_worker(rank, root):
         torch.testing.assert_close(model.table, expected)
     finally:
         NodeSharedCPUResidentParameter._node_group = None
-        dist.destroy_process_group()
+        destroy_process_group()
 
 
 def test_node_shared_dcp_native_layout_failure_reaches_every_node(tmp_path):
@@ -551,7 +556,7 @@ def _io_failure_worker(rank, root, operation):
         dist.barrier()
     finally:
         NodeSharedCPUResidentParameter._node_group = None
-        dist.destroy_process_group()
+        destroy_process_group()
 
 
 @pytest.mark.skipif(

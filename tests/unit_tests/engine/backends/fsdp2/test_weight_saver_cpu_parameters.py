@@ -25,6 +25,11 @@ from torchturbo.engine.backends.fsdp2.checkpoint.weight_saver import (
 from torchturbo.models.modules.cpu_resident import NodeSharedCPUResidentParameter
 from torchturbo.models.weight_converter import BaseWeightConverter
 from torchturbo.runtime.cpu import CpuRuntime
+from tests.support.distributed import destroy_process_group
+
+
+pytestmark = pytest.mark.cpu
+
 
 _NGRAM_NAMES = (
     "ngram_embedding.shard_0.weight",
@@ -83,7 +88,7 @@ def process_group(tmp_path, monkeypatch):
     try:
         yield init_device_mesh("cpu", (1, 1), mesh_dim_names=("edp", "ep"))
     finally:
-        dist.destroy_process_group()
+        destroy_process_group()
         NodeSharedCPUResidentParameter._node_group = None
 
 
@@ -201,7 +206,7 @@ def _distributed_export_worker(rank, source, output, init_file):
         _update_frozen_parameters(model)
         saver.save_model(output)
     finally:
-        dist.destroy_process_group()
+        destroy_process_group()
 
 
 def test_distributed_export_saves_frozen_cpu_parameters_once(tmp_path, source_checkpoint):
@@ -308,7 +313,7 @@ def _ordered_export_worker(rank, root, created, release, finished, failure):
             json.dumps({"result": result, "metadata_started": metadata_started})
         )
     finally:
-        dist.destroy_process_group()
+        destroy_process_group()
 
 
 @pytest.mark.parametrize("failure", [None, "writer", "metadata"])

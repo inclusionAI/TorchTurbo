@@ -7,6 +7,15 @@ import pytest
 import torch.distributed as dist
 
 from torchturbo.models.modules.cpu_resident import NodeSharedCPUResidentParameter
+from torchturbo.ops import get_or_create_ops
+from torchturbo.runtime.cpu import CpuRuntime
+from tests.support.distributed import destroy_process_group
+
+
+@pytest.fixture(autouse=True)
+def configure_cpu_ops(request):
+    if request.node.get_closest_marker("cpu") is not None:
+        get_or_create_ops(device_runtime=CpuRuntime())
 
 
 @pytest.fixture
@@ -19,5 +28,5 @@ def node_group(tmp_path_factory, monkeypatch):
     try:
         yield
     finally:
-        dist.destroy_process_group()
+        destroy_process_group()
         NodeSharedCPUResidentParameter._node_group = None

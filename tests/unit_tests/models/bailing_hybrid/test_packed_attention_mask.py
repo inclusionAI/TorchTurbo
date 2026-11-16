@@ -11,6 +11,10 @@ from torchturbo.models.bailing_hybrid import modeling_bailing_moe_v3 as modeling
 from torchturbo.models.bailing_hybrid.model import TurboBailingMoeV3ForCausalLM
 
 
+pytestmark = pytest.mark.cpu
+
+
+
 class _CapturedKDA(Exception):
     pass
 

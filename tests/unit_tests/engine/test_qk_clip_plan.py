@@ -24,6 +24,10 @@ from torchturbo.models.modules.attention.qk_clip import get_qk_clip_state
 from torchturbo.runtime.cpu import CpuRuntime
 
 
+pytestmark = pytest.mark.cpu
+
+
+
 class _Attention(nn.Module):
     def __init__(self):
         super().__init__()

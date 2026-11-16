@@ -12,6 +12,10 @@ from torchturbo.models.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeGatedDe
 from torchturbo.models.qwen3_5_moe_text.model import TurboQwen3_5MoeTextForCausalLM
 
 
+pytestmark = pytest.mark.cpu
+
+
+
 _ADAPTERS = [
     (TurboQwen3_5ForConditionalGeneration, Qwen3_5GatedDeltaNet),
     (TurboQwen3_5MoeForConditionalGeneration, Qwen3_5MoeGatedDeltaNet),

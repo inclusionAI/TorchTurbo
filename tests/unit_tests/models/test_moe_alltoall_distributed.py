@@ -26,6 +26,10 @@ from torchturbo.ops import OpPolicy, get_or_create_ops
 from torchturbo.parallel import FSDPPlanSpec
 from torchturbo.runtime.cpu import CpuRuntime
 import torchturbo.runtime.runtime as runtime_module
+from tests.support.distributed import destroy_process_group
+
+
+pytestmark = pytest.mark.cpu
 
 
 def _check_moe(
@@ -145,7 +149,7 @@ def _run_moe(rank: int, ep_size: int, init_file: str) -> None:
             _check_moe(rank, ep_size, empty_source, boundary, use_reentrant, on_input)
             dist.barrier()
     finally:
-        dist.destroy_process_group()
+        destroy_process_group()
 
 
 def _run_fsdp_moe(rank: int, world_size: int, init_file: str, freeze_inputs: bool) -> None:
@@ -170,7 +174,7 @@ def _run_fsdp_moe(rank: int, world_size: int, init_file: str, freeze_inputs: boo
             )
             dist.barrier()
     finally:
-        dist.destroy_process_group()
+        destroy_process_group()
 
 
 @pytest.mark.skipif(

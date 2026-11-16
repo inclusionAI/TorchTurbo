@@ -22,8 +22,13 @@ from torchturbo.models.qwen3_5_moe.model import TurboQwen3_5MoeForConditionalGen
 from torchturbo.models.qwen3_5_moe.parallel_plan import _replace_qwen3_5_moe_only
 from torchturbo.ops import get_or_create_ops
 from torchturbo.runtime.cpu import CpuRuntime
+from tests.support.distributed import destroy_process_group
 
 from .test_trainer_packed import _packed_batch
+
+
+pytestmark = pytest.mark.cpu
+
 
 
 @pytest.fixture
@@ -42,7 +47,7 @@ def cpu_moe(monkeypatch, tmp_path):
     try:
         yield
     finally:
-        dist.destroy_process_group()
+        destroy_process_group()
 
 
 def _model(engine_config, sp_info):

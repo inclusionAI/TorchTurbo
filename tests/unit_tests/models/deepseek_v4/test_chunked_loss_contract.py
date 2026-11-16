@@ -15,6 +15,10 @@ from torchturbo.models.deepseek_v4.modeling_deepseek_v4 import (
 )
 
 
+pytestmark = pytest.mark.cpu
+
+
+
 class _IdentityLayer(nn.Module):
     def forward(self, hidden_states, **kwargs):
         return (hidden_states,)

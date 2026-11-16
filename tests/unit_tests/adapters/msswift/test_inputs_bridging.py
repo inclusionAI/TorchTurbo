@@ -19,6 +19,10 @@ from torchturbo.adapters.msswift.inputs_bridging import (  # noqa: E402
 )
 
 
+pytestmark = pytest.mark.cpu
+
+
+
 def _t(values):
     return torch.tensor(values)
 

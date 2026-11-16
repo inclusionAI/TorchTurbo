@@ -6,6 +6,10 @@ import torch.nn as nn
 from torchturbo.engine.model_fqn import build_model_fqn_map
 
 
+pytestmark = pytest.mark.cpu
+
+
+
 def test_model_fqn_map_is_identity_for_an_unwrapped_model():
     model = nn.Sequential(nn.Linear(2, 2), nn.ReLU())
 
