@@ -160,7 +160,7 @@ def test_kimi_forwards_cu_boundaries_and_padding_to_language_layers(sequence_len
             super().__init__()
             self.model = backbone
 
-        def forward(self, **kwargs):
+        def forward(self, logits_to_keep=0, **kwargs):
             output = self.model(**kwargs)
             return CausalLMOutputWithPast(logits=output.last_hidden_state)
 

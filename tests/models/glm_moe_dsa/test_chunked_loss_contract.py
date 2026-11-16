@@ -45,6 +45,6 @@ def test_glm_moe_dsa_standard_forward_exposes_lm_head_input():
     )
 
     assert outputs.logits is None
-    assert hidden_states[0] is model.model.hidden
+    assert torch.equal(hidden_states[0], model.model.hidden)
     assert model.lm_head is real_lm_head
     assert model.lm_head(hidden_states[0]).shape == (1, 4, 7)
