@@ -129,3 +129,31 @@ def test_chunk_loss_restores_deepseek_head_after_forward_error():
 
     assert "head" not in vars(model)
     assert model.head is real_lm_head
+
+
+@pytest.mark.parametrize(
+    "selector",
+    [
+        1,
+        torch.tensor([False, True, True, False]),
+        torch.zeros(4, dtype=torch.bool),
+        torch.tensor([3, 1]),
+    ],
+)
+def test_logits_to_keep_is_rejected_before_model_forward(selector):
+    model = _make_model()
+    model.layers = nn.ModuleList([_FailingLayer()])
+
+    with pytest.raises(AssertionError, match="DeepSeek V4 logits_to_keep is disabled"):
+        model(input_ids=torch.tensor([[1, 2, 3, 4]]), logits_to_keep=selector)
+
+
+def test_explicit_zero_keeps_full_logits():
+    model = _make_model()
+    input_ids = torch.tensor([[1, 2, 3, 4]])
+
+    expected = model(input_ids=input_ids).logits
+    actual = model(input_ids=input_ids, logits_to_keep=0).logits
+
+    assert actual.shape == (1, 4, model.vocab_size)
+    torch.testing.assert_close(actual, expected)

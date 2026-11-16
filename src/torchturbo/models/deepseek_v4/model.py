@@ -130,6 +130,11 @@ class TurboDeepseekV4ForCausalLM(TurboModel, DeepseekV4ForCausalLM):
 
     @wraps(DeepseekV4ForCausalLM.forward)
     def forward(self, *args, **kwargs):
+        logits_to_keep = kwargs.pop("logits_to_keep", 0)
+        assert isinstance(logits_to_keep, int) and logits_to_keep == 0, (
+            "DeepSeek V4 logits_to_keep is disabled: NPU RMSNorm backward "
+            "does not support empty selections. Set use_logits_to_keep=False."
+        )
         lm_head = self._modules["head"]
         noop_lm_head = self.head
         if noop_lm_head is lm_head:
