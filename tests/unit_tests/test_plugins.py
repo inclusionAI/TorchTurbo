@@ -14,7 +14,9 @@ import pytest
 pytestmark = pytest.mark.cpu
 
 
-_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_REPO_ROOT = os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)
 _PLUGINS_PATH = os.path.join(_REPO_ROOT, "src", "torchturbo", "engine", "plugins.py")
 
 
@@ -163,6 +165,7 @@ def test_try_consume_runs_consumer_only_on_matching_plugins(module, manager, tmp
     manager.try_consume(_C())
     manager.try_consume(_NonMatching())
     assert seen == [["a"]]
+
 
 def test_checkpoint_export_plugin_loads_without_platform_sdk(module, tmp_path):
     plugin_file = _write_plugin(
