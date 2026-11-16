@@ -4,8 +4,10 @@ import pytest
 import torch
 
 from torchturbo.engine.config import EngineConfig, MTPConfig
+from torchturbo.models import base as model_base
 from torchturbo.models.base import TurboModel, TurboVLMModel
 from torchturbo.models.kimi_k25.model import TurboKimiK25ForConditionalGeneration
+from torchturbo.runtime import TurboDevice
 
 
 pytestmark = pytest.mark.cpu
@@ -73,17 +75,46 @@ def test_init_context_retains_mtp_when_enabled():
     assert model_config.num_nextn_predict_layers == 2
 
 
-def test_init_context_forces_flash_attention_2():
+@pytest.mark.parametrize(
+    ("turbo_device", "expected"),
+    [
+        (TurboDevice.CPU, "eager"),
+        (TurboDevice.NPU, "flash_attention_2"),
+    ],
+)
+def test_init_context_selects_attention_implementation(
+    monkeypatch, turbo_device, expected
+):
+    monkeypatch.setattr(
+        model_base,
+        "get_device_runtime",
+        lambda: SimpleNamespace(turbo_device=turbo_device),
+    )
     model_config = SimpleNamespace(dtype=torch.bfloat16)
     engine_config = EngineConfig()
 
     with TurboModel.init_context(model_config, engine_config):
-        assert model_config._attn_implementation == "flash_attention_2"
+        assert model_config._attn_implementation == expected
 
 
-def test_vlm_init_context_propagates_flash_attention_2_to_subconfigs():
+@pytest.mark.parametrize(
+    ("turbo_device", "expected"),
+    [
+        (TurboDevice.CPU, "eager"),
+        (TurboDevice.NPU, "flash_attention_2"),
+    ],
+)
+def test_vlm_init_context_propagates_attention_implementation_to_subconfigs(
+    monkeypatch, turbo_device, expected
+):
     from torchturbo.models.qwen3_5_moe.configuration_qwen3_5_moe import (
         Qwen3_5MoeConfig,
+    )
+
+    monkeypatch.setattr(
+        model_base,
+        "get_device_runtime",
+        lambda: SimpleNamespace(turbo_device=turbo_device),
     )
 
     model_config = Qwen3_5MoeConfig()
@@ -92,9 +123,9 @@ def test_vlm_init_context_propagates_flash_attention_2_to_subconfigs():
     model_config.vision_config._attn_implementation = "sdpa"
 
     with TurboVLMModel.init_context(model_config, EngineConfig()):
-        assert model_config._attn_implementation == "flash_attention_2"
-        assert model_config.text_config._attn_implementation == "flash_attention_2"
-        assert model_config.vision_config._attn_implementation == "flash_attention_2"
+        assert model_config._attn_implementation == expected
+        assert model_config.text_config._attn_implementation == expected
+        assert model_config.vision_config._attn_implementation == expected
 
 
 def test_vlm_init_context_forwards_engine_config_and_restores_nested_dtype():
