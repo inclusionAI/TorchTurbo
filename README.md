@@ -374,6 +374,7 @@ Most environment variables have corresponding higher-priority `--tt_*` CLI argum
 | Diffusion models (LLaDA2) | `--tt_cap_lambda` / `--tt_bd_mask_low` / `--tt_bd_mask_high` / `--tt_bd_block_size` |
 | Checkpointing | `--tt_hf_export` |
 | Profiling, metrics, and logging | `--tt_profiling` / `--tt_memory_snapshot_steps` / `--tt_log_mfu` / `--tt_card_name` / `--tt_log_level` |
+| ms-swift integration | `--tt_swift_packing_max_sequences` |
 
 DeepSeek-V4 MTP and DSpark jointly train the backbone and draft modules, including
 the shared embedding and output head. DSpark stops gradients through its reference
