@@ -11,6 +11,7 @@ from .base import BaseProfiler, DeviceRuntime, TurboDevice
 # Ascend environment variable reference:
 # https://www.hiascend.com/document/detail/zh/Pytorch/600/apiref/apilist/ptaoplist_001052.html
 _NPU_ENV_DEFAULTS = {
+    "ASCEND_CUSTOM_OPP_PATH": "/usr/local/lib/cann_ops/vendors/custom_transformer",
     "HCCL_CONNECT_TIMEOUT": "7200",
     "HCCL_EXEC_TIMEOUT": "7200",
     "HCCL_EVENT_TIMEOUT": "14500",

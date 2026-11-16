@@ -20,6 +20,7 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import logging
 
+from ..modules.rope import get_shared_rope_table
 from .configuration_deepseek_v4 import DeepseekV4Config
 
 logger = logging.get_logger(__name__)
@@ -751,14 +752,19 @@ class DeepseekV4Attention(nn.Module):
         else:
             original_seq_len, rope_theta = 0, config.rope_theta
 
-        freqs_cis = self._precompute_freqs_cis(
-            self.rope_head_dim,
-            config.max_position_embeddings,
-            original_seq_len,
-            rope_theta,
-            config.rope_factor,
-            config.beta_fast,
-            config.beta_slow,
+        freqs_cis = get_shared_rope_table(
+            DeepseekV4Attention._precompute_freqs_cis,
+            (
+                self.rope_head_dim,
+                config.max_position_embeddings,
+                original_seq_len,
+                rope_theta,
+                config.rope_factor,
+                config.beta_fast,
+                config.beta_slow,
+            ),
+            device=None,
+            dtype=torch.complex64,
         )
         self.register_buffer("freqs_cis", freqs_cis, persistent=False)
 
