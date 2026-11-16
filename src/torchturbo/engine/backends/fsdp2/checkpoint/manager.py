@@ -123,6 +123,9 @@ class FSDP2CheckpointManager(BaseCheckpointManager):
 
         adapter_state_dict = get_peft_model_state_dict(model)
         expert_tensors = self._grouped_lora_tensors(model)
+        adapter_configs = self._to_standard_hf_adapter_configs(
+            model, expert_tensors.values()
+        )
         gathered_state_dict = {}
         for name, tensor in adapter_state_dict.items():
             if name in expert_tensors:
@@ -138,7 +141,9 @@ class FSDP2CheckpointManager(BaseCheckpointManager):
                     )
                 )
             else:
-                gathered_state_dict[name] = self._full_cpu_tensor(tensor)
+                if isinstance(tensor, DTensor):
+                    tensor = self._stage_tensor(tensor).full_tensor()
+                gathered_state_dict[name] = tensor.detach().to("cpu", copy=True).contiguous()
 
         def write_adapter() -> None:
             os.makedirs(output_dir, exist_ok=True)
@@ -146,9 +151,7 @@ class FSDP2CheckpointManager(BaseCheckpointManager):
                 gathered_state_dict,
                 os.path.join(output_dir, "adapter_model.safetensors"),
             )
-            for config in self._hf_adapter_configs(
-                model, expert_tensors.values()
-            ).values():
+            for config in adapter_configs.values():
                 config.save_pretrained(output_dir)
             sync_directory(output_dir)
 
@@ -206,10 +209,10 @@ class FSDP2CheckpointManager(BaseCheckpointManager):
                 )
         return split
 
-    def _hf_adapter_configs(
+    def _to_standard_hf_adapter_configs(
         self, model: nn.Module, grouped_tensors: Any
     ) -> dict[str, Any]:
-        """Return PEFT configs whose targets match standard HF expert modules."""
+        """Convert PEFT configs to use standard HF expert target modules."""
         import copy
 
         configs = copy.deepcopy(model.peft_config)
@@ -240,7 +243,7 @@ class FSDP2CheckpointManager(BaseCheckpointManager):
             config.target_modules = targets
         return configs
 
-    def _stage_cpu_offload_tensor(self, tensor: Any) -> Any:
+    def _stage_tensor(self, tensor: Any) -> Any:
         """Stage a CPU-resident DTensor shard onto its mesh's device."""
         if not self._cpu_offload or not isinstance(tensor, DTensor):
             return tensor
@@ -257,19 +260,12 @@ class FSDP2CheckpointManager(BaseCheckpointManager):
             stride=tensor.stride(),
         )
 
-    def _full_cpu_tensor(self, tensor: Any) -> Any:
-        """Detach a local or distributed tensor into a CPU safetensors value."""
-        if isinstance(tensor, DTensor):
-            tensor = self._stage_cpu_offload_tensor(tensor)
-            tensor = tensor.full_tensor()
-        return tensor.detach().to("cpu", copy=True).contiguous()
-
     def _gather_expert_lora_tensor(
         self, tensor: Any, num_global_experts: int
     ) -> torch.Tensor:
         """Concatenate GroupedMLPLoRA local expert tensors over the EP mesh."""
         if isinstance(tensor, DTensor):
-            tensor = self._stage_cpu_offload_tensor(tensor)
+            tensor = self._stage_tensor(tensor)
             local = tensor.full_tensor()
         else:
             local = tensor
