@@ -1,6 +1,7 @@
 """Numerical and lifecycle contracts for Bailing V3 VL integration."""
 
 import copy
+import importlib
 import json
 import logging
 from contextlib import nullcontext
@@ -12,6 +13,9 @@ import torch
 from torch import nn
 
 from torchturbo.engine.config import EngineConfig, ParameterGroup
+from torchturbo.ops import OpPolicy, get_or_create_ops
+from torchturbo.runtime.cuda import CudaRuntime
+from torchturbo.runtime.npu import NpuRuntime
 from torchturbo.models.bailing_moe_v3_vl.configuration_bailing_moe_v3_vl import (
     BailingMoeV3Config,
     BailingMoeV3VLConfig,
@@ -88,6 +92,61 @@ def make_model(**kwargs):
         if isinstance(module, BailingMoeV3KimiDeltaAttention):
             nn.init.zeros_(module.dt_bias)
     return model.eval()
+
+
+def _available_accelerator() -> str | None:
+    """Return the device type whose kernels are worth comparing against CPU."""
+    if torch.cuda.is_available():
+        return "cuda"
+    if hasattr(torch, "npu") and torch.npu.is_available():
+        return "npu"
+    return None
+
+
+@pytest.mark.skipif(
+    _available_accelerator() is None,
+    reason="requires a CUDA or NPU device for the device-vs-CPU comparison",
+)
+@pytest.mark.parametrize(
+    "grid_side",
+    [4, 256],
+    ids=["small-run", "huge-run"],
+)
+def test_get_rope_index_matches_cpu_on_accelerator(grid_side, monkeypatch):
+    """The patched mRoPE builder must give identical results on CPU and device.
+
+    The huge-run case spans many Triton program blocks; it guards against
+    sizing a single program to the whole run, which overflows on-chip memory
+    on accelerators with a small local buffer.
+    """
+    accelerator = _available_accelerator()
+    model = make_model()
+    merged_side = grid_side // 2
+    token_count = merged_side * merged_side
+    ids = torch.tensor([[2] + [60] * token_count + [3]])
+    image_grid_thw = torch.tensor([[1, grid_side, grid_side]])
+
+    # The cpu_dispatch fixture points the ops proxy at the CPU runtime, so
+    # this call selects the native PyTorch baseline.
+    cpu_positions, cpu_deltas = model.model.get_rope_index(
+        ids, image_grid_thw=image_grid_thw
+    )
+
+    # Reconfigure the dispatcher for the accelerator runtime: the same call
+    # now selects the fused Triton implementation on NPU.
+    runtime_cls = NpuRuntime if accelerator == "npu" else CudaRuntime
+    monkeypatch.setattr(
+        importlib.import_module("torchturbo.ops.ops"), "_OPS", None
+    )
+    get_or_create_ops(device_runtime=runtime_cls(), default_policy=OpPolicy.AUTO)
+    device_positions, device_deltas = model.model.get_rope_index(
+        ids.to(accelerator), image_grid_thw=image_grid_thw.to(accelerator)
+    )
+
+    assert device_positions.device.type == accelerator
+    assert device_deltas.device.type == accelerator
+    torch.testing.assert_close(device_positions.cpu(), cpu_positions)
+    torch.testing.assert_close(device_deltas.cpu(), cpu_deltas)
 
 
 @pytest.fixture

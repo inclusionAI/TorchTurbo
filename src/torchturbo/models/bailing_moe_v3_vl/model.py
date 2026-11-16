@@ -1,6 +1,7 @@
 """TorchTurbo lifecycle and parallel input contract for Bailing V3 VL."""
 
 from collections.abc import Iterable, Iterator
+import functools
 from contextlib import contextmanager
 from typing import Any
 
@@ -66,6 +67,39 @@ class TurboBailingMoeV3VLForConditionalGeneration(
                 config.to_dict(), attn_implementation=config._attn_implementation
             )
         super().__init__(config)
+        self._patch_get_rope_index()
+
+    def _patch_get_rope_index(self) -> None:
+        """Install the dispatched mRoPE builder on the inner model.
+        """
+        original_get_rope_index = self.model.get_rope_index
+
+        @functools.wraps(original_get_rope_index)
+        def _wrapped_get_rope_index(
+            input_ids,
+            mm_token_type_ids=None,
+            image_grid_thw=None,
+            video_grid_thw=None,
+            segment_ids=None,
+            **kwargs: Any,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            from torchturbo.ops import ops
+
+            vl_config = self.model._vl_config
+            return ops.bailing_vl_get_rope_index(
+                input_ids,
+                image_grid_thw,
+                video_grid_thw,
+                segment_ids,
+                image_token_id=vl_config.image_token_id,
+                video_token_id=vl_config.video_token_id,
+                spatial_merge_size=vl_config.vision_config.spatial_merge_size,
+                use_interleaved_frame_timestamp=(
+                    vl_config.text_config.use_interleaved_frame_timestamp
+                ),
+            )
+
+        self.model.get_rope_index = _wrapped_get_rope_index
 
     @classmethod
     @contextmanager
