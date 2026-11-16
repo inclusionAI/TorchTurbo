@@ -17,8 +17,8 @@
     "UPDATE_GOLDEN": true,
     "MODEL_ARGS": {},
     "TRAIN_ARGS": {
-      "model": "/root/.cache/pretrained_models/bailing_v3/ling_tiny_v3_formal_256k_enhance_0420_wthink/merge-step-mean-0baeb1658f223ec4bcfa8d7cf6b7e242",
-      "dataset": "/root/.cache/torchturbo/datasets/am_think/science.jsonl",
+      "model": "/mnt/sfs_turbo/pretrained_models/bailing_v3/ling_tiny_v3_formal_256k_enhance_0420_wthink/merge-step-mean-0baeb1658f223ec4bcfa8d7cf6b7e242",
+      "dataset": "/mnt/sfs_turbo/torchturbo/datasets/am_think/science.jsonl",
       "model_type": "turbo_bailing_hybrid",
       "template": "ling_v3",
       "check_model": false,
