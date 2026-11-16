@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from functools import lru_cache
+from itertools import pairwise
 from typing import Any
 
 import torch
@@ -11,6 +13,29 @@ from torchturbo.runtime import TurboDevice
 from ...base import OpImpl, OpImplKind
 from ...packed_params import PackedParams
 from ...registry import register_op
+
+
+_MAX_KDA_SEQUENCES = 1024
+
+
+@lru_cache(maxsize=1)
+def _prepare_kda_batches(cu_host: tuple[int, ...], max_sequences: int):
+    """Cache token ranges and rebased host metadata without device transfers."""
+    num_sequences = len(cu_host) - 1
+    batches = []
+    for sequence_start in range(0, num_sequences, max_sequences):
+        sequence_end = min(sequence_start + max_sequences, num_sequences)
+        token_start, token_end = cu_host[sequence_start], cu_host[sequence_end]
+        boundaries = [
+            offset - token_start
+            for offset in cu_host[sequence_start:sequence_end + 1]
+        ]
+        indices = []
+        for sequence_index, (left, right) in enumerate(pairwise(boundaries)):
+            for chunk_index in range((right - left + 63) // 64):
+                indices.extend((sequence_index, chunk_index))
+        batches.append((token_start, token_end, (boundaries, indices)))
+    return batches
 
 
 class ChunkKDAFunction(torch.autograd.Function):
@@ -30,15 +55,29 @@ class ChunkKDAFunction(torch.autograd.Function):
         output_final_state: bool,
         lower_bound: float | None,
         use_gate_in_kernel: bool,
-        packed_params: PackedParams | None,
+        packed_metadata: tuple[list[int], list[int]] | None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        from fla_npu.ops.ascendc import chunk_kda_fwd
-
         cu_seqlens = None
         chunk_indices = None
-        if packed_params is not None:
-            cu_seqlens = packed_params.cu_seqlens_list
-            chunk_indices = packed_params.chunk_indices_list["64"]
+        if packed_metadata is not None:
+            cu_seqlens, chunk_indices = packed_metadata
+        ctx.empty = cu_seqlens is not None and q.size(1) == 0
+        # An unused final state must arrive as None, not a materialized zero
+        # gradient: this kernel does not implement final-state backward.
+        ctx.set_materialize_grads(False)
+        if ctx.empty:
+            ctx.save_for_backward(q, k, v, g, beta, A_log, dt_bias)
+            final_state = None
+            if output_final_state:
+                final_state = torch.zeros(
+                    (len(cu_seqlens) - 1, q.size(0), q.size(-1), v.size(-1)),
+                    dtype=torch.float32,
+                    device=q.device,
+                )
+            return v.transpose(0, 1), final_state
+
+        from fla_npu.ops.ascendc import chunk_kda_fwd
+
         outputs = chunk_kda_fwd(
             q,
             k,
@@ -47,7 +86,7 @@ class ChunkKDAFunction(torch.autograd.Function):
             beta,
             scale,
             64,
-            layout="NTD" if packed_params is not None else "BNSD",
+            layout="NTD" if packed_metadata is not None else "BNSD",
             output_final_state=output_final_state,
             cu_seqlens=cu_seqlens,
             chunk_indices=chunk_indices,
@@ -68,9 +107,6 @@ class ChunkKDAFunction(torch.autograd.Function):
         ctx.use_gate_in_kernel = use_gate_in_kernel
         ctx.cu_seqlens = cu_seqlens
         ctx.chunk_indices = chunk_indices
-        # An unused final state must arrive as None, not a materialized zero
-        # gradient: this kernel does not implement final-state backward.
-        ctx.set_materialize_grads(False)
         return output, final_state
 
     @staticmethod
@@ -79,12 +115,18 @@ class ChunkKDAFunction(torch.autograd.Function):
         grad_output: torch.Tensor,
         grad_final_state: torch.Tensor | None,
     ) -> tuple[torch.Tensor | None, ...]:
-        from fla_npu.ops.ascendc import chunk_kda_bwd
-
         if grad_final_state is not None:
             raise NotImplementedError(
                 "AscendC KDA does not support gradients through final_state."
             )
+        if ctx.empty:
+            return tuple(
+                torch.zeros_like(tensor) if tensor is not None else None
+                for tensor in ctx.saved_tensors
+            ) + (None,) * 5
+
+        from fla_npu.ops.ascendc import chunk_kda_bwd
+
         q, k, v, g, beta, A_log, dt_bias, gk, aqk, akk, w, qg, kg, v_new, h = (
             ctx.saved_tensors
         )
@@ -159,11 +201,7 @@ def ascendc_chunk_kda(
     lower_bound: float | None = None,
     packed_params: PackedParams | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """Run KDA on [B,T,H,D] inputs and return time-major output.
-
-    The fla-npu v26.9.1 backward requires safe gate, equal Q/K/V head
-    counts, K=V=128, and no initial-state or final-state gradients.
-    """
+    """Run KDA on [B,T,H,D] inputs, batching packed sequences within the kernel limit."""
     if not safe_gate:
         raise NotImplementedError(
             "AscendC KDA training requires safe_gate=True. "
@@ -200,21 +238,38 @@ def ascendc_chunk_kda(
         tensor = tensor.transpose(1, 2)
         if packed_params is not None:
             tensor = tensor.squeeze(0)
-        inputs.append(tensor.contiguous())
+        inputs.append(tensor)
 
-    output, final_state = ChunkKDAFunction.apply(
-        *inputs,
-        A_log,
-        dt_bias,
-        scale,
-        output_final_state,
-        lower_bound,
-        use_gate_in_kernel,
-        packed_params,
-    )
-    if packed_params is not None:
-        output = output.unsqueeze(0)
-    return output, final_state
+    def run_chunk(chunk_inputs, metadata):
+        return ChunkKDAFunction.apply(
+            *(tensor.contiguous() for tensor in chunk_inputs),
+            A_log,
+            dt_bias,
+            scale,
+            output_final_state,
+            lower_bound,
+            use_gate_in_kernel,
+            metadata,
+        )
+
+    if packed_params is None:
+        return run_chunk(inputs, None)
+    cu_host = packed_params.cu_seqlens_list
+    if len(cu_host) - 1 <= _MAX_KDA_SEQUENCES:
+        metadata = (cu_host, packed_params.chunk_indices_list["64"])
+        output, final_state = run_chunk(inputs, metadata)
+        return output.unsqueeze(0), final_state
+
+    outputs, final_states = [], []
+    batches = _prepare_kda_batches(tuple(cu_host), _MAX_KDA_SEQUENCES)
+    for token_start, token_end, metadata in batches:
+        group_inputs = [tensor[:, token_start:token_end] for tensor in inputs]
+        output, final_state = run_chunk(group_inputs, metadata)
+        outputs.append(output)
+        if output_final_state:
+            final_states.append(final_state)
+    output = torch.cat(outputs, dim=0).unsqueeze(0)
+    return output, torch.cat(final_states, dim=0) if output_final_state else None
 
 
 @register_op(
