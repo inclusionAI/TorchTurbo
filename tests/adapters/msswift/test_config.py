@@ -53,7 +53,6 @@ from torchturbo.engine.backends.fsdp2.config import (  # noqa: E402
 )
 from torchturbo.engine.config import (  # noqa: E402
     DistributedBackend,
-    FreezePolicy,
     MixedPrecisionPolicy,
     ParameterGroup,
 )
@@ -723,6 +722,87 @@ def test_lora_dpo_rejects_a_separate_reference_adapter():
         build_config_from_swift_args(
             _base_args(rlhf_type="dpo", tuner_type="lora", ref_adapters=["reference"])
         )
+
+
+@pytest.mark.parametrize("resume_from_checkpoint", [None, "checkpoint"])
+def test_lora_dpo_rejects_policy_adapters(resume_from_checkpoint):
+    _set_tt()
+    with pytest.raises(NotImplementedError, match="LoRA DPO with adapters"):
+        build_config_from_swift_args(
+            _base_args(
+                rlhf_type="dpo", tuner_type="lora", adapters=["policy-adapter"],
+                resume_from_checkpoint=resume_from_checkpoint, resume_only_model=False,
+            )
+        )
+
+
+@pytest.mark.parametrize("ignore_data_skip", [False, True])
+def test_lora_dpo_rejects_model_only_resume(ignore_data_skip):
+    _set_tt()
+    with pytest.raises(NotImplementedError, match="LoRA DPO with resume_only_model"):
+        build_config_from_swift_args(
+            _base_args(
+                rlhf_type="dpo", tuner_type="lora", adapters=["checkpoint"],
+                resume_from_checkpoint="checkpoint", resume_only_model=True,
+                ignore_data_skip=ignore_data_skip,
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    "initialization,resume_only_model,ignore_data_skip",
+    [
+        ("adapters", False, False),
+        ("adapters_and_resume", False, False),
+        ("resume", False, False),
+        ("resume", False, True),
+        ("resume", True, False),
+        ("resume", True, True),
+    ],
+)
+def test_native_lora_dpo_checkpoint_options(
+    tmp_path, initialization, resume_only_model, ignore_data_skip,
+):
+    pytest.importorskip("swift", minversion="4.0")
+    from peft import LoraConfig
+
+    from torchturbo.adapters.msswift.args import TurboRLHFArguments
+
+    model_dir = _save_tiny_llama(tmp_path)
+    checkpoint = tmp_path / "checkpoint"
+    # Swift requires an adapter config when normalizing policy adapter paths.
+    LoraConfig(r=2, target_modules=["q_proj"]).save_pretrained(checkpoint)
+    adapters = [str(checkpoint)] if initialization.startswith("adapters") else []
+    resume = str(checkpoint) if initialization != "adapters" else None
+    args = TurboRLHFArguments(
+        model=str(model_dir), model_type="llama", template="llama",
+        dataset=["training-data"], rlhf_type="dpo", tuner_type="lora",
+        adapters=adapters, resume_from_checkpoint=resume,
+        resume_only_model=resume_only_model, ignore_data_skip=ignore_data_skip,
+        output_dir=str(tmp_path / "output"), add_version=False, report_to=[],
+        use_cpu=True, check_model=False, fp16=False, bf16=False,
+    )
+    assert args.resume_from_checkpoint == resume
+    if resume_only_model:
+        # Native Swift synthesizes this adapter path before Turbo validates it.
+        assert args.adapters == [str(checkpoint)]
+        expected_error = "LoRA DPO with resume_only_model"
+    elif initialization.startswith("adapters"):
+        assert args.adapters == [str(checkpoint)]
+        expected_error = "LoRA DPO with adapters"
+    else:
+        assert args.adapters == []
+        expected_error = None
+
+    _set_tt()
+    if expected_error is None:
+        config = build_config_from_swift_args(args)
+        assert config.checkpoint.hf_export == "every"
+        assert args.training_args.resume_from_checkpoint == str(checkpoint)
+        assert args.training_args.resume_only_model is False
+    else:
+        with pytest.raises(NotImplementedError, match=expected_error):
+            build_config_from_swift_args(args)
 
 
 def test_dpo_rejects_mtp():
