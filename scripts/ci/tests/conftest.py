@@ -10,9 +10,9 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from scripts.ci.contracts.artifacts import Source  # noqa: E402
-from scripts.ci.producer.catalog import Catalog, load as load_catalog  # noqa: E402
+from scripts.ci.producer.ci_config import CiConfig, Scope, load as load_config  # noqa: E402
+from scripts.ci.producer.facts import TestFacts, load as load_facts  # noqa: E402
 from scripts.ci.producer.planner import build, source_for  # noqa: E402
-from scripts.ci.producer.policy import Policy, load as load_policy  # noqa: E402
 
 
 @pytest.fixture(scope="session")
@@ -21,8 +21,13 @@ def repo_root() -> Path:
 
 
 @pytest.fixture(scope="session")
-def catalog() -> Catalog:
-    return load_catalog(ROOT)
+def config() -> CiConfig:
+    return load_config(ROOT)
+
+
+@pytest.fixture(scope="session")
+def facts(config: CiConfig) -> TestFacts:
+    return load_facts(ROOT, config)
 
 
 @pytest.fixture(scope="session")
@@ -35,25 +40,21 @@ def source(repo_root: Path) -> Source:
     )
 
 
-def _policy(name: str) -> Policy:
-    return load_policy(ROOT / "scripts" / "ci" / "config" / "policies.yml", name)
+@pytest.fixture(scope="session")
+def pr_scope(config: CiConfig) -> Scope:
+    return config.scope("pull_request")
 
 
 @pytest.fixture(scope="session")
-def pr_policy() -> Policy:
-    return _policy("pull_request")
+def nightly_scope(config: CiConfig) -> Scope:
+    return config.scope("nightly")
 
 
 @pytest.fixture(scope="session")
-def nightly_policy() -> Policy:
-    return _policy("nightly")
+def pr_plan(config: CiConfig, facts: TestFacts, source: Source):
+    return build(config, facts, "pull_request", source)
 
 
 @pytest.fixture(scope="session")
-def pr_plan(catalog: Catalog, pr_policy: Policy, source: Source):
-    return build(catalog, pr_policy, source)
-
-
-@pytest.fixture(scope="session")
-def nightly_plan(catalog: Catalog, nightly_policy: Policy, source: Source):
-    return build(catalog, nightly_policy, source)
+def nightly_plan(config: CiConfig, facts: TestFacts, source: Source):
+    return build(config, facts, "nightly", source)

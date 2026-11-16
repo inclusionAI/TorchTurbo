@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Derive per-file pytest facts from source without importing test modules."""
+"""Derive per-file pytest facts from tests/unit_tests without importing modules."""
 
 from __future__ import annotations
 
@@ -273,10 +273,10 @@ def _process_unit(path: str, families: set[str]) -> str:
 
 
 def scan_tests(root: Path, models: set[str]) -> tuple[dict[str, TestFacts], list[ScanError]]:
-    """Scan tests/ and validate marker/runtime evidence for each file."""
+    """Scan tests/unit_tests and validate marker/runtime evidence for each file."""
     facts: dict[str, TestFacts] = {}
     errors: list[ScanError] = []
-    for path in sorted((root / "tests").rglob("test_*.py")):
+    for path in sorted((root / "tests" / "unit_tests").rglob("test_*.py")):
         rel = path.relative_to(root).as_posix()
         try:
             tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"))

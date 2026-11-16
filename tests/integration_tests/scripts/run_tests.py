@@ -140,9 +140,18 @@ def cli_args(args: dict[str, Any]) -> list[str]:
     return result
 
 
-def run_case(spec: TestCaseSpec, golden_path: Path) -> Path:
+def run_case(
+    spec: TestCaseSpec,
+    golden_path: Path,
+    *,
+    output_dir: Path,
+    skip_install: bool,
+    forbid_update_golden: bool,
+) -> Path:
     """Run one isolated case; never reuse logs or mutate input assets."""
     case = load_case(spec)
+    if forbid_update_golden and case["UPDATE_GOLDEN"]:
+        raise ValueError(f"{spec.test_name}: CI must not update golden values")
     framework = case["FRAMEWORK"]
     if framework == "swift":
         model_key = "model"
@@ -153,7 +162,8 @@ def run_case(spec: TestCaseSpec, golden_path: Path) -> Path:
     else:
         raise NotImplementedError(f"Training is not implemented for {framework}")
     validate_training(case, model_key)
-    install_dependencies(spec)
+    if not skip_install:
+        install_dependencies(spec)
     if case["COMPARE"] and not case["UPDATE_GOLDEN"] and not golden_path.is_file():
         raise FileNotFoundError(
             f"No {golden_path.name}; set UPDATE_GOLDEN to establish a baseline"
@@ -186,12 +196,8 @@ def run_case(spec: TestCaseSpec, golden_path: Path) -> Path:
         tokenizer_path, local_files_only=True, trust_remote_code=False
     )
     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-    run_dir = (
-        INTEGRATION_ROOT
-        / "outputs"
-        / spec.output_name
-        / f"{stamp}-{uuid.uuid4().hex[:8]}"
-    )
+    output_dir.mkdir(parents=True, exist_ok=True)
+    run_dir = output_dir / spec.output_name / f"{stamp}-{uuid.uuid4().hex[:8]}"
     run_dir.mkdir(parents=True, exist_ok=False)
     (run_dir / "config.yaml").write_text(yaml.safe_dump(case, sort_keys=False))
     engine_path = run_dir / "tt_config.yaml"
@@ -337,6 +343,25 @@ def select_cases(
     return selected
 
 
+def case_manifest(spec: TestCaseSpec) -> dict[str, Any]:
+    """Describe one case for CI without running it."""
+    case = load_case(spec)
+    golden_path = spec.config_path.parent / f"golden_values_{spec.platform}.json"
+    return {
+        "case_id": spec.test_name,
+        "description": spec.test_descr,
+        "framework": spec.framework,
+        "platform": spec.platform,
+        "ranks": spec.ngpu,
+        "mode": spec.mode,
+        "test_type": spec.test_type,
+        "compare": spec.compare,
+        "update_golden": case["UPDATE_GOLDEN"],
+        "config": spec.config_path.relative_to(REPO_ROOT).as_posix(),
+        "golden": golden_path.relative_to(REPO_ROOT).as_posix(),
+    }
+
+
 def install_dependencies(spec: TestCaseSpec) -> None:
     """Run the dependency installer this case needs for its model and framework."""
     # TEMPORARY: the installer chain sources deps/platform.sh, which exits
@@ -363,15 +388,51 @@ def main() -> None:
         required=True,
         help="Suite module name under test_suite/, e.g. base_suite",
     )
-    parser.add_argument("--platform", required=True, help="Platform this run targets")
-    parser.add_argument("--ngpu", type=int, required=True, help="Devices available")
+    parser.add_argument("--platform", help="Platform this run targets")
+    parser.add_argument("--ngpu", type=int, help="Devices available")
     parser.add_argument("--test_name", default="all", help="One case name, or all")
+    parser.add_argument(
+        "--list-cases", action="store_true", help="List suite cases as JSON"
+    )
+    parser.add_argument(
+        "--json", action="store_true", help="Use JSON output with --list-cases"
+    )
+    parser.add_argument(
+        "--skip-install",
+        action="store_true",
+        help="Use the caller's prepared environment instead of installing dependencies",
+    )
+    parser.add_argument(
+        "--forbid-update-golden",
+        action="store_true",
+        help="Fail before training if the case would rewrite its golden baseline",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=INTEGRATION_ROOT / "outputs",
+        help="Directory for isolated case run outputs",
+    )
     args = parser.parse_args()
-    if args.ngpu < 1:
-        raise ValueError("--ngpu must be positive")
     # Import the selected suite from the integration test_suite directory.
     sys.path.insert(0, str(INTEGRATION_ROOT / "test_suite"))
     suite = importlib.import_module(args.suite)
+    if args.list_cases:
+        payload = {
+            "schema_version": 1,
+            "suite": args.suite,
+            "cases": [case_manifest(spec) for spec in suite.TEST_CASES],
+        }
+        if args.json or not sys.stdout.isatty():
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+        else:
+            for case in payload["cases"]:
+                print(f"{case['case_id']}\t{case['platform']}\t{case['ranks']}")
+        return
+    if not args.platform or args.ngpu is None:
+        parser.error("--platform and --ngpu are required unless --list-cases is used")
+    if args.ngpu < 1:
+        raise ValueError("--ngpu must be positive")
     specs = select_cases(args, suite.TEST_CASES)
     if not specs:
         raise ValueError("No case matches the requested suite and filters")
@@ -380,7 +441,13 @@ def main() -> None:
             spec.config_path.parent / f"golden_values_{spec.platform}.json"
         )
         print(f"\n===== {spec.test_descr} ({spec.test_name}) =====", flush=True)
-        run_case(spec, golden_path)
+        run_case(
+            spec,
+            golden_path,
+            output_dir=args.output_dir,
+            skip_install=args.skip_install,
+            forbid_update_golden=args.forbid_update_golden,
+        )
 
 
 if __name__ == "__main__":

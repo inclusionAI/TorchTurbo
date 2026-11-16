@@ -12,15 +12,16 @@ from typing import Any, Iterable
 from ..contracts.artifacts import (
     ContractError,
     Decision,
+    IntegrationEvidence,
+    IntegrationSpec,
     JOB_RESULT_FILENAME,
     Job,
     JobResult,
-    ModelE2EEvidence,
-    ModelE2ESpec,
     Plan,
     PlanArtifact,
     PytestEvidence,
     PytestSpec,
+    SCHEMA_VERSION,
     canonical_json,
     digest,
     load_job_result,
@@ -49,20 +50,27 @@ def _failure(
 
 def _plan_failures(plan: Plan) -> list[dict[str, Any]]:
     failures: list[dict[str, Any]] = []
-    if plan.schema_version != 1:
+    if plan.schema_version != SCHEMA_VERSION:
         failures.append(_failure("plan-schema", f"unsupported schema {plan.schema_version}"))
     job_ids: set[str] = set()
     step_ids: set[str] = set()
     test_routes: set[tuple[str, str]] = set()
     pytest_files = {"core": set(), "model": set(), "adapter": set()}
     pytest_routes: Counter[str] = Counter()
-    e2e_cases: list[str] = []
+    integration_cases: dict[str, set[str]] = {}
+    integration_routes: set[tuple[str, str]] = set()
     for job in plan.jobs:
         if job.id in job_ids:
             failures.append(_failure("duplicate-job", "duplicate job id", job_id=job.id))
         job_ids.add(job.id)
         if not job.steps:
             failures.append(_failure("empty-job", "job has no steps", job_id=job.id))
+        if job.kind == "integration" and len(job.steps) != 1:
+            failures.append(_failure(
+                "integration-steps",
+                "integration job must contain exactly one step",
+                job_id=job.id,
+            ))
         for step in job.steps:
             if step.id in step_ids:
                 failures.append(_failure("duplicate-step", "duplicate step id", step_id=step.id))
@@ -78,8 +86,25 @@ def _plan_failures(plan: Plan) -> list[dict[str, Any]]:
                     test_routes.add(route)
                     pytest_files[step.spec.suite].add(path)
                     pytest_routes[step.spec.suite] += 1
-            else:
-                e2e_cases.append(step.spec.case_id)
+            elif isinstance(step.spec, IntegrationSpec):
+                if step.ranks != job.runtime.ranks:
+                    failures.append(_failure(
+                        "integration-ranks",
+                        "integration step ranks differ from job runtime",
+                        job_id=job.id,
+                        step_id=step.id,
+                    ))
+                route = (step.spec.suite, step.spec.case_id)
+                if route in integration_routes:
+                    failures.append(_failure(
+                        "duplicate-integration-case",
+                        f"duplicate integration case {route}",
+                        step_id=step.id,
+                    ))
+                integration_routes.add(route)
+                integration_cases.setdefault(step.spec.suite, set()).add(
+                    step.spec.case_id
+                )
 
     coverage = plan.coverage
     if coverage.get("jobs") != len(plan.jobs):
@@ -96,11 +121,55 @@ def _plan_failures(plan: Plan) -> list[dict[str, Any]]:
                     "coverage-pytest",
                     f"coverage for suite {suite} does not match jobs",
                 ))
-    e2e_coverage = coverage.get("model_e2e")
-    if not isinstance(e2e_coverage, dict):
-        failures.append(_failure("coverage-e2e", "coverage model_e2e is invalid"))
-    elif sorted(e2e_coverage.get("cases") or []) != sorted(e2e_cases):
-        failures.append(_failure("coverage-e2e", "coverage E2E cases differ from jobs"))
+    integration_coverage = coverage.get("integration")
+    if not isinstance(integration_coverage, dict):
+        failures.append(_failure("coverage-integration", "coverage integration is invalid"))
+    else:
+        for suite, cases in integration_cases.items():
+            value = integration_coverage.get(suite)
+            if not isinstance(value, dict) or sorted(value.get("cases") or []) != sorted(cases):
+                failures.append(_failure(
+                    "coverage-integration",
+                    f"coverage for integration suite {suite} differs from jobs",
+                ))
+        for suite, value in integration_coverage.items():
+            if not isinstance(value, dict):
+                failures.append(_failure(
+                    "coverage-integration",
+                    f"coverage for integration suite {suite} is invalid",
+                ))
+                continue
+            mode = value.get("mode")
+            cases = value.get("cases")
+            if mode not in {"all", "explicit", "none"} or not isinstance(cases, list):
+                failures.append(_failure(
+                    "coverage-integration",
+                    f"coverage for integration suite {suite} is invalid",
+                ))
+            elif suite not in integration_cases and (mode != "none" or cases):
+                failures.append(_failure(
+                    "coverage-integration",
+                    f"coverage for integration suite {suite} has no jobs",
+                ))
+    unsupported = coverage.get("unsupported_routes")
+    if not isinstance(unsupported, list):
+        failures.append(_failure("coverage-routes", "unsupported_routes is invalid"))
+    else:
+        seen_unsupported: set[tuple[str, str]] = set()
+        for item in unsupported:
+            if not isinstance(item, dict):
+                failures.append(_failure("coverage-routes", "unsupported route is invalid"))
+                continue
+            path, device = item.get("path"), item.get("device")
+            if not isinstance(path, str) or not path or device not in {"cpu", "npu", "gpu"}:
+                failures.append(_failure("coverage-routes", "unsupported route is invalid"))
+                continue
+            route = (path, device)
+            if route in seen_unsupported:
+                failures.append(_failure("coverage-routes", f"duplicate unsupported route {route}"))
+            if route in test_routes:
+                failures.append(_failure("coverage-routes", f"route is both executed and unsupported: {route}"))
+            seen_unsupported.add(route)
     return failures
 
 
@@ -117,12 +186,11 @@ def _expected_pytest_files(job: Job) -> set[str]:
     }
 
 
-def _expected_cases(job: Job) -> set[str]:
-    return {
-        step.spec.case_id
-        for step in job.steps
-        if isinstance(step.spec, ModelE2ESpec)
-    }
+def _expected_integration(job: Job) -> tuple[str, set[str]]:
+    specs = [step.spec for step in job.steps if isinstance(step.spec, IntegrationSpec)]
+    if len(specs) != 1:
+        return "", set()
+    return specs[0].suite, {specs[0].case_id}
 
 
 def _result_failures(plan: Plan, job: Job, result: JobResult) -> list[dict[str, Any]]:
@@ -167,9 +235,20 @@ def _result_failures(plan: Plan, job: Job, result: JobResult) -> list[dict[str, 
                     f"expected {len(expected_files)} files, got {result.items.executed_files}",
                     job_id=job.id,
                 ))
-        elif isinstance(result.items, ModelE2EEvidence):
-            if set(result.items.case_ids) != _expected_cases(job):
-                failures.append(_failure("e2e-case-ids", "E2E case evidence differs from Plan", job_id=job.id))
+        elif isinstance(result.items, IntegrationEvidence):
+            suite, case_ids = _expected_integration(job)
+            if result.items.suite != suite:
+                failures.append(_failure(
+                    "integration-suite",
+                    "integration evidence suite differs from Plan",
+                    job_id=job.id,
+                ))
+            if set(result.items.case_ids) != case_ids:
+                failures.append(_failure(
+                    "integration-case-ids",
+                    "integration case evidence differs from Plan",
+                    job_id=job.id,
+                ))
         else:
             failures.append(_failure("result-items", "result evidence type is invalid", job_id=job.id))
     elif result.status == "skipped":
@@ -197,7 +276,7 @@ def _check(identifier: str, failures: Iterable[dict[str, Any]], detail: str = ""
 
 
 def decide(plan: Plan, results: list[JobResult]) -> Decision:
-    """Judge one Plan and its JobResults without reading Catalog or Policy."""
+    """Judge one Plan and its JobResults without reading CiConfig or TestFacts."""
     failures: list[dict[str, Any]] = []
     plan_failures = _plan_failures(plan)
     failures.extend(plan_failures)
@@ -272,7 +351,7 @@ def decide(plan: Plan, results: list[JobResult]) -> Decision:
         _check("jobs.status", status_failures, "One or more jobs did not pass"),
     )
     return Decision(
-        schema_version=1,
+        schema_version=SCHEMA_VERSION,
         plan_id=plan.plan_id,
         status="passed" if not failures else "failed",
         summary=summary,
@@ -297,7 +376,7 @@ def decide_artifact(artifact: PlanArtifact) -> Decision:
             ),
         )
     return Decision(
-        schema_version=1,
+        schema_version=SCHEMA_VERSION,
         plan_id=artifact.plan.plan_id if artifact.plan is not None else "",
         status="failed",
         summary={

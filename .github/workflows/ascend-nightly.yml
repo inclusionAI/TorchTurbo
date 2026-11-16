@@ -1,7 +1,7 @@
 name: Ascend-Nightly-CI
 run-name: Ascend-Nightly-CI ${{ github.ref_name }}
 
-# Full unit + nightly E2E run. Reuses the main CI graph in ascend-pr.yml.
+# Full pytest + integration run. Reuses the main CI graph in ascend-pr.yml.
 # Automatic scheduling is intentionally disabled for now.
 on:
   # schedule:

@@ -5,9 +5,10 @@ run-name: Ascend-PR-CI ${{ github.event.pull_request.number && format('#{0}', gi
 #
 #   lint -> Planner -> PlanArtifact -> Executor matrix -> JobResult -> Gate
 #
-# PR runs all core pytest plus one model guard. Nightly runs every pytest suite
-# and every E2E case. The workflow only moves artifacts; selection lives in
-# scripts/ci/config/policies.yml and execution lives in the consumer package.
+# PR runs every core pytest plus two lightweight integration cases. Nightly runs
+# every pytest suite and every integration case. The workflow only moves
+# artifacts; selection lives in scripts/ci/config/ci.yml and execution lives in
+# the consumer package.
 
 on:
   pull_request:
@@ -25,7 +26,7 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: 'pr = core pytest + one model guard; full = nightly scope'
+        description: 'pr = core pytest + two integration guards; full = nightly scope'
         required: true
         default: 'pr'
         type: choice
@@ -141,11 +142,11 @@ jobs:
         run: |
           set -uo pipefail
           mkdir -p "$RUNNER_TEMP/ci-plan"
-          POLICY=pull_request
-          if [ "$CI_MODE" = full ]; then POLICY=nightly; fi
+          SCOPE=pull_request
+          if [ "$CI_MODE" = full ]; then SCOPE=nightly; fi
           COMMON=(
             --root "$GITHUB_WORKSPACE"
-            --policy "$POLICY"
+            --scope "$SCOPE"
             --output "$RUNNER_TEMP/ci-plan/plan.json"
             --source-repository "$GITHUB_REPOSITORY"
             --source-ref "$GITHUB_REF"
@@ -212,7 +213,7 @@ jobs:
           cache: pip
           cache-dependency-path: |
             pyproject.toml
-            scripts/ci/config/catalog.yml
+            scripts/ci/config/ci.yml
             scripts/ci/config/envs/*.txt
 
       - uses: actions/download-artifact@v4

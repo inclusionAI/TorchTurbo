@@ -6,13 +6,16 @@ Current architecture and local validation commands:
 The execution path is:
 
 ```text
-lint -> Producer -> PlanArtifact -> Consumer -> JobResult -> Gate
+lint -> Planner -> PlanArtifact -> Executor -> JobResult -> Gate
 ```
 
-- `scripts/ci/config/catalog.yml` declares images, venvs, runner lanes, pytest
-  facts, and model E2E cases.
-- `scripts/ci/config/policies.yml` selects the pull-request or nightly scope.
+- `scripts/ci/config/ci.yml` is the only CI configuration. It declares resources,
+  workload mappings, and pull-request/nightly scopes.
+- `scripts/ci/producer/facts.py` derives pytest facts from `tests/unit_tests` and
+  integration cases from the suite runner manifest.
+- Pull requests run all core pytest plus the two lightweight CPU/NPU integration
+  cases; nightly runs all pytest suites and all integration cases.
 - `.github/workflows/ascend-pr.yml` is the main PR and reusable workflow entry.
 - `.github/workflows/ascend-manual.yml` reduces the normal Plan to one exact job.
 - `.github/workflows/ascend-nightly.yml` reuses the main workflow with the
-  nightly policy.
+  nightly scope.

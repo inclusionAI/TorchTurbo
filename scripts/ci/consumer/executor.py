@@ -18,13 +18,14 @@ from typing import Any
 
 from ..contracts.artifacts import (
     ContractError,
+    IntegrationEvidence,
+    IntegrationSpec,
     Job,
     JobResult,
-    ModelE2EEvidence,
-    ModelE2ESpec,
     Plan,
     PytestEvidence,
     PytestSpec,
+    SCHEMA_VERSION,
     Step,
     StepResult,
     JOB_RESULT_FILENAME,
@@ -243,6 +244,34 @@ def _pytest_command(venv: Venv, spec: PytestSpec, junit: Path) -> list[str]:
     ]
 
 
+def _integration_command(
+    venv: Venv,
+    spec: IntegrationSpec,
+    job: Job,
+    step: Step,
+    *,
+    root: Path,
+    output_dir: Path,
+) -> list[str]:
+    return [
+        str(venv.python),
+        str(root / spec.runner.script),
+        "--suite",
+        spec.suite,
+        "--platform",
+        job.runtime.device,
+        "--ngpu",
+        str(step.ranks),
+        "--test_name",
+        spec.case_id,
+        "--skip-install",
+        "--forbid-update-golden",
+        "--output-dir",
+        str(output_dir / "integration"),
+        *spec.runner.args,
+    ]
+
+
 def _step_command(
     venv: Venv,
     job: Job,
@@ -256,10 +285,19 @@ def _step_command(
         junit = output_dir / "junit" / f"step-{index:02d}.xml"
         junit.parent.mkdir(parents=True, exist_ok=True)
         return _pytest_command(venv, step.spec, junit), venv.environment(), junit
-    if isinstance(step.spec, ModelE2ESpec):
-        script = root / "scripts/ci/consumer/runtime/model_e2e/run_train.sh"
-        environment = _e2e_environment(venv, step.spec, job, output_dir=output_dir)
-        return ["bash", str(script), "case"], environment, None
+    if isinstance(step.spec, IntegrationSpec):
+        return (
+            _integration_command(
+                venv,
+                step.spec,
+                job,
+                step,
+                root=root,
+                output_dir=output_dir,
+            ),
+            venv.environment(),
+            None,
+        )
     raise ExecutorError(f"unsupported step spec for {step.id}")
 
 
@@ -309,7 +347,9 @@ def _execute_steps(
     junit_paths: list[Path] = []
     executed_files = 0
     for index, step in enumerate(job.steps):
-        case_ids = (step.spec.case_id,) if isinstance(step.spec, ModelE2ESpec) else ()
+        case_ids = (
+            (step.spec.case_id,) if isinstance(step.spec, IntegrationSpec) else ()
+        )
         limit, _ = _timeout_budget(deadline, step.timeout_seconds)
         if limit == 0:
             results.append(_step_result(step, "failed", 124, case_ids))
@@ -366,46 +406,6 @@ def _job_timeout_failure(job: Job, step_id: str = "") -> dict[str, Any]:
     return failure
 
 
-def _e2e_environment(
-    venv: Venv,
-    spec: ModelE2ESpec,
-    job: Job,
-    *,
-    output_dir: Path,
-) -> dict[str, str]:
-    environment = venv.environment()
-    environment.update({
-        "MODEL_TYPE": spec.model,
-        "CASE_ID": spec.case_id,
-        "FRAMEWORK": spec.framework,
-        "ENV_NAME": job.runtime.venv.name,
-        "RUN_DIR": spec.run_dir,
-        "INSTALL_SCRIPT": spec.install.script,
-        "INSTALL_ARGS": " ".join(spec.install.args),
-        "TRAIN_SCRIPT": spec.train.script,
-        "TRAIN_ARGS": " ".join(spec.train.args),
-        "HF_REPO": spec.hf_repo,
-        "LAYERS": str(spec.layers),
-        "DATASET_IN": spec.dataset,
-        "SEQ_LEN": str(spec.seq_len),
-        "FINETUNING_TYPE": spec.finetuning_type,
-        "PLAN_CARDS": str(spec.ranks),
-        "PLAN_SP": str(spec.parallelism_sp),
-        "PLAN_EP": str(spec.parallelism_ep),
-        "FETCH_TIMEOUT": str(spec.fetch_timeout_seconds),
-        "CASE_TIMEOUT": str(spec.case_timeout_seconds),
-        "TORCH_BEFORE": str(output_dir / "torch-before.json"),
-        "RUNNER_LABEL": os.environ.get("RUNNER_LABEL", ""),
-        "IMAGE": job.runtime.image.ref,
-        "RESULT_JSON": str(output_dir / "e2e-facts.json"),
-        "GITHUB_OUTPUT": os.environ.get("GITHUB_OUTPUT", os.devnull),
-        "GITHUB_STEP_SUMMARY": os.environ.get(
-            "GITHUB_STEP_SUMMARY", os.devnull
-        ),
-    })
-    return environment
-
-
 def _junit_suites(path: Path) -> list[ET.Element]:
     if not path.is_file():
         return []
@@ -459,13 +459,20 @@ def _write_versions(venv: Venv, output: Path, root: Path) -> None:
     output.write_text(result.stdout.strip() + "\n", encoding="utf-8")
 
 
-def _evidence(job: Job, executed_files: int, merged_junit: Path) -> PytestEvidence | ModelE2EEvidence:
+def _evidence(
+    job: Job,
+    executed_files: int,
+    merged_junit: Path,
+) -> PytestEvidence | IntegrationEvidence:
     if job.kind == "pytest":
         return _junit_evidence(merged_junit, executed_files)
-    case_ids = tuple(
-        step.spec.case_id for step in job.steps if isinstance(step.spec, ModelE2ESpec)
-    )
-    return ModelE2EEvidence(case_ids=case_ids)
+    integration = [
+        step.spec for step in job.steps if isinstance(step.spec, IntegrationSpec)
+    ]
+    if len(integration) != 1:
+        raise ExecutorError("integration job must contain exactly one integration step")
+    spec = integration[0]
+    return IntegrationEvidence(suite=spec.suite, case_ids=(spec.case_id,))
 
 
 def _write_result(result: JobResult, output_dir: Path) -> None:
@@ -480,13 +487,13 @@ def _new_result(
     started_at: str,
     finished_at: str,
     duration_seconds: int,
-    items: PytestEvidence | ModelE2EEvidence,
+    items: PytestEvidence | IntegrationEvidence,
     **values: Any,
 ) -> JobResult:
     values.setdefault("steps", ())
     values.setdefault("artifacts", {})
     return JobResult(
-        schema_version=1,
+        schema_version=SCHEMA_VERSION,
         plan_id=plan.plan_id,
         job_id=job.id,
         kind=job.kind,
@@ -532,7 +539,7 @@ def execute(
     output_dir: Path,
     root: Path | None = None,
 ) -> JobResult:
-    """Execute one Job from a ready Plan without reading Catalog or Policy."""
+    """Execute one Job from a ready Plan without reading CiConfig or TestFacts."""
     job = _job(plan, job_id)
     root = root or Path(__file__).resolve().parents[3]
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -592,9 +599,8 @@ def execute(
     artifacts = {"log": log_path.name}
     if job.kind == "pytest":
         artifacts["junit"] = merged_junit.name
-    e2e_facts = output_dir / "e2e-facts.json"
-    if job.kind == "model_e2e" and e2e_facts.is_file():
-        artifacts["e2e"] = e2e_facts.name
+    if job.kind == "integration" and (output_dir / "integration").is_dir():
+        artifacts["integration"] = "integration"
     torch_before = output_dir / "torch-before.json"
     if torch_before.is_file():
         artifacts["torch-before"] = torch_before.name
@@ -660,8 +666,11 @@ def render_summary(result: JobResult) -> str:
             f"{result.items.tests_failed} failed, {result.items.tests_errors} errors, "
             f"{result.items.tests_skipped} skipped"
         )
-    elif isinstance(result.items, ModelE2EEvidence):
-        lines.append(f"- E2E cases: {', '.join(result.items.case_ids)}")
+    elif isinstance(result.items, IntegrationEvidence):
+        lines.append(
+            f"- integration {result.items.suite}: "
+            f"{', '.join(result.items.case_ids)}"
+        )
     if result.failure:
         step = f" ({result.failure['step_id']})" if result.failure.get("step_id") else ""
         lines.append(

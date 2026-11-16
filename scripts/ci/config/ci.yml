@@ -1,0 +1,112 @@
+schema_version: 1
+
+resources:
+  images:
+    cpu-default:
+      device: cpu
+      kind: host
+      ref: python:3.11
+      default: true
+    npu-default:
+      device: npu
+      kind: container
+      ref: swr.cn-north-12.myhuaweicloud.com/ascend/torchturbo_npu:base-latest
+      default: true
+
+  venvs:
+    default:
+      python: "3.11"
+      requirements: [scripts/ci/config/envs/default.txt]
+      constraints: auto
+    qwen4_exp:
+      python: "3.11"
+      requirements: [scripts/ci/config/envs/qwen4_exp.txt]
+      constraints: auto
+    lf:
+      python: "3.11"
+      requirements: [scripts/ci/config/envs/lf.txt]
+      constraints: auto
+    swift:
+      python: "3.11"
+      requirements: [scripts/ci/config/envs/swift.txt]
+      overrides: [scripts/ci/config/envs/swift_overrides.txt]
+      constraints: auto
+    qwen4_exp_swift:
+      python: "3.11"
+      extends: swift
+      constraints: auto
+
+  lanes:
+    cpu/default:
+      device: cpu
+      image: cpu-default
+      capacity_slots: 8
+      runner_variable: CI_CPU_RUNNER
+      runner: ubuntu-22.04-arm
+    npu/default-2:
+      device: npu
+      image: npu-default
+      capacity_slots: 2
+      runner_variable: CI_NPU_2_RUNNER
+      runner: linux-aarch64-a3-800i-2
+    npu/default-4:
+      device: npu
+      image: npu-default
+      capacity_slots: 4
+      runner_variable: CI_NPU_4_RUNNER
+      runner: linux-aarch64-a3-800i-4
+    npu/default-8:
+      device: npu
+      image: npu-default
+      capacity_slots: 8
+      runner_variable: CI_NPU_8_RUNNER
+      runner: linux-aarch64-a3-800i-8
+    npu/default-16:
+      device: npu
+      image: npu-default
+      capacity_slots: 16
+      runner_variable: CI_NPU_16_RUNNER
+      runner: linux-aarch64-a3-800i-16
+
+workloads:
+  pytest:
+    defaults:
+      job_timeout_minutes: {cpu: 40, npu: 360, gpu: 360}
+      step_timeout_seconds: {cpu: 2400, npu: 21600, gpu: 21600}
+    model_venvs:
+      qwen4_exp: qwen4_exp
+    framework_venvs:
+      lf: lf
+      swift: swift
+    combo_venvs:
+      qwen4_exp+swift: qwen4_exp_swift
+    overrides:
+      tests/unit_tests/models/bailing_moe_v3_vl/test_lf_image_parity.py:
+        venv: lf
+
+  integration:
+    suites:
+      base_suite:
+        runner: tests/integration_tests/scripts/run_tests.py
+        defaults:
+          job_timeout_minutes: {cpu: 60, npu: 360}
+          step_timeout_seconds: {cpu: 3600, npu: 21600}
+        framework_venvs:
+          swift: swift
+          llamafactory: lf
+        overrides:
+          bailing_v3/sft_16npu:
+            job_timeout_minutes: 480
+
+scopes:
+  pull_request:
+    pytest: {core: all, model: none, adapter: none}
+    integration:
+      base_suite:
+        mode: explicit
+        cases: [qwen3_5_moe/sft_2cpu, qwen3_5_moe/sft_2npu]
+
+  nightly:
+    pytest: {core: all, model: all, adapter: all}
+    integration:
+      base_suite: {mode: all}

@@ -40,8 +40,7 @@ class Venv:
         env.update({
             "VIRTUAL_ENV": str(self.path),
             "PYTHONNOUSERSITE": "1",
-            "PATH": (f"{Path(__file__).resolve().parent / 'bin'}:"
-                     f"{self.path / 'bin'}:{env.get('PATH', '')}"),
+            "PATH": f"{self.path / 'bin'}:{env.get('PATH', '')}",
         })
         return env
 

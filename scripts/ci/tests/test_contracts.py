@@ -5,9 +5,11 @@ from pathlib import Path
 import pytest
 
 from scripts.ci.contracts.artifacts import (
+    SCHEMA_VERSION,
     ContractError,
+    IntegrationEvidence,
+    IntegrationSpec,
     JobResult,
-    ModelE2EEvidence,
     PytestEvidence,
     StepResult,
     digest,
@@ -23,6 +25,8 @@ def test_plan_round_trip(tmp_path: Path, pr_plan) -> None:
     write_json(path, pr_plan.to_dict())
     loaded = load_plan(path)
     assert loaded.to_dict() == pr_plan.to_dict()
+    assert loaded.schema_version == SCHEMA_VERSION
+    assert loaded.scope == "pull_request"
 
 
 def test_plan_rejects_unknown_field(tmp_path: Path, pr_plan) -> None:
@@ -56,7 +60,7 @@ def _pytest_result(plan) -> JobResult:
     )
     executed_files = sum(len(step.spec.files) for step in job.steps)
     return JobResult(
-        schema_version=1,
+        schema_version=SCHEMA_VERSION,
         plan_id=plan.plan_id,
         job_id=job.id,
         kind=job.kind,
@@ -107,10 +111,12 @@ def test_skipped_result_requires_reason(tmp_path: Path, pr_plan) -> None:
         load_job_result(path)
 
 
-def test_e2e_result_requires_case_evidence(tmp_path: Path, pr_plan) -> None:
-    job = next(item for item in pr_plan.jobs if item.kind == "model_e2e")
+def test_integration_result_requires_case_evidence(tmp_path: Path, pr_plan) -> None:
+    job = next(item for item in pr_plan.jobs if item.kind == "integration")
+    spec = job.steps[0].spec
+    assert isinstance(spec, IntegrationSpec)
     result = JobResult(
-        schema_version=1,
+        schema_version=SCHEMA_VERSION,
         plan_id=pr_plan.plan_id,
         job_id=job.id,
         kind=job.kind,
@@ -119,13 +125,13 @@ def test_e2e_result_requires_case_evidence(tmp_path: Path, pr_plan) -> None:
         finished_at="2026-11-16T00:01:00Z",
         duration_seconds=60,
         runtime=job.runtime,
-        items=ModelE2EEvidence(case_ids=(job.steps[0].spec.case_id,)),
+        items=IntegrationEvidence(suite=spec.suite, case_ids=(spec.case_id,)),
         steps=(StepResult(
             id=job.steps[0].id,
             status="passed",
             exit_code=0,
-            spec_digest=digest(job.steps[0].spec.to_dict()),
-            case_ids=(job.steps[0].spec.case_id,),
+            spec_digest=digest(spec.to_dict()),
+            case_ids=(spec.case_id,),
         ),),
     )
     path = tmp_path / "result.json"

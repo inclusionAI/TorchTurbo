@@ -7,7 +7,7 @@ import pytest
 
 from scripts.ci.consumer import executor
 from scripts.ci.contracts.artifacts import (
-    ModelE2ESpec,
+    IntegrationSpec,
     PytestSpec,
     build_plan,
     build_plan_artifact,
@@ -56,7 +56,7 @@ def _plan_with_allowed_skip(plan, job_id: str, reason: str):
         for job in plan.jobs
     )
     return build_plan(
-        policy=plan.policy,
+        scope=plan.scope,
         source=plan.source,
         inputs=plan.inputs,
         coverage=plan.coverage,
@@ -67,10 +67,8 @@ def _plan_with_allowed_skip(plan, job_id: str, reason: str):
 def test_execute_pytest_job_writes_passing_result(
     tmp_path: Path, monkeypatch, pr_plan
 ) -> None:
-    job = next(item for item in pr_plan.jobs if item.id == "pytest-core-cpu-cpu-default-default")
-
+    job = next(item for item in pr_plan.jobs if item.kind == "pytest")
     _patch_execution(monkeypatch, tmp_path, job)
-
     calls = 0
 
     def fake_run(command, *, cwd, environment, log_path, timeout_seconds):
@@ -96,6 +94,35 @@ def test_execute_pytest_job_writes_passing_result(
     })
     loaded = load_job_result(output_dir / "job-result.json")
     assert loaded.to_dict() == result.to_dict()
+
+
+def test_execute_integration_job_writes_evidence(
+    tmp_path: Path, monkeypatch, pr_plan
+) -> None:
+    job = next(item for item in pr_plan.jobs if item.kind == "integration")
+    _patch_execution(monkeypatch, tmp_path, job)
+    observed: list[list[str]] = []
+
+    def fake_run(command, *, cwd, environment, log_path, timeout_seconds):
+        observed.append(command)
+        output = Path(command[command.index("--output-dir") + 1])
+        output.mkdir(parents=True, exist_ok=True)
+        (output / "run.log").write_text("integration output\n", encoding="utf-8")
+        return 0, False
+
+    monkeypatch.setattr(executor, "_run_stream", fake_run)
+    output_dir = tmp_path / "result"
+    result = executor.execute(pr_plan, job.id, output_dir=output_dir, root=tmp_path)
+    spec = job.steps[0].spec
+    assert isinstance(spec, IntegrationSpec)
+    assert result.status == "passed"
+    assert result.items.suite == spec.suite
+    assert result.items.case_ids == (spec.case_id,)
+    assert result.steps[0].case_ids == (spec.case_id,)
+    assert result.artifacts["integration"] == "integration"
+    assert "--skip-install" in observed[0]
+    assert "--forbid-update-golden" in observed[0]
+    assert "--test_name" in observed[0]
 
 
 def test_execute_leaves_provisional_result_if_terminated(
@@ -124,9 +151,7 @@ def test_execute_leaves_provisional_result_if_terminated(
 
 def test_execute_stops_after_first_failed_step(tmp_path: Path, monkeypatch, pr_plan) -> None:
     job = next(item for item in pr_plan.jobs if item.kind == "pytest")
-
     _patch_execution(monkeypatch, tmp_path, job)
-
     calls = 0
 
     def fake_run(command, *, cwd, environment, log_path, timeout_seconds):
@@ -147,13 +172,8 @@ def test_execute_stops_after_first_failed_step(tmp_path: Path, monkeypatch, pr_p
 
 def test_execute_records_timeout(tmp_path: Path, monkeypatch, pr_plan) -> None:
     job = next(item for item in pr_plan.jobs if item.kind == "pytest")
-
     _patch_execution(monkeypatch, tmp_path, job)
-    monkeypatch.setattr(
-        executor,
-        "_run_stream",
-        lambda *args, **kwargs: (124, True),
-    )
+    monkeypatch.setattr(executor, "_run_stream", lambda *args, **kwargs: (124, True))
     result = executor.execute(pr_plan, job.id, output_dir=tmp_path / "result", root=tmp_path)
 
     assert result.status == "failed"
@@ -206,22 +226,28 @@ def test_record_skip_enforces_allowed_reason(tmp_path: Path, pr_plan) -> None:
         )
 
 
-def test_e2e_environment_comes_from_plan(tmp_path: Path, pr_plan) -> None:
-    job = next(item for item in pr_plan.jobs if item.kind == "model_e2e")
+def test_integration_command_comes_from_plan(
+    tmp_path: Path, pr_plan
+) -> None:
+    job = next(item for item in pr_plan.jobs if item.kind == "integration")
     spec = job.steps[0].spec
-    assert isinstance(spec, ModelE2ESpec)
-    venv = _fake_venv(tmp_path, job)
-    environment = executor._e2e_environment(
-        venv, spec, job, output_dir=tmp_path / "result"
+    assert isinstance(spec, IntegrationSpec)
+    command = executor._integration_command(
+        _fake_venv(tmp_path, job),
+        spec,
+        job,
+        job.steps[0],
+        root=tmp_path,
+        output_dir=tmp_path / "result",
     )
-    assert environment["CASE_ID"] == spec.case_id
-    assert environment["MODEL_TYPE"] == spec.model
-    assert environment["PLAN_CARDS"] == str(spec.ranks)
-    assert environment["PLAN_SP"] == str(spec.parallelism_sp)
-    assert environment["PLAN_EP"] == str(spec.parallelism_ep)
-    assert environment["INSTALL_SCRIPT"] == spec.install.script
-    assert environment["TRAIN_SCRIPT"] == spec.train.script
-    assert environment["TORCH_BEFORE"] == str(tmp_path / "result" / "torch-before.json")
+    assert command[1] == str(tmp_path / spec.runner.script)
+    assert command[command.index("--suite") + 1] == spec.suite
+    assert command[command.index("--platform") + 1] == job.runtime.device
+    assert command[command.index("--ngpu") + 1] == str(job.steps[0].ranks)
+    assert command[command.index("--test_name") + 1] == spec.case_id
+    assert command[command.index("--output-dir") + 1] == str(
+        tmp_path / "result" / "integration"
+    )
 
 
 def test_npu_job_cleans_up_environment(tmp_path: Path, monkeypatch, pr_plan) -> None:
@@ -256,9 +282,7 @@ def test_merge_junit_ignores_truncated_xml(tmp_path: Path) -> None:
     bad = tmp_path / "bad.xml"
     bad.write_text("<testsuite", encoding="utf-8")
     output = tmp_path / "merged.xml"
-
     executor._merge_junit([bad, good], output)
-
     assert "<testsuite" in output.read_text(encoding="utf-8")
 
 
@@ -266,7 +290,9 @@ def test_pytest_command_uses_only_plan_evidence(tmp_path: Path, pr_plan) -> None
     job = next(item for item in pr_plan.jobs if item.kind == "pytest")
     spec = job.steps[0].spec
     assert isinstance(spec, PytestSpec)
-    command = executor._pytest_command(_fake_venv(tmp_path, job), spec, tmp_path / "junit.xml")
+    command = executor._pytest_command(
+        _fake_venv(tmp_path, job), spec, tmp_path / "junit.xml"
+    )
     assert command[-len(spec.files):] == list(spec.files)
     assert "-m" in command
     assert spec.marker in command
@@ -282,7 +308,7 @@ def test_cli_record_skip_writes_result_file(tmp_path: Path, pr_plan) -> None:
     )
     plan = _plan_with_allowed_skip(pr_plan, job.id, "maintenance")
     write_json(plan_path, build_plan_artifact(
-        policy=plan.policy, source=plan.source, plan=plan
+        scope=plan.scope, source=plan.source, plan=plan
     ).to_dict())
 
     assert executor.main([

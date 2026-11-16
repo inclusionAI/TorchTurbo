@@ -14,10 +14,10 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Union, get_args, get_origin, get_type_hints
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 JOB_RESULT_FILENAME = "job-result.json"
 SUITES = ("core", "model", "adapter")
-JOB_KINDS = ("pytest", "model_e2e")
+JOB_KINDS = ("pytest", "integration")
 DEVICES = ("cpu", "npu", "gpu")
 JOB_STATUSES = ("passed", "failed", "skipped", "cancelled", "infra_error")
 PLAN_ARTIFACT_STATUSES = ("ready", "failed")
@@ -94,24 +94,13 @@ class CommandSpec(Contract):
 
 
 @dataclass(frozen=True)
-class ModelE2ESpec(Contract):
+class IntegrationSpec(Contract):
+    suite: str
     case_id: str
-    model: str
     framework: str
-    run_dir: str
-    workdir: str
-    install: CommandSpec
-    train: CommandSpec
-    hf_repo: str
-    layers: int
-    dataset: str
-    ranks: int
-    parallelism_sp: int
-    parallelism_ep: int
-    seq_len: int
-    finetuning_type: str
-    fetch_timeout_seconds: int
-    case_timeout_seconds: int
+    config_digest: str
+    golden_digest: str
+    runner: CommandSpec
 
 
 @dataclass(frozen=True)
@@ -120,7 +109,7 @@ class Step(Contract):
     kind: str
     ranks: int
     timeout_seconds: int
-    spec: PytestSpec | ModelE2ESpec
+    spec: PytestSpec | IntegrationSpec
 
 
 @dataclass(frozen=True)
@@ -137,7 +126,7 @@ class Job(Contract):
 class Plan(Contract):
     schema_version: int
     plan_id: str
-    policy: str
+    scope: str
     source: Source
     inputs: dict[str, str]
     coverage: dict[str, Any]
@@ -149,7 +138,7 @@ class PlanArtifact(Contract):
     schema_version: int
     artifact_id: str
     status: str
-    policy: str
+    scope: str
     source: Source
     errors: tuple[Issue, ...] = ()
     plan: Plan | None = None
@@ -165,7 +154,8 @@ class PytestEvidence(Contract):
 
 
 @dataclass(frozen=True)
-class ModelE2EEvidence(Contract):
+class IntegrationEvidence(Contract):
+    suite: str
     case_ids: tuple[str, ...]
 
 
@@ -189,7 +179,7 @@ class JobResult(Contract):
     finished_at: str
     duration_seconds: int
     runtime: Runtime
-    items: PytestEvidence | ModelE2EEvidence
+    items: PytestEvidence | IntegrationEvidence
     steps: tuple[StepResult, ...]
     skip_reason: str | None = None
     skip_message: str | None = None
@@ -256,7 +246,7 @@ def _artifact_payload(artifact: PlanArtifact) -> dict[str, Any]:
 
 def build_plan(
     *,
-    policy: str,
+    scope: str,
     source: Source,
     inputs: dict[str, str],
     coverage: dict[str, Any],
@@ -265,7 +255,7 @@ def build_plan(
     plan = Plan(
         schema_version=SCHEMA_VERSION,
         plan_id="",
-        policy=policy,
+        scope=scope,
         source=source,
         inputs=dict(inputs),
         coverage=coverage,
@@ -276,19 +266,26 @@ def build_plan(
 
 def build_plan_artifact(
     *,
-    policy: str,
+    scope: str,
     source: Source,
     errors: list[Issue] | tuple[Issue, ...] = (),
     plan: Plan | None = None,
 ) -> PlanArtifact:
-    status = "ready" if plan is not None and not errors else "failed"
+    values = tuple(errors)
+    if plan is None and not values:
+        values = (Issue(
+            code="missing-plan",
+            path="planner",
+            message="planner produced no plan",
+        ),)
+    status = "ready" if plan is not None and not values else "failed"
     artifact = PlanArtifact(
         schema_version=SCHEMA_VERSION,
         artifact_id="",
         status=status,
-        policy=policy,
+        scope=scope,
         source=source,
-        errors=tuple(errors),
+        errors=values,
         plan=plan,
     )
     return replace(artifact, artifact_id=digest(_artifact_payload(artifact)))
@@ -383,13 +380,13 @@ def _decode(tp: Any, value: Any, path: str) -> Any:
     return value
 
 
-def _decode_spec(kind: Any, value: Any, path: str) -> PytestSpec | ModelE2ESpec:
+def _decode_spec(kind: Any, value: Any, path: str) -> PytestSpec | IntegrationSpec:
     if not isinstance(kind, str):
         _fail(path, "has no kind")
     if kind == "pytest":
         return _decode(PytestSpec, value, path)
-    if kind == "model_e2e":
-        return _decode(ModelE2ESpec, value, path)
+    if kind == "integration":
+        return _decode(IntegrationSpec, value, path)
     _fail(f"{path}.kind", f"has unknown kind {kind!r}")
 
 
@@ -416,7 +413,11 @@ def _decode_dataclass(cls: type, value: Any, path: str) -> Any:
         if cls is Step and item.name == "spec":
             data[item.name] = _decode_spec(value.get("kind"), value[item.name], f"{path}.spec")
         elif cls is JobResult and item.name == "items":
-            evidence = PytestEvidence if value.get("kind") == "pytest" else ModelE2EEvidence
+            evidence = (
+                PytestEvidence
+                if value.get("kind") == "pytest"
+                else IntegrationEvidence
+            )
             data[item.name] = _decode(evidence, value[item.name], f"{path}.items")
         else:
             data[item.name] = _decode(hints[item.name], value[item.name], f"{path}.{item.name}")
@@ -435,15 +436,12 @@ def _validate(value: Any, path: str) -> None:
             _fail(f"{path}.ranks", "must be >= 1")
     if isinstance(value, PytestSpec) and value.suite not in SUITES:
         _fail(f"{path}.suite", f"has unknown suite {value.suite!r}")
-    if isinstance(value, ModelE2ESpec):
-        for name in (
-            "ranks", "parallelism_sp", "parallelism_ep", "seq_len",
-            "fetch_timeout_seconds", "case_timeout_seconds",
-        ):
-            if getattr(value, name) < 1:
-                _fail(f"{path}.{name}", "must be >= 1")
-        if value.layers < 0:
-            _fail(f"{path}.layers", "must be >= 0")
+    if isinstance(value, IntegrationSpec):
+        for name in ("suite", "case_id", "framework", "config_digest", "golden_digest"):
+            if not getattr(value, name):
+                _fail(f"{path}.{name}", "must not be empty")
+        if not value.runner.script:
+            _fail(f"{path}.runner.script", "must not be empty")
     if isinstance(value, Step):
         if value.ranks < 1 or value.timeout_seconds < 1:
             _fail(path, "ranks and timeout_seconds must be >= 1")
@@ -480,8 +478,11 @@ def _validate(value: Any, path: str) -> None:
         if min(value.executed_files, value.tests_total, value.tests_failed,
                value.tests_errors, value.tests_skipped) < 0:
             _fail(path, "counts must be >= 0")
-    if isinstance(value, ModelE2EEvidence) and not value.case_ids:
-        _fail(f"{path}.case_ids", "must not be empty")
+    if isinstance(value, IntegrationEvidence):
+        if not value.suite:
+            _fail(f"{path}.suite", "must not be empty")
+        if not value.case_ids:
+            _fail(f"{path}.case_ids", "must not be empty")
     if isinstance(value, StepResult):
         if value.status not in JOB_STATUSES:
             _fail(f"{path}.status", f"has unknown status {value.status!r}")

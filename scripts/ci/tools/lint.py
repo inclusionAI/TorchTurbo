@@ -406,13 +406,15 @@ def _check_planner_v2(rel: str, jobs: dict, dumped: str) -> list[Problem]:
     return problems
 
 
-def check_catalog() -> list[Problem]:
-    """Validate catalog.yml and all facts derived from the repository."""
-    from ..producer.catalog import CatalogError, load
+def check_config() -> list[Problem]:
+    """Validate ci.yml and every test fact derived from the repository."""
+    from ..producer.ci_config import CiConfigError, load
+    from ..producer.facts import FactsError, load as load_facts
 
     try:
-        load(ROOT)
-    except CatalogError as exc:
+        config = load(ROOT)
+        load_facts(ROOT, config)
+    except (CiConfigError, FactsError) as exc:
         return [Problem(issue.path, issue.message) for issue in exc.issues]
     return []
 
@@ -448,6 +450,11 @@ def check_markers() -> list[Problem]:
 
     parser = configparser.ConfigParser(interpolation=None)
     parser.read(ini, encoding="utf-8")
+    if parser.get("pytest", "testpaths", fallback="") != "tests/unit_tests":
+        problems.append(Problem(
+            "pytest.ini",
+            "testpaths must be tests/unit_tests; integration runs through its runner",
+        ))
     configured = set()
     for line in (parser.get("pytest", "markers", fallback="") or "").splitlines():
         if ":" in line:
@@ -468,7 +475,7 @@ CHECKS = (
     Check("actionlint", "GitHub Actions workflow syntax", check_actionlint),
     Check("hadolint", "Dockerfile warnings", check_hadolint),
     Check("contract", "planner/lint/lane topology and output contracts", check_contract),
-    Check("catalog", "catalog, test facts, and E2E case contract", check_catalog),
+    Check("config", "CI config, pytest facts, and integration manifest contract", check_config),
     Check("markers", "registered pytest marker contract", check_markers),
 )
 CHECK_BY_NAME = {check.name: check for check in CHECKS}
