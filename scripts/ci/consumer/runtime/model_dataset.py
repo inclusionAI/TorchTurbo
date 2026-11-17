@@ -300,17 +300,23 @@ def _huggingface_path(
     repo_type = "dataset" if role == "dataset" else "model"
     cache_dir = environ.get("HF_HUB_CACHE") or None
     try:
-        from huggingface_hub import hf_hub_download, snapshot_download
+        from huggingface_hub import snapshot_download
 
         if filename:
-            path = hf_hub_download(
+            path = snapshot_download(
                 repo_id=repo,
-                filename=filename,
                 repo_type=repo_type,
                 revision=revision,
                 cache_dir=cache_dir,
+                allow_patterns=[filename],
                 local_files_only=not allow_download,
             )
+            candidate = Path(path) / filename
+            if candidate.is_file():
+                return candidate
+            if Path(path).is_file():
+                return Path(path)
+            raise ModelDatasetError(f"{field}: {filename!r} is absent from {repo!r}")
         else:
             path = snapshot_download(
                 repo_id=repo,

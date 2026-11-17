@@ -16,11 +16,13 @@ INDEX_FILENAME = "model.safetensors.index.json"
 
 
 def asset_path(value: str) -> Path:
-    """Resolve local assets relative to integration_tests, not the shell cwd."""
+    """Resolve local assets without replacing a named symlink with its blob."""
     path = Path(value).expanduser()
     if not path.is_absolute():
         path = INTEGRATION_ROOT / path
-    return path.resolve(strict=True)
+    if not path.exists():
+        raise FileNotFoundError(path)
+    return path.absolute()
 
 
 def save_hf_checkpoint(model: nn.Module, assets_dir: Path, output_dir: Path) -> Path:

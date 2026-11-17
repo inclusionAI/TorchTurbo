@@ -74,20 +74,24 @@ def test_ci_source_requires_asset_root(
         )
 
 
-def test_huggingface_dataset_uses_pinned_download(
+def test_huggingface_dataset_uses_pinned_snapshot(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    dataset = tmp_path / "science.jsonl"
-    dataset.write_text("{}", encoding="utf-8")
+    blob = tmp_path / "blob"
+    blob.write_text("{}", encoding="utf-8")
+    snapshot = tmp_path / "snapshot"
+    snapshot.mkdir()
+    dataset = snapshot / "science.jsonl"
+    dataset.symlink_to(blob)
     calls: list[dict[str, object]] = []
 
-    def fake_download(**kwargs: object) -> str:
+    def fake_snapshot(**kwargs: object) -> str:
         calls.append(kwargs)
-        return str(dataset)
+        return str(snapshot)
 
     import huggingface_hub
 
-    monkeypatch.setattr(huggingface_hub, "hf_hub_download", fake_download)
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", fake_snapshot)
     args = {
         "dataset": {
             "source": "huggingface",
@@ -105,8 +109,10 @@ def test_huggingface_dataset_uses_pinned_download(
     )
 
     assert resolved["dataset"] == str(dataset)
+    assert Path(resolved["dataset"]).name == "science.jsonl"
     assert calls[0]["repo_type"] == "dataset"
     assert calls[0]["revision"] == "186b575b5cc2113f8ba81d4f4ac9ae2494633829"
+    assert calls[0]["allow_patterns"] == ["science.jsonl"]
     assert calls[0]["local_files_only"] is False
 
 
