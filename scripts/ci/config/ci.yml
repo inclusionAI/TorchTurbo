@@ -109,4 +109,5 @@ scopes:
   nightly:
     pytest: {core: all, model: all, adapter: all}
     integration:
-      base_suite: {mode: all}
+      base_suite:
+        mode: all
