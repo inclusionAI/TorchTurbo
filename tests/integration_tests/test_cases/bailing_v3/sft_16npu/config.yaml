@@ -3,8 +3,15 @@ UPDATE_GOLDEN: false
 MODEL_ARGS: {}
 
 TRAIN_ARGS:
-  model: /mnt/sfs_turbo/pretrained_models/bailing_v3/ling_tiny_v3_formal_256k_enhance_0420_wthink/merge-step-mean-0baeb1658f223ec4bcfa8d7cf6b7e242
-  dataset: /mnt/sfs_turbo/torchturbo/datasets/am_think/science.jsonl
+  model:
+    source: huggingface
+    repo: inclusionAI/Ling-3.0-tiny
+    revision: 9a98e35fe1c9ee255f78dd64771c7ae15a799481
+  dataset:
+    source: huggingface
+    repo: a-m-team/AM-Thinking-v1-Distilled
+    revision: 186b575b5cc2113f8ba81d4f4ac9ae2494633829
+    file: science.jsonl
   model_type: turbo_bailing_hybrid
   template: ling_v3
   check_model: false
@@ -64,8 +71,8 @@ LAUNCH_ARGS:
 
 ENV_VARS:
   TOKENIZERS_PARALLELISM: 'false'
-  HF_HUB_OFFLINE: '1'
-  HF_DATASETS_OFFLINE: '1'
+  HF_HUB_OFFLINE: '0'
+  HF_DATASETS_OFFLINE: '0'
   HCCL_CONNECT_TIMEOUT: '7200'
   HCCL_EXEC_TIMEOUT: '7200'
   HCCL_EVENT_TIMEOUT: '14500'

@@ -23,6 +23,14 @@ from typing import Any
 import yaml
 from gen_init_checkpoint import REPO_ROOT, asset_path, generate_checkpoint
 
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from scripts.ci.consumer.runtime.model_dataset import (  # noqa: E402
+    allow_download_from_env,
+    resolve_model_dataset_args,
+)
+
 INTEGRATION_ROOT = Path(__file__).resolve().parents[1]
 TEST_CASES_ROOT = INTEGRATION_ROOT / "test_cases"
 
@@ -177,21 +185,21 @@ def run_case(
     )
     # Apply environment before importing torch/tokenizers.
     os.environ.update(env)
+    args, resolved_inputs = resolve_model_dataset_args(
+        case["TRAIN_ARGS"],
+        framework=framework,
+        root=INTEGRATION_ROOT,
+        allow_download=allow_download_from_env(env),
+    )
+    resolved_case = {**case, "TRAIN_ARGS": args}
     from transformers import AutoTokenizer
 
-    args = dict(case["TRAIN_ARGS"])
     if args.get(model_key):
-        model_path = asset_path(args[model_key])
-        for name in ("config.json", "model.safetensors.index.json"):
-            if not (model_path / name).is_file():
-                raise ValueError(
-                    f"Existing model requires {model_path / name}; source assets are never modified"
-                )
-        tokenizer_path = model_path
+        model_path = Path(args[model_key])
+        tokenizer_path = Path(args["tokenizer"]) if args.get("tokenizer") else model_path
     else:
         model_path = None
-        tokenizer_path = asset_path(args["tokenizer"])
-    # An explicit model owns its tokenizer. Never fall back to assets/tokenizer.
+        tokenizer_path = Path(args["tokenizer"])
     AutoTokenizer.from_pretrained(
         tokenizer_path, local_files_only=True, trust_remote_code=False
     )
@@ -200,13 +208,18 @@ def run_case(
     run_dir = output_dir / spec.output_name / f"{stamp}-{uuid.uuid4().hex[:8]}"
     run_dir.mkdir(parents=True, exist_ok=False)
     (run_dir / "config.yaml").write_text(yaml.safe_dump(case, sort_keys=False))
+    if resolved_inputs:
+        (run_dir / "resolved_inputs.json").write_text(
+            json.dumps({"inputs": list(resolved_inputs)}, indent=2) + "\n",
+            encoding="utf-8",
+        )
     engine_path = run_dir / "tt_config.yaml"
     engine_path.write_text(
         yaml.safe_dump({"engine_config": case["ENGINE_CONFIG"]}, sort_keys=False)
     )
     if model_path is None:
         model_path = generate_checkpoint(
-            case, run_dir / "initial_checkpoint", engine_path
+            resolved_case, run_dir / "initial_checkpoint", engine_path
         )
     args.pop("tokenizer", None)
     args.update(

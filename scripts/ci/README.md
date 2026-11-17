@@ -36,6 +36,7 @@ scripts/ci/
     runtime/
       env.py          CPU/NPU/GPU 探针与清理
       venv.py         内容寻址 venv
+      model_dataset.py 模型/数据集的本地解析、缓存与下载
   tools/
     lint.py           通用 linter + CI 契约检查
     image.py          基础镜像解析
