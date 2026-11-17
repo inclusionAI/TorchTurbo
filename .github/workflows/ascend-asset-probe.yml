@@ -1,0 +1,39 @@
+name: Ascend-Asset-Probe
+
+# Metadata-only connectivity probe for public model and dataset sources. It
+# never downloads model weights or dataset contents.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: Probe asset sources
+    runs-on: ${{ vars.CI_NPU_2_RUNNER || 'linux-aarch64-a3-800i-2' }}
+    timeout-minutes: 10
+    container:
+      image: ${{ vars.BASE_IMAGE_TAG || 'swr.cn-north-12.myhuaweicloud.com/ascend/torchturbo_npu:base-latest' }}
+      options: --user root
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: probe HF mirror and Hugging Face metadata
+        env:
+          PYTHONUNBUFFERED: '1'
+        run: |
+          set -euo pipefail
+          python3 scripts/ci/tools/probe_asset_sources.py \
+            --output "$RUNNER_TEMP/asset-source-probe.json"
+
+      - name: upload probe report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: asset-source-probe
+          path: ${{ runner.temp }}/asset-source-probe.json
+          if-no-files-found: warn
+          retention-days: 7
