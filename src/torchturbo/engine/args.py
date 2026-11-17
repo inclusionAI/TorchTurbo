@@ -99,6 +99,9 @@ class TorchTurboArgs:
     gradient_checkpointing:
         Whether TorchTurbo should enable engine-owned activation
         checkpointing. Defaults to ``True``.
+    gc_mode:
+        Cyclic GC policy: ``auto`` (default) or ``step``. ``None`` leaves
+        the file-backed engine default unchanged.
     cpu_offload:
         Structured CPU offload policy (``CPUOffloadConfig``).
         File configuration uses ``enabled``, ``mode`` and
@@ -169,6 +172,7 @@ class TorchTurboArgs:
     gbs: int | None = None
     gradient_checkpointing: bool = True
     ac_use_reentrant: bool = False
+    gc_mode: str | None = None
     cpu_offload: CPUOffloadConfig = field(default_factory=CPUOffloadConfig)
     cpu_offload_enabled: bool | None = None
     enable_mtp: bool = False
@@ -365,6 +369,17 @@ _TURBO_ARG_SPECS: tuple[TurboArgSpec, ...] = (
         "checkpointing tears down recomputed intermediates synchronously "
         "within a step, reducing cross-step allocation peak for MoE/linear-"
         "attention workloads. Replaces TORCH_TURBO_AC_USE_REENTRANT.",
+    ),
+    TurboArgSpec(
+        name="gc_mode",
+        args_name="gc_mode",
+        cli_name="--tt_gc_mode",
+        config_path="garbage_collection.mode",
+        choices=("auto", "step"),
+        type=str,
+        help="Training cyclic GC policy: auto (default) preserves Python's automatic "
+        "policy; step pauses automatic GC within optimizer steps and collects "
+        "fully between steps when available host or device memory is below 10%.",
     ),
     TurboArgSpec(
         name="cpu_offload",

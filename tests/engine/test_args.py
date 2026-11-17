@@ -7,6 +7,29 @@ import pytest
 os.environ.setdefault("TORCH_TURBO_DISABLE", "1")
 
 
+def test_gc_mode_defaults_to_auto_and_accepts_step_override():
+    from torchturbo.engine.args import parse_torchturbo_args
+    from torchturbo.engine.config import build_from_args
+
+    args, remaining = parse_torchturbo_args([])
+    assert remaining == []
+    assert args.gc_mode is None
+    assert build_from_args(args).garbage_collection.mode == "auto"
+    assert "tt_gc_mode" not in args.config_overrides
+
+    args, remaining = parse_torchturbo_args(
+        ["--tt_gc_mode", "step", "--framework-flag"]
+    )
+    assert remaining == ["--framework-flag"]
+    assert args.config_overrides["tt_gc_mode"] == "step"
+    assert build_from_args(args).garbage_collection.mode == "step"
+
+    with pytest.raises(SystemExit):
+        parse_torchturbo_args(["--tt_gc_mode", "invalid"])
+    with pytest.raises(SystemExit):
+        parse_torchturbo_args(["--tt_gc_mode", "freeze"])
+
+
 def test_string_to_bool_matches_transformers_semantics():
     from torchturbo.engine.args import string_to_bool
 

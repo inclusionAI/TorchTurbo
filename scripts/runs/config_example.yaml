@@ -71,6 +71,12 @@ engine_config:
     enabled: true
     use_reentrant: false
 
+  garbage_collection:
+    # auto: Preserve the current Python GC behavior.
+    # step: Pause automatic GC during each optimizer step, then restore it.
+    # With step, collect fully if available host or device memory is below 10%.
+    mode: auto
+
   # Engine-managed optimizer configuration.
   optimizer:
     # Optimizer selected by the engine. Currently only "muon" is supported.
