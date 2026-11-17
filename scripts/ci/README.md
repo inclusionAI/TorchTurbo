@@ -152,6 +152,12 @@ python3 -m scripts.ci.producer.planner \
   --target-job integration-base-suite-qwen3-5-moe-sft-2cpu \
   --output /tmp/plan.json
 
+# 同一 Plan 选择多个 job：CPU/NPU 会在同一 run 内并行执行
+python3 -m scripts.ci.producer.planner \
+  --scope pull_request \
+  --target-job 'pytest-core-cpu-cpu-default-default,pytest-core-npu-npu-default-default' \
+  --output /tmp/plan.json
+
 # 执行一个 Job
 python3 -m scripts.ci.consumer.executor \
   --plan /tmp/plan.json \

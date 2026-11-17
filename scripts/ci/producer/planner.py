@@ -452,15 +452,30 @@ def build(
     )
 
 
-def _target_plan(plan: Plan, target_job: str) -> Plan:
-    """Reduce a validated Plan to one job for an explicit manual run."""
-    jobs = tuple(job for job in plan.jobs if job.id == target_job)
-    if not jobs:
+def _target_plan(plan: Plan, target_jobs: str) -> Plan:
+    """Reduce a validated Plan to explicit jobs for one manual run."""
+    targets = tuple(dict.fromkeys(
+        part for part in re.split(r"[,\s]+", target_jobs.strip()) if part
+    ))
+    if not targets:
         raise PlanError([_issue(
-            target_job,
-            f"target job {target_job!r} is not in the full plan",
+            "target_job",
+            "target job list is empty",
             "unknown-job",
         )])
+    known = {job.id for job in plan.jobs}
+    unknown = [target for target in targets if target not in known]
+    if unknown:
+        raise PlanError([
+            _issue(
+                target,
+                f"target job {target!r} is not in the full plan",
+                "unknown-job",
+            )
+            for target in unknown
+        ])
+    selected = set(targets)
+    jobs = tuple(job for job in plan.jobs if job.id in selected)
     pytest_files = {suite: set() for suite in plan.coverage.get("pytest", {})}
     pytest_routes = {suite: 0 for suite in pytest_files}
     integration_cases = {
@@ -476,7 +491,7 @@ def _target_plan(plan: Plan, target_job: str) -> Plan:
     return build_plan(
         scope=plan.scope,
         source=plan.source,
-        inputs={**plan.inputs, "target_job": target_job},
+        inputs={**plan.inputs, "target_job": ",".join(targets)},
         coverage={
             "pytest": {
                 suite: {
@@ -603,7 +618,11 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--fail-path", default="planner")
     parser.add_argument("--fail-message", default="")
     parser.add_argument("--change-scope", choices=("code", "docs_only"), default="code")
-    parser.add_argument("--target-job", default="")
+    parser.add_argument(
+        "--target-job",
+        default="",
+        help="exact Plan job id(s), separated by commas or whitespace",
+    )
     parser.add_argument("--verify", action="store_true")
     args = parser.parse_args(argv)
     if args.verify and args.target_job:

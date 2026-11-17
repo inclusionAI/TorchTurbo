@@ -133,6 +133,28 @@ def test_unknown_target_job_is_rejected(
     assert [issue.code for issue in artifact.errors] == ["unknown-job"]
 
 
+def test_target_cpu_and_npu_jobs_in_one_plan(
+    config: CiConfig, facts: TestFacts, source
+) -> None:
+    cpu = "pytest-core-cpu-cpu-default-default"
+    npu = "pytest-core-npu-npu-default-default"
+    artifact = artifact_for(
+        config,
+        facts,
+        "pull_request",
+        source,
+        (),
+        target_job=f"{cpu}, {npu}",
+    )
+    assert artifact.status == "ready"
+    assert artifact.plan is not None
+    assert [job.id for job in artifact.plan.jobs] == [cpu, npu]
+    assert artifact.plan.inputs["target_job"] == f"{cpu},{npu}"
+    assert matrix_outputs(artifact.plan, config)["cpu_jobs"][0]["job_id"] == cpu
+    assert matrix_outputs(artifact.plan, config)["npu_jobs"][0]["job_id"] == npu
+    assert validate_plan(artifact.plan, config, facts) == []
+
+
 def test_explicit_unknown_integration_case_is_rejected(
     config: CiConfig, facts: TestFacts, source
 ) -> None:

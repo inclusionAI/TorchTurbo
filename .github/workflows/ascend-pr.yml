@@ -34,7 +34,7 @@ on:
           - pr
           - full
       target_job:
-        description: 'optional exact Plan job id; empty runs the full mode'
+        description: 'optional Plan job id(s), comma-separated; empty runs the full mode'
         required: false
         default: ''
         type: string
