@@ -23,6 +23,8 @@ from .modeling_qwen4_exp import (
     apply_rotary_pos_emb,
 )
 
+from .gbsa import qsa_gbsa_attention
+
 _QSA_INDEXER_QUERY_CHUNK_SIZE = 256
 # Expanded KV rows are transient: each chunk is checkpointed, so this bounds
 # peak memory rather than saved activations. Real head sizes need about 4 MiB
@@ -346,6 +348,7 @@ def qsa_forward(
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Keep Q local and gather K/V for packed sequence-parallel QSA."""
     cu_seq_lens = kwargs.get("cu_seq_lens_q")
+    backend = os.environ.get("TORCHTURBO_QSA_BACKEND", "flash")
     if past_key_values is not None or cu_seq_lens is None:
         return Qwen4ExpTextAttention.forward(
             self,
@@ -383,15 +386,25 @@ def qsa_forward(
     )
     key, value = key_value.chunk(2, dim=-1)
 
-    output = qsa_attention_forward(
-        query,
-        key,
-        value,
-        token_ids,
-        dropout=self.attention_dropout if self.training else 0.0,
-        softmax_scale=self.scaling,
-        target_dtype=get_target_dtype(query, self),
-    )
+    if backend == "gbsa":
+        output = qsa_gbsa_attention(
+            query, key, value, token_ids, cu_seq_lens,
+            block_size=self.indexer.compress_ratio,
+            query_offset=sp_rank * hidden_states.shape[1],
+            dropout=self.attention_dropout if self.training else 0.0,
+            softmax_scale=self.scaling,
+            target_dtype=get_target_dtype(query, self),
+        )
+    else:
+        output = qsa_attention_forward(
+            query,
+            key,
+            value,
+            token_ids,
+            dropout=self.attention_dropout if self.training else 0.0,
+            softmax_scale=self.scaling,
+            target_dtype=get_target_dtype(query, self),
+        )
     output = output.reshape(*input_shape, -1)
     output = output * torch.sigmoid(gate.reshape(*input_shape, -1))
     return self.o_proj(output), None
