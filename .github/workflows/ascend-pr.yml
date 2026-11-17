@@ -226,11 +226,20 @@ jobs:
           RUNNER_LABEL: ${{ vars[matrix.runner_variable] || matrix.runner }}
           CI_VENV_ROOT: ${{ runner.temp }}/turbo-ci-venv
         run: |
+          set +e
+          result_root="$RUNNER_TEMP/ci-result"
+          mkdir -p "$result_root"
           python3 -m scripts.ci.consumer.executor \
             --plan "$RUNNER_TEMP/ci-plan/plan.json" \
             --job-id "${{ matrix.job_id }}" \
-            --output "$RUNNER_TEMP/ci-result/job-result.json" \
+            --output "$result_root/job-result.json" \
             --summary "$GITHUB_STEP_SUMMARY"
+          rc=$?
+          printf '%s\n' "$rc" > "$result_root/executor.exit_code"
+          if [ "$rc" -ne 0 ]; then
+            echo "::warning::executor exited with code $rc; uploading result before failing the job"
+          fi
+          exit 0
 
       - name: verify result
         if: always()
@@ -249,6 +258,34 @@ jobs:
           path: ${{ runner.temp }}/ci-result
           if-no-files-found: warn
           retention-days: 7
+
+      - name: enforce result
+        if: always()
+        run: |
+          set -euo pipefail
+          result_root="$RUNNER_TEMP/ci-result"
+          result="$result_root/job-result.json"
+          if [ ! -s "$result" ]; then
+            echo "::error::executor exited without writing $result"
+            exit 1
+          fi
+          status=$(python3 -c \
+            'import json,sys; print(json.load(open(sys.argv[1])).get("status", ""))' \
+            "$result")
+          rc=$(cat "$result_root/executor.exit_code" 2>/dev/null || true)
+          rc=${rc:-missing}
+          echo "executor exit code: $rc; result status: $status"
+          case "$status" in
+            passed|skipped) ;;
+            *)
+              echo "::error::CI job result is $status"
+              exit 1
+              ;;
+          esac
+          if [ "$rc" != 0 ]; then
+            echo "::error::executor exited with code $rc"
+            exit 1
+          fi
 
   npu:
     name: Ascend-PR-NPU (${{ matrix.job_id }})
@@ -282,11 +319,20 @@ jobs:
           RUNNER_LABEL: ${{ vars[matrix.runner_variable] || matrix.runner }}
           CI_VENV_ROOT: /tmp/turbo-ci-venv
         run: |
+          set +e
+          result_root="$RUNNER_TEMP/ci-result"
+          mkdir -p "$result_root"
           python3 -m scripts.ci.consumer.executor \
             --plan "$RUNNER_TEMP/ci-plan/plan.json" \
             --job-id "${{ matrix.job_id }}" \
-            --output "$RUNNER_TEMP/ci-result/job-result.json" \
+            --output "$result_root/job-result.json" \
             --summary "$GITHUB_STEP_SUMMARY"
+          rc=$?
+          printf '%s\n' "$rc" > "$result_root/executor.exit_code"
+          if [ "$rc" -ne 0 ]; then
+            echo "::warning::executor exited with code $rc; uploading result before failing the job"
+          fi
+          exit 0
 
       - name: verify result
         if: always()
@@ -305,6 +351,34 @@ jobs:
           path: ${{ runner.temp }}/ci-result
           if-no-files-found: warn
           retention-days: 7
+
+      - name: enforce result
+        if: always()
+        run: |
+          set -euo pipefail
+          result_root="$RUNNER_TEMP/ci-result"
+          result="$result_root/job-result.json"
+          if [ ! -s "$result" ]; then
+            echo "::error::executor exited without writing $result"
+            exit 1
+          fi
+          status=$(python3 -c \
+            'import json,sys; print(json.load(open(sys.argv[1])).get("status", ""))' \
+            "$result")
+          rc=$(cat "$result_root/executor.exit_code" 2>/dev/null || true)
+          rc=${rc:-missing}
+          echo "executor exit code: $rc; result status: $status"
+          case "$status" in
+            passed|skipped) ;;
+            *)
+              echo "::error::CI job result is $status"
+              exit 1
+              ;;
+          esac
+          if [ "$rc" != 0 ]; then
+            echo "::error::executor exited with code $rc"
+            exit 1
+          fi
 
   gate:
     name: Ascend-PR-Gate

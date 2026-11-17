@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+from scripts.ci.consumer.runtime import model_dataset
 from scripts.ci.consumer.runtime.model_dataset import (
     ModelDatasetError,
     allow_download_from_env,
@@ -171,6 +172,70 @@ def test_modelscope_dataset_uses_file_pattern(
     assert resolved["dataset"] == str(data)
     assert calls[0]["allow_file_pattern"] == "science.jsonl"
     assert calls[0]["local_files_only"] is True
+
+
+def test_remote_source_uses_configured_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dataset = tmp_path / "dataset"
+    dataset.mkdir()
+    data = dataset / "science.jsonl"
+    data.write_text("{}", encoding="utf-8")
+
+    def unavailable(*args: object, **kwargs: object) -> Path:
+        raise ModelDatasetError("mirror unavailable")
+
+    monkeypatch.setattr(model_dataset, "_huggingface_path", unavailable)
+    monkeypatch.setattr(
+        model_dataset,
+        "_modelscope_path",
+        lambda *args, **kwargs: data,
+    )
+
+    resolved, evidence = resolve_model_dataset_args(
+        {
+            "dataset": {
+                "source": "huggingface",
+                "repo": "example/dataset",
+                "revision": "hf-revision",
+                "file": "science.jsonl",
+                "fallback": {
+                    "source": "modelscope",
+                    "repo": "example/dataset",
+                    "revision": "ms-revision",
+                    "file": "science.jsonl",
+                },
+            }
+        },
+        framework="swift",
+        root=tmp_path,
+        allow_download=True,
+    )
+
+    assert resolved["dataset"] == str(data)
+    assert evidence[0]["source"] == "modelscope"
+    assert evidence[0]["fallback"] == "true"
+
+
+def test_fallback_cannot_be_nested(tmp_path: Path) -> None:
+    with pytest.raises(ModelDatasetError, match="cannot contain another fallback"):
+        resolve_model_dataset_args(
+            {
+                "dataset": {
+                    "source": "huggingface",
+                    "repo": "example/dataset",
+                    "revision": "hf-revision",
+                    "fallback": {
+                        "source": "modelscope",
+                        "repo": "example/dataset",
+                        "revision": "ms-revision",
+                        "fallback": {},
+                    },
+                }
+            },
+            framework="swift",
+            root=tmp_path,
+        )
 
 
 def test_llamafactory_dataset_name_is_not_treated_as_path(tmp_path: Path) -> None:

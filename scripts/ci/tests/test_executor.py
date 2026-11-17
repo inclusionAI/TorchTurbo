@@ -106,8 +106,13 @@ def test_execute_integration_job_writes_evidence(
     def fake_run(command, *, cwd, environment, log_path, timeout_seconds):
         observed.append(command)
         output = Path(command[command.index("--output-dir") + 1])
-        output.mkdir(parents=True, exist_ok=True)
-        (output / "run.log").write_text("integration output\n", encoding="utf-8")
+        run_dir = output / "case" / "run"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        (run_dir / "training.log").write_text("integration output\n", encoding="utf-8")
+        (run_dir / "actual.json").write_text("{}\n", encoding="utf-8")
+        (run_dir / "training" / "checkpoint-4").mkdir(parents=True)
+        (run_dir / "initial_checkpoint").mkdir()
+        (run_dir / "tensorboard").mkdir()
         return 0, False
 
     monkeypatch.setattr(executor, "_run_stream", fake_run)
@@ -120,6 +125,12 @@ def test_execute_integration_job_writes_evidence(
     assert result.items.case_ids == (spec.case_id,)
     assert result.steps[0].case_ids == (spec.case_id,)
     assert result.artifacts["integration"] == "integration"
+    run_dir = output_dir / "integration" / "case" / "run"
+    assert (run_dir / "actual.json").is_file()
+    assert (run_dir / "training.log").is_file()
+    assert not (run_dir / "training").exists()
+    assert not (run_dir / "initial_checkpoint").exists()
+    assert not (run_dir / "tensorboard").exists()
     assert "--skip-install" in observed[0]
     assert "--forbid-update-golden" in observed[0]
     assert "--test_name" in observed[0]

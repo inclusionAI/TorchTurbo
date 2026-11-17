@@ -121,22 +121,35 @@ def _resolve_value(
     if value is None:
         return None
     if isinstance(value, Mapping):
-        path, source, revision = _resolve_spec(
-            value,
-            field=field,
-            role=role,
-            root=root,
-            allow_download=allow_download,
-            environ=environ,
+        errors: list[str] = []
+        candidates = _candidate_specs(value, field=field)
+        for index, candidate in enumerate(candidates):
+            try:
+                path, source, revision = _resolve_spec(
+                    candidate,
+                    field=field,
+                    role=role,
+                    root=root,
+                    allow_download=allow_download,
+                    environ=environ,
+                )
+                _validate(path, role=role, spec=candidate, field=field)
+            except ModelDatasetError as exc:
+                errors.append(str(exc))
+                continue
+            item = {
+                "field": field,
+                "source": source,
+                "path": str(path),
+                **({"revision": revision} if revision else {}),
+            }
+            if index:
+                item["fallback"] = "true"
+            evidence.append(item)
+            return str(path)
+        raise ModelDatasetError(
+            f"{field}: all configured sources failed: " + " | ".join(errors)
         )
-        _validate(path, role=role, spec=value, field=field)
-        evidence.append({
-            "field": field,
-            "source": source,
-            "path": str(path),
-            **({"revision": revision} if revision else {}),
-        })
-        return str(path)
     if isinstance(value, list):
         return [
             _resolve_value(
@@ -161,6 +174,23 @@ def _resolve_value(
             f"{field}: expected a path, null, mapping, or list; got {type(value).__name__}"
         )
     return value
+
+
+def _candidate_specs(
+    spec: Mapping[str, Any], *, field: str
+) -> list[Mapping[str, Any]]:
+    """Return the primary source followed by its single optional fallback."""
+    primary = dict(spec)
+    fallback = primary.pop("fallback", None)
+    candidates: list[Mapping[str, Any]] = [primary]
+    if fallback is None:
+        return candidates
+    if not isinstance(fallback, Mapping):
+        raise ModelDatasetError(f"{field}.fallback must be a mapping")
+    if "fallback" in fallback:
+        raise ModelDatasetError(f"{field}.fallback cannot contain another fallback")
+    candidates.append(dict(fallback))
+    return candidates
 
 
 def _resolve_spec(

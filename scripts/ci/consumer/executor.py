@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import shutil
 import shlex
 import signal
 import subprocess
@@ -43,6 +44,7 @@ class ExecutorError(ValueError):
 
 PROBE_TIMEOUT_SECONDS = 300
 CLEANUP_TIMEOUT_SECONDS = 60
+TRANSIENT_INTEGRATION_DIRS = ("training", "initial_checkpoint", "tensorboard")
 
 
 def _now() -> str:
@@ -185,6 +187,19 @@ def _cleanup_environment(venv: Venv, root: Path, log_path: Path) -> None:
             )
     except (OSError, subprocess.TimeoutExpired) as exc:
         print(f"::warning::environment cleanup failed: {exc}", file=sys.stderr)
+
+
+def _prune_integration_artifacts(output_dir: Path) -> None:
+    """Drop transient model/event output before uploading CI artifacts."""
+    integration = output_dir / "integration"
+    if not integration.is_dir():
+        return
+    for name in TRANSIENT_INTEGRATION_DIRS:
+        for path in integration.glob(f"*/*/{name}"):
+            if not path.is_dir():
+                continue
+            shutil.rmtree(path, ignore_errors=True)
+            print(f"Pruned transient CI artifact: {path}", flush=True)
 
 
 def _prepare_environment(
@@ -588,6 +603,8 @@ def execute(
 
     if venv is not None and job.runtime.device == "npu":
         _cleanup_environment(venv, root, log_path)
+
+    _prune_integration_artifacts(output_dir)
 
     _merge_junit(junit_paths, merged_junit)
     if venv is not None:

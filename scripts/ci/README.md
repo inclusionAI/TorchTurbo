@@ -95,6 +95,20 @@ PR 不跑模型 pytest，因为不同模型族依赖的 venv 不同，安装成�
 纯文档包括 `docs/**`、`*.md`、`*.rst`、`*.adoc`、`LICENSE`、`NOTICE`。空 diff、
 分类失败或读取失败按代码变更处理。
 
+## 远端资产
+
+integration case 的 `TRAIN_ARGS.model` / `TRAIN_ARGS.dataset` 可配置一个远程主来源和
+一个 `fallback` 来源；主来源解析或校验失败时才会切换到 fallback。实际来源会写入
+`resolved_inputs.json`，便于区分命中主来源还是回退。
+
+Hugging Face 来源应显式设置 `HF_ENDPOINT`（例如 `https://hf-mirror.com`），不要依赖
+runner 的默认网络。远端 revision 必须固定到 commit；ModelScope 使用其仓库 commit，
+不能复用 Hugging Face revision。
+
+integration 结果上传前会删除 `training/`、`initial_checkpoint/`、`tensorboard/` 等临时
+大目录，只保留 `actual.json`、`resolved_inputs.json`、`training.log` 和配置快照。Job 的
+真实退出状态由最后的 `enforce result` 步骤判定，确保失败结果先上传再由 Gate 消费。
+
 ## 扩展点
 
 - 新增镜像或 lane：改 `resources.images` / `resources.lanes`。Planner 选择容量最小且满足
