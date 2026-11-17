@@ -197,6 +197,7 @@ jobs:
       needs.plan.outputs.cpu_job_count != '0'
     strategy:
       fail-fast: false
+      max-parallel: 5
       matrix:
         include: ${{ fromJSON(needs.plan.outputs.cpu_jobs) }}
     runs-on: ${{ vars[matrix.runner_variable] || matrix.runner }}
