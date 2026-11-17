@@ -81,8 +81,8 @@ def _plan_with_allowed_skip(plan, job_id: str, reason: str):
 def test_all_jobs_pass(pr_plan) -> None:
     decision = decide(pr_plan, _results(pr_plan))
     assert decision.status == "passed"
-    assert decision.summary["expected_jobs"] == 4
-    assert decision.summary["passed"] == 4
+    assert decision.summary["expected_jobs"] == 7
+    assert decision.summary["passed"] == 7
     assert decision.failures == ()
 
 

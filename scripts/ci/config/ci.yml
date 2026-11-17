@@ -73,8 +73,8 @@ resources:
 workloads:
   pytest:
     defaults:
-      job_timeout_minutes: {cpu: 40, npu: 360, gpu: 360}
-      step_timeout_minutes: {cpu: 40, npu: 360, gpu: 360}
+      job_timeout_minutes: {cpu: 40, npu: 90, gpu: 90}
+      step_timeout_minutes: {cpu: 40, npu: 90, gpu: 90}
     model_venvs:
       qwen4_exp: qwen4_exp
     framework_venvs:
@@ -91,8 +91,8 @@ workloads:
       base_suite:
         runner: tests/integration_tests/scripts/run_tests.py
         defaults:
-          job_timeout_minutes: {cpu: 60, npu: 360}
-          step_timeout_minutes: {cpu: 60, npu: 360}
+          job_timeout_minutes: {cpu: 40, npu: 90}
+          step_timeout_minutes: {cpu: 40, npu: 90}
         framework_venvs:
           swift: swift
           llamafactory: lf
@@ -103,7 +103,7 @@ workloads:
 scopes:
   pull_request:
     targets: [cpu, npu-a3]
-    pytest: {core: all, model: none, adapter: none}
+    pytest: {core: all, model: none, adapter: all}
     integration:
       base_suite:
         mode: explicit

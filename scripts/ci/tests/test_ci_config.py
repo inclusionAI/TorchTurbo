@@ -37,11 +37,11 @@ def test_config_resources(config: CiConfig) -> None:
         "swift",
         "qwen4_exp_swift",
     }
-    assert config.pytest.job_timeout_minutes == {"cpu": 40, "npu": 360, "gpu": 360}
-    assert config.pytest.step_timeout_minutes == {"cpu": 40, "npu": 360, "gpu": 360}
+    assert config.pytest.job_timeout_minutes == {"cpu": 40, "npu": 90, "gpu": 90}
+    assert config.pytest.step_timeout_minutes == {"cpu": 40, "npu": 90, "gpu": 90}
     suite = config.integration.suites["base_suite"]
-    assert suite.job_timeout_minutes == {"cpu": 60, "npu": 360}
-    assert suite.step_timeout_minutes == {"cpu": 60, "npu": 360}
+    assert suite.job_timeout_minutes == {"cpu": 40, "npu": 90}
+    assert suite.step_timeout_minutes == {"cpu": 40, "npu": 90}
 
 
 @pytest.mark.parametrize(
@@ -162,7 +162,7 @@ def test_venv_extends_is_expanded(config: CiConfig) -> None:
 def test_scope_selection_is_declarative(config: CiConfig) -> None:
     pr = config.scope("pull_request")
     nightly = config.scope("nightly")
-    assert pr.pytest == {"core": "all", "model": "none", "adapter": "none"}
+    assert pr.pytest == {"core": "all", "model": "none", "adapter": "all"}
     assert pr.integration["base_suite"].mode == "explicit"
     assert pr.integration["base_suite"].cases == (
         "qwen3_5_moe/sft_2cpu",

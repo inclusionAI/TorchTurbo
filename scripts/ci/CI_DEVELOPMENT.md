@@ -77,7 +77,7 @@ pytest suite 固定为三层：
 |---|---|---|---|
 | `core` | 通用 engine/ops/runtime 等 | 全量 | 全量 |
 | `model` | 模型族依赖测试 | 不跑 | 全量 |
-| `adapter` | LLaMA-Factory / ms-swift 适配测试 | 不跑 | 全量 |
+| `adapter` | LLaMA-Factory / ms-swift 适配测试 | 全量 | 全量 |
 
 integration case 的事实源是 suite runner 的 `--list-cases --json`。一个 case 一个 Job，
 不把 case 的 framework、ranks、config、golden 再抄进 `ci.yml`。
@@ -88,12 +88,13 @@ integration case 的事实源是 suite runner 的 `--list-cases --json`。一个
 
 | scope | pytest | integration | Job |
 |---|---|---|---:|
-| `pull_request` | `core=all` | `sft_2cpu`、`sft_2npu` | 4 |
+| `pull_request` | `core=all`、`adapter=all` | `sft_2cpu`、`sft_2npu` | 7 |
 | `nightly` | 全部 | 全部 3 case | 12 |
 | docs-only | 无 | 无 | 0 |
 
-PR 不跑模型 pytest，因为不同模型族依赖的 venv 不同，安装成本和稳定性不可控。PR 使用
-两个轻量 integration case 看护 CPU 和 NPU 主路径；完整模型和 16 卡 case 留给 nightly。
+PR 不跑模型 pytest，因为不同模型族依赖的 venv 不同，安装成本和稳定性不可控；core 和
+adapter 全量运行。PR 使用两个轻量 integration case 看护 CPU 和 NPU 主路径；完整模型和
+16 卡 case 留给 nightly。
 
 纯文档包括 `docs/**`、`*.md`、`*.rst`、`*.adoc`、`LICENSE`、`NOTICE`。空 diff、
 分类失败或读取失败按代码变更处理。

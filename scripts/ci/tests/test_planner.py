@@ -39,14 +39,14 @@ def _with_plan_id(plan: Plan) -> Plan:
 
 def test_pull_request_scope(config: CiConfig, facts: TestFacts, pr_plan: Plan) -> None:
     assert Counter(job.kind for job in pr_plan.jobs) == {
-        "pytest": 2,
+        "pytest": 5,
         "integration": 2,
     }
     assert pr_plan.coverage == {
         "pytest": {
             "core": {"mode": "all", "files": 86, "routes": 88},
             "model": {"mode": "none", "files": 0, "routes": 0},
-            "adapter": {"mode": "none", "files": 0, "routes": 0},
+            "adapter": {"mode": "all", "files": 16, "routes": 16},
         },
         "integration": {
             "base_suite": {
@@ -58,12 +58,15 @@ def test_pull_request_scope(config: CiConfig, facts: TestFacts, pr_plan: Plan) -
             "path": "tests/unit_tests/ops/test_packed_params.py",
             "device": "gpu",
         }],
-        "jobs": 4,
+        "jobs": 7,
     }
     assert validate_plan(pr_plan, config, facts) == []
     assert [job.id for job in pr_plan.jobs] == [
         "integration-base-suite-qwen3-5-moe-sft-2cpu",
         "integration-base-suite-qwen3-5-moe-sft-2npu",
+        "pytest-adapter-cpu-cpu-default-lf",
+        "pytest-adapter-cpu-cpu-default-qwen4-exp-swift",
+        "pytest-adapter-cpu-cpu-default-swift",
         "pytest-core-cpu-cpu-default-default",
         "pytest-core-npu-npu-default-default",
     ]
@@ -318,5 +321,5 @@ def test_cli_uses_scope_and_writes_matrix(
         "--github-output", str(matrix),
     ]) == 0
     assert output.is_file()
-    assert "cpu_job_count=2" in matrix.read_text(encoding="utf-8")
+    assert "cpu_job_count=5" in matrix.read_text(encoding="utf-8")
     assert "npu_job_count=2" in matrix.read_text(encoding="utf-8")

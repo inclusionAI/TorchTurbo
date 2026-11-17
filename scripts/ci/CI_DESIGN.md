@@ -49,7 +49,7 @@ Planner 从 pytest 源码派生以下事实，不手工维护测试清单：
 - 是否属于 integration 测试
 - 是否需要独立进程组
 
-adapter 测试依赖独立的 `swift` / `llamafactory` 环境，当前 PR 默认不跑，nightly 全量运行。
+adapter 测试依赖独立的 `swift` / `llamafactory` 环境，PR 和 nightly 均全量运行。
 
 ### 1.3 integration case
 
@@ -143,17 +143,20 @@ Planner 先按 device 与 scope 选择 target，再解析 image，最后按 rank
 
 | scope | pytest | integration | Job 数 |
 |---|---|---|---:|
-| `pull_request` | `core=all`，`model=none`，`adapter=none` | `sft_2cpu`、`sft_2npu` | 4 |
+| `pull_request` | `core=all`，`model=none`，`adapter=all` | `sft_2cpu`、`sft_2npu` | 7 |
 | `nightly` | `core/model/adapter=all` | 全部 3 case | 12 |
 | docs-only | 无 | 无 | 0 |
 
-PR 的 4 个执行 Job：
+PR 的 7 个执行 Job：
 
 ```text
-pytest-core-cpu-cpu-default-default
-pytest-core-npu-npu-default-default
 integration-base-suite-qwen3-5-moe-sft-2cpu
 integration-base-suite-qwen3-5-moe-sft-2npu
+pytest-adapter-cpu-cpu-default-lf
+pytest-adapter-cpu-cpu-default-qwen4-exp-swift
+pytest-adapter-cpu-cpu-default-swift
+pytest-core-cpu-cpu-default-default
+pytest-core-npu-npu-default-default
 ```
 
 nightly 的 12 个 Job 由 9 个 pytest Job 和 3 个 integration Job 组成。16 卡 case 不出现在 PR Plan 中。
@@ -212,7 +215,7 @@ Gate 的核心规则是 fail closed：
 
 ### 2.9 当前限制和后续增强
 
-- PR 不跑 adapter pytest；adapter 细粒度回归目前只在 nightly 覆盖。
+- PR 不跑 model pytest；adapter 全量在 PR 与 nightly 执行。
 - NPU 2 卡资源池目前只有一个在线 runner 时，NPU pytest 和 NPU integration 会串行，`max-parallel: 2` 只表示允许并发，不创造 runner 容量。
 - nightly 和 image workflow 的 cron 暂时关闭，nightly 当前只做 Plan 验证。
 - 模型 index 和全部 shard 的严格校验、下载超时/错误分类、`resolved_inputs.json` 的耗时和大小、ModelScope fallback 与 HF golden 一致性仍是非阻塞增强项。
@@ -224,12 +227,12 @@ Gate 的核心规则是 fail closed：
 
 当前已验证：
 
-- 真实 PR 事件生成 4 个执行 Job，CPU/NPU core pytest 和两条 integration 均通过，Gate 成功。
+- 真实 PR 事件生成 7 个执行 Job，CPU/NPU core、adapter pytest 和两条 integration 均通过，Gate 成功。
 - `2cpu`、`2npu` manual 单点通过。
 - 16 卡 case manual 单点通过。
 - nightly Plan 为 12 个 Job，16 卡只进入 nightly。
 - docs-only Plan 为 0 个 Job。
-- CI 单元测试 79 项通过，config、facts、contract lint 通过。
+- CI 单元测试 86 项通过，config、facts、contract lint 通过。
 
 常用本地校验：
 
@@ -411,7 +414,7 @@ Planner 仍按以下维度聚合 pytest：
 2. `lane.image` 已删除，lane 只绑定 target 和 runner 容量。
 3. Planner 使用统一 image 解析顺序和 `lane_for(target, ranks)`。
 4. `Runtime` 增加 `target`，artifact schema 升级到 3。
-5. 生产配置保留 `cpu` / `npu-a3`，PR 仍为 4 Job、nightly 仍为 12 Job。
+5. 生产配置保留 `cpu` / `npu-a3`，PR 为 7 Job、nightly 为 12 Job。
 6. A5 通过临时配置单测覆盖；生产配置不声明不存在的 A5 runner。
 
 后续增强：
