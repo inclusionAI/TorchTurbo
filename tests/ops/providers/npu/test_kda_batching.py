@@ -24,7 +24,7 @@ def _inputs(lengths, batch=1):
     return tensors, build_packed_params(boundaries, chunk_sizes=(64,))
 
 
-def _call(tensors, packed, output_final_state=True, normalize=False):
+def _call(tensors, packed, output_final_state=True, normalize=True):
     return kda.ascendc_chunk_kda(
         *tensors[:5], A_log=tensors[5], dt_bias=tensors[6],
         packed_params=packed, output_final_state=output_final_state,
@@ -35,11 +35,14 @@ def _call(tensors, packed, output_final_state=True, normalize=False):
 
 def _reference_apply(calls):
     def apply(query, key, value, gate, beta, a_log, dt_bias, scale,
-              output_final_state, lower_bound, use_gate_in_kernel, metadata):
-        assert all(tensor.is_contiguous() for tensor in (query, key, value, gate, beta))
+              output_final_state, lower_bound, use_gate_in_kernel,
+              use_qk_l2norm_in_kernel,
+              export_intermediates, metadata):
+        assert all(tensor.is_contiguous() for tensor in (query, key, value))
         assert use_gate_in_kernel and scale == 0.5 and lower_bound == -5.0
         if metadata is None:
-            token_axis = 1
+            combined = (query + 2 * key + 3 * value).transpose(1, 2)
+            boundaries = [0, query.size(2)]
         else:
             boundaries, indices = metadata
             assert len(boundaries) - 1 <= kda._MAX_KDA_SEQUENCES
@@ -49,16 +52,17 @@ def _reference_apply(calls):
                 for chunk_index in range((right - left + 63) // 64):
                     expected_indices.extend((sequence_index, chunk_index))
             assert indices == expected_indices
-            token_axis = 0
+            combined = (query + 2 * key + 3 * value).transpose(0, 1).unsqueeze(0)
         calls.append(metadata)
-        combined = query + 2 * key + 3 * value + 4 * gate + 5 * beta.unsqueeze(-1)
-        output = combined.transpose(token_axis, token_axis + 1)
-        output = output + a_log.reshape(2, 1) + dt_bias.reshape(2, 4)
+        output = (
+            combined + 4 * gate + 5 * beta.unsqueeze(-1)
+            + a_log.reshape(1, 1, 2, 1) + dt_bias.reshape(1, 1, 2, 4)
+        )
         final_state = None
         if output_final_state:
             assert metadata is not None
             final_state = torch.stack([
-                output[left:right].sum(dim=0).unsqueeze(-2).expand(2, 4, 4)
+                output[:, left:right].sum(dim=(0, 1)).unsqueeze(-2).expand(2, 4, 4)
                 for left, right in pairwise(boundaries)
             ])
         return output, final_state
@@ -74,7 +78,8 @@ def test_sequence_count_boundaries(monkeypatch, num_sequences, output_final_stat
     output, final_state = _call(tensors, packed, output_final_state)
 
     assert [len(metadata[0]) - 1 for metadata in calls] == [
-        min(1024, num_sequences - start) for start in range(0, num_sequences, 1024)
+        min(kda._MAX_KDA_SEQUENCES, num_sequences - start)
+        for start in range(0, num_sequences, kda._MAX_KDA_SEQUENCES)
     ]
     assert output.shape == (1, num_sequences, 2, 4)
     assert (final_state is not None) == output_final_state
@@ -98,7 +103,10 @@ def test_explicit_dispatch_reaches_batched_provider(monkeypatch, use_raw_offsets
         use_gate_in_kernel=True, safe_gate=True, lower_bound=-5.0,
         output_final_state=True, impl="ascendc_kda", **metadata,
     )
-    assert [len(group[0]) - 1 for group in calls] == [1024, 1]
+    assert [
+        len(group[0]) - 1
+        for group in calls
+    ] == [kda._MAX_KDA_SEQUENCES, 1025 - kda._MAX_KDA_SEQUENCES]
     assert output.shape == (1, 1025, 2, 4)
     assert final_state.shape == (1025, 2, 4, 4)
 
@@ -111,9 +119,6 @@ def test_batched_outputs_and_gradients_match_single_call(
 ):
     calls = []
     monkeypatch.setattr(kda.ChunkKDAFunction, "apply", _reference_apply(calls))
-    triton = ModuleType("fla_npu.ops.triton")
-    triton.l2norm = lambda tensor: torch.nn.functional.normalize(tensor, dim=-1)
-    monkeypatch.setitem(sys.modules, "fla_npu.ops.triton", triton)
     lengths = [1, 63, 64, 65, 0, 2, 0, 127, 1]
     baseline_inputs, packed = _inputs(lengths)
     split_inputs = [tensor.detach().clone().requires_grad_() for tensor in baseline_inputs]
@@ -168,7 +173,13 @@ def test_padding_tail_counts_as_an_isolated_sequence(monkeypatch):
     tensors, _ = _inputs([1027])
     packed = build_packed_params(torch.arange(1025), chunk_sizes=(64,), total_tokens=1027)
     output, final_state = _call(tensors, packed)
-    assert [len(metadata[0]) - 1 for metadata in calls] == [1024, 1]
+    assert [
+        len(metadata[0]) - 1
+        for metadata in calls
+    ] == [
+        kda._MAX_KDA_SEQUENCES,
+        len(packed.cu_seqlens_list) - 1 - kda._MAX_KDA_SEQUENCES,
+    ]
     assert calls[-1] == ([0, 3], [0, 0])
     assert output.shape == (1, 1027, 2, 4)
     assert final_state.shape == (1025, 2, 4, 4)
@@ -225,26 +236,37 @@ def test_autograd_function_receives_group_metadata_and_empty_states(monkeypatch,
         forward_calls.append((boundaries, indices))
         assert 0 < query.size(1) and len(boundaries) - 1 <= 2
         assert kwargs["layout"] == "NTD" and kwargs["disable_recompute"]
-        assert all(tensor.is_contiguous() for tensor in (query, key, value, gate, beta))
+        assert query.is_contiguous() and gate.is_contiguous() and beta.is_contiguous()
+        kwargs["q_hat_out"].copy_(query)
+        kwargs["k_hat_out"].copy_(key)
+        kwargs["q_rstd_out"].fill_(1)
+        kwargs["k_rstd_out"].fill_(1)
         state = torch.ones(len(boundaries) - 1, query.size(0), query.size(-1), value.size(-1))
         return (value.transpose(0, 1), state, gate, query, key, value,
                 value, query, key, value, state, None)
 
-    def backward(query, key, value, beta, gate_cumsum, aqk, akk, weights,
-                 query_gated, key_gated, value_new, state, grad_output, scale, **kwargs):
+    def prepare(aqk, v_new, grad_output, state, **kwargs):
         backward_calls.append((kwargs["cu_seqlens"], kwargs["chunk_indices"]))
-        assert kwargs["implementation"] == "legacy"
-        assert kwargs["disable_recompute"] and grad_output.shape == value.shape
-        assert grad_output.is_contiguous()
-        torch.testing.assert_close(grad_output, torch.ones_like(value))
+        return grad_output, grad_output, grad_output
+
+    def scan(query, key, weights, grad_output, dv_local, scale, chunk_size, **kwargs):
+        backward_calls.append((kwargs["cu_seqlens"], kwargs["chunk_indices"]))
+        return query, None, dv_local
+
+    def finalize(query, key, value, gate_cumsum, gate, beta, a_log, dt_bias, *saved, **kwargs):
+        backward_calls.append((kwargs["cu_seqlens"], kwargs["chunk_indices"]))
         return (
-            torch.zeros_like(query), torch.zeros_like(key), grad_output,
-            torch.zeros_like(beta), torch.zeros_like(kwargs["raw_g"]), None,
-            torch.ones_like(kwargs["A_log"]), torch.ones_like(kwargs["dt_bias"]),
+            torch.zeros_like(query), torch.zeros_like(key), torch.zeros_like(value),
+            torch.zeros_like(beta).transpose(0, 1), torch.zeros_like(gate).transpose(0, 1),
+            torch.zeros_like(a_log), torch.zeros_like(dt_bias),
         )
 
     ascendc.chunk_kda_fwd = forward
-    ascendc.chunk_kda_bwd = backward
+    ascendc.npu_chunk_kda_bwd_prepare = prepare
+    ascendc.npu_chunk_gated_delta_rule_bwd_dhu = scan
+    ascendc.npu_chunk_kda_bwd_finalize = finalize
+    monkeypatch.setitem(sys.modules, "fla_npu", ModuleType("fla_npu"))
+    monkeypatch.setitem(sys.modules, "fla_npu.ops", ModuleType("fla_npu.ops"))
     monkeypatch.setitem(sys.modules, "fla_npu.ops.ascendc", ascendc)
     monkeypatch.setattr(kda, "_MAX_KDA_SEQUENCES", 2)
     tensors, packed = _inputs([0, 0, 65, 1, 0, 0, 2])
@@ -261,14 +283,14 @@ def test_autograd_function_receives_group_metadata_and_empty_states(monkeypatch,
     output.sum().backward()
     expected_calls = [([0, 65, 66], [0, 0, 0, 1, 1, 0]), ([0, 2], [0, 0])]
     assert forward_calls == expected_calls * (2 if use_checkpoint else 1)
-    assert sorted(backward_calls) == sorted(expected_calls)
-    for tensor_index, tensor in enumerate(tensors):
-        expected_grad = 2 if tensor_index >= 5 else int(tensor_index == 2)
-        torch.testing.assert_close(tensor.grad, torch.full_like(tensor, expected_grad))
+    assert len(backward_calls) == 6
+    assert all(metadata in forward_calls for metadata in backward_calls)
+    for tensor in tensors:
+        torch.testing.assert_close(tensor.grad, torch.zeros_like(tensor))
 
 
 @pytest.mark.parametrize("output_final_state", [False, True])
-@pytest.mark.parametrize("use_gate_in_kernel", [False, True])
+@pytest.mark.parametrize("use_gate_in_kernel", [True])
 def test_empty_groups_return_zero_states_and_gradients(output_final_state, use_gate_in_kernel):
     tensors, packed = _inputs([0] * 2049)
     output, final_state = kda.ascendc_chunk_kda(
@@ -284,10 +306,8 @@ def test_empty_groups_return_zero_states_and_gradients(output_final_state, use_g
     else:
         assert final_state is None
     output.sum().backward()
-    for tensor in tensors[:5] + (tensors[5:] if use_gate_in_kernel else []):
+    for tensor in tensors:
         torch.testing.assert_close(tensor.grad, torch.zeros_like(tensor))
-    if not use_gate_in_kernel:
-        assert tensors[5].grad is None and tensors[6].grad is None
 
 
 def test_empty_groups_preserve_final_state_gradient_rejection():

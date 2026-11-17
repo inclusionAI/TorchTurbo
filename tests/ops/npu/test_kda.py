@@ -12,7 +12,7 @@ from torchturbo.ops.registry import registry
 from torchturbo.runtime.npu import NpuRuntime
 
 
-@pytest.mark.parametrize("num_sequences", [1025, 2049])
+@pytest.mark.parametrize("num_sequences", [1024, 1025, 2049])
 @pytest.mark.parametrize("output_final_state", [False, True])
 def test_large_varlen_kda_matches_smaller_groups(monkeypatch, num_sequences, output_final_state):
     if not torch.npu.is_available():
@@ -32,6 +32,8 @@ def test_large_varlen_kda_matches_smaller_groups(monkeypatch, num_sequences, out
     ])
     ops = OpDispatcher(registry=registry, device_runtime=NpuRuntime(), default_policy=OpPolicy.AUTO)
 
+    production_limit = kda._MAX_KDA_SEQUENCES
+
     def run(max_sequences):
         monkeypatch.setattr(kda, "_MAX_KDA_SEQUENCES", max_sequences)
         inputs = [tensor.detach().clone().requires_grad_() for tensor in original]
@@ -39,7 +41,8 @@ def test_large_varlen_kda_matches_smaller_groups(monkeypatch, num_sequences, out
             q=inputs[0], k=inputs[1], v=inputs[2], g=inputs[3], beta=inputs[4],
             A_log=inputs[5], dt_bias=inputs[6], cu_seqlens=boundaries,
             output_final_state=output_final_state, use_qk_l2norm_in_kernel=True,
-            use_gate_in_kernel=True, safe_gate=True, lower_bound=-5.0, impl="ascendc_kda",
+            use_gate_in_kernel=True, safe_gate=True, lower_bound=-5.0,
+            impl="ascendc_kda",
         )
         output.float().square().sum().backward()
         result = [output.detach(), *(tensor.grad.detach() for tensor in inputs)]
@@ -49,7 +52,8 @@ def test_large_varlen_kda_matches_smaller_groups(monkeypatch, num_sequences, out
         return result
 
     baseline = run(127)
-    actual = run(1024)
+    # The test must exercise the production limit, not always force 1024.
+    actual = run(production_limit)
     torch.npu.synchronize()
     names = ("output", "dq", "dk", "dv", "dg", "dbeta", "dA_log", "dt_bias", "final_state")
     for name, expected, result in zip(names, baseline, actual):
