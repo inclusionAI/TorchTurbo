@@ -31,6 +31,7 @@ def test_large_varlen_kda_matches_smaller_groups(monkeypatch, num_sequences, out
         torch.randn(256, device="npu", dtype=torch.float32),
     ])
     ops = OpDispatcher(registry=registry, device_runtime=NpuRuntime(), default_policy=OpPolicy.AUTO)
+    production_limit = kda._MAX_KDA_SEQUENCES
 
     def run(max_sequences):
         monkeypatch.setattr(kda, "_MAX_KDA_SEQUENCES", max_sequences)
@@ -49,7 +50,7 @@ def test_large_varlen_kda_matches_smaller_groups(monkeypatch, num_sequences, out
         return result
 
     baseline = run(127)
-    actual = run(1024)
+    actual = run(production_limit)
     torch.npu.synchronize()
     names = ("output", "dq", "dk", "dv", "dg", "dbeta", "dA_log", "dt_bias", "final_state")
     for name, expected, result in zip(names, baseline, actual):
