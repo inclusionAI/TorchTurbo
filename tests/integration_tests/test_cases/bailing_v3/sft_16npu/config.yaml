@@ -4,13 +4,13 @@ MODEL_ARGS: {}
 
 TRAIN_ARGS:
   model:
-    source: huggingface
+    source: modelscope
     repo: inclusionAI/Ling-3.0-tiny
-    revision: 9a98e35fe1c9ee255f78dd64771c7ae15a799481
+    revision: 0a9ee734a409577fa0cff0ff48b48df008e7d8d4
   dataset:
-    source: huggingface
+    source: modelscope
     repo: a-m-team/AM-Thinking-v1-Distilled
-    revision: 186b575b5cc2113f8ba81d4f4ac9ae2494633829
+    revision: f231097a64f61c091ef220672f3e6cc130f2cdb7
     file: science.jsonl
   model_type: turbo_bailing_hybrid
   template: ling_v3
