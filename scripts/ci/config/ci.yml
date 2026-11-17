@@ -1,14 +1,21 @@
-schema_version: 1
+schema_version: 2
 
 resources:
+  targets:
+    cpu:
+      device: cpu
+    npu-a3:
+      device: npu
+      hardware: a3
+
   images:
     cpu-default:
-      device: cpu
+      target: cpu
       kind: host
       ref: python:3.11
       default: true
     npu-default:
-      device: npu
+      target: npu-a3
       kind: container
       ref: swr.cn-north-12.myhuaweicloud.com/ascend/torchturbo_npu:base-latest
       default: true
@@ -38,32 +45,27 @@ resources:
 
   lanes:
     cpu/default:
-      device: cpu
-      image: cpu-default
+      target: cpu
       capacity_slots: 8
       runner_variable: CI_CPU_RUNNER
       runner: ubuntu-22.04-arm
     npu/default-2:
-      device: npu
-      image: npu-default
+      target: npu-a3
       capacity_slots: 2
       runner_variable: CI_NPU_2_RUNNER
       runner: linux-aarch64-a3-800i-2
     npu/default-4:
-      device: npu
-      image: npu-default
+      target: npu-a3
       capacity_slots: 4
       runner_variable: CI_NPU_4_RUNNER
       runner: linux-aarch64-a3-800i-4
     npu/default-8:
-      device: npu
-      image: npu-default
+      target: npu-a3
       capacity_slots: 8
       runner_variable: CI_NPU_8_RUNNER
       runner: linux-aarch64-a3-800i-8
     npu/default-16:
-      device: npu
-      image: npu-default
+      target: npu-a3
       capacity_slots: 16
       runner_variable: CI_NPU_16_RUNNER
       runner: linux-aarch64-a3-800i-16
@@ -72,7 +74,7 @@ workloads:
   pytest:
     defaults:
       job_timeout_minutes: {cpu: 40, npu: 360, gpu: 360}
-      step_timeout_seconds: {cpu: 2400, npu: 21600, gpu: 21600}
+      step_timeout_minutes: {cpu: 40, npu: 360, gpu: 360}
     model_venvs:
       qwen4_exp: qwen4_exp
     framework_venvs:
@@ -90,7 +92,7 @@ workloads:
         runner: tests/integration_tests/scripts/run_tests.py
         defaults:
           job_timeout_minutes: {cpu: 60, npu: 360}
-          step_timeout_seconds: {cpu: 3600, npu: 21600}
+          step_timeout_minutes: {cpu: 60, npu: 360}
         framework_venvs:
           swift: swift
           llamafactory: lf
@@ -100,6 +102,7 @@ workloads:
 
 scopes:
   pull_request:
+    targets: [cpu, npu-a3]
     pytest: {core: all, model: none, adapter: none}
     integration:
       base_suite:
@@ -107,6 +110,7 @@ scopes:
         cases: [qwen3_5_moe/sft_2cpu, qwen3_5_moe/sft_2npu]
 
   nightly:
+    targets: [cpu, npu-a3]
     pytest: {core: all, model: all, adapter: all}
     integration:
       base_suite:

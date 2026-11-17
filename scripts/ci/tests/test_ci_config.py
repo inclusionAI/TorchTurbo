@@ -1,21 +1,35 @@
 from __future__ import annotations
 
 from collections import Counter
+from dataclasses import replace
 
 import pytest
 
-from scripts.ci.producer.ci_config import CiConfig, CiConfigError
+from scripts.ci.producer.ci_config import (
+    CiConfig,
+    CiConfigError,
+    CiImage,
+    CiLane,
+    CiTarget,
+)
 from scripts.ci.producer.facts import TestFacts, counts
 
 
 def test_config_resources(config: CiConfig) -> None:
-    assert [image.name for image in config.images.values() if image.device == "cpu"] == [
+    assert config.targets["cpu"].device == "cpu"
+    assert config.targets["npu-a3"].device == "npu"
+    assert config.targets["npu-a3"].hardware == "a3"
+    assert [
+        image.name for image in config.images.values() if image.target == "cpu"
+    ] == [
         "cpu-default"
     ]
-    assert [image.name for image in config.images.values() if image.device == "npu"] == [
+    assert [
+        image.name for image in config.images.values() if image.target == "npu-a3"
+    ] == [
         "npu-default"
     ]
-    assert not [image for image in config.images.values() if image.device == "gpu"]
+    assert not [image for image in config.images.values() if image.target == "gpu"]
     assert set(config.venvs) == {
         "default",
         "qwen4_exp",
@@ -23,6 +37,11 @@ def test_config_resources(config: CiConfig) -> None:
         "swift",
         "qwen4_exp_swift",
     }
+    assert config.pytest.job_timeout_minutes == {"cpu": 40, "npu": 360, "gpu": 360}
+    assert config.pytest.step_timeout_minutes == {"cpu": 40, "npu": 360, "gpu": 360}
+    suite = config.integration.suites["base_suite"]
+    assert suite.job_timeout_minutes == {"cpu": 60, "npu": 360}
+    assert suite.step_timeout_minutes == {"cpu": 60, "npu": 360}
 
 
 @pytest.mark.parametrize(
@@ -38,7 +57,99 @@ def test_config_resources(config: CiConfig) -> None:
 def test_npu_lane_picks_smallest_sufficient_capacity(
     config: CiConfig, ranks: int, lane_name: str
 ) -> None:
-    assert config.lane_for("npu", "npu-default", ranks).name == lane_name
+    assert config.lane_for("npu-a3", ranks).name == lane_name
+
+
+def test_scope_selects_targets_not_images(config: CiConfig) -> None:
+    pr = config.scope("pull_request")
+    assert pr.targets == ("cpu", "npu-a3")
+    assert config.targets_for("npu", pr.targets) == (config.targets["npu-a3"],)
+    assert config.targets_for("cpu", pr.targets) == (config.targets["cpu"],)
+
+
+def test_image_resolution_precedence(config: CiConfig) -> None:
+    target = config.targets["npu-a3"]
+    alternative = replace(
+        config.images["npu-default"],
+        name="npu-a3-alt",
+        ref="swr.example/torchturbo_npu:a3-alt",
+        default=False,
+    )
+    candidate = replace(
+        config,
+        images={**config.images, alternative.name: alternative},
+    )
+    scope_image = {target.name: alternative.name}
+    workload_image = {target.name: "npu-default"}
+
+    assert candidate.resolve_image(target).name == "npu-default"
+    assert candidate.resolve_image(
+        target, workload_images=workload_image
+    ).name == "npu-default"
+    assert candidate.resolve_image(
+        target,
+        scope_images=scope_image,
+        workload_images=workload_image,
+    ).name == alternative.name
+    assert candidate.resolve_image(
+        target,
+        explicit="npu-default",
+        scope_images=scope_image,
+        workload_images=workload_image,
+    ).name == "npu-default"
+
+
+def test_image_must_match_target(config: CiConfig) -> None:
+    with pytest.raises(CiConfigError, match="is for target"):
+        config.image_for("npu-a3", "cpu-default")
+
+
+def test_unknown_target_fails_closed(config: CiConfig) -> None:
+    with pytest.raises(CiConfigError, match="unknown target"):
+        config.target_for("npu-a5")
+
+
+def _with_a5(config: CiConfig) -> CiConfig:
+    target = CiTarget(name="npu-a5", device="npu", hardware="a5")
+    image = CiImage(
+        name="npu-a5-default",
+        target=target.name,
+        kind="container",
+        ref="swr.example/torchturbo_npu:a5",
+        default=True,
+    )
+    lane = CiLane(
+        name="npu-a5/default-2",
+        target=target.name,
+        capacity_slots=2,
+        runner_variable="CI_NPU_A5_2_RUNNER",
+        runner="linux-aarch64-a5-800i-2",
+    )
+    scopes = {
+        name: replace(
+            scope,
+            targets=(*scope.targets, target.name),
+            images={**scope.images, target.name: image.name},
+        )
+        for name, scope in config.scopes.items()
+    }
+    return replace(
+        config,
+        targets={**config.targets, target.name: target},
+        images={**config.images, image.name: image},
+        lanes={**config.lanes, lane.name: lane},
+        scopes=scopes,
+    )
+
+
+def test_a5_target_is_explicit_and_lane_is_target_scoped(config: CiConfig) -> None:
+    candidate = _with_a5(config)
+    target = candidate.target_for("npu-a5")
+    assert candidate.targets_for("npu", ("cpu", "npu-a3", "npu-a5"), ("npu-a5",)) == (
+        target,
+    )
+    assert candidate.lane_for(target, 2).name == "npu-a5/default-2"
+    assert candidate.resolve_image(target).name == "npu-a5-default"
 
 
 def test_venv_extends_is_expanded(config: CiConfig) -> None:

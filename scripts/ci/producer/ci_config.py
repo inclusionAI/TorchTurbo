@@ -24,7 +24,7 @@ from ..contracts.artifacts import (
 )
 
 CONFIG_PATH = Path("scripts/ci/config/ci.yml")
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 SCOPES = ("pull_request", "nightly")
 
 
@@ -37,9 +37,16 @@ class CiConfigError(ValueError):
 
 
 @dataclass(frozen=True)
-class CiImage:
+class CiTarget:
     name: str
     device: str
+    hardware: str
+
+
+@dataclass(frozen=True)
+class CiImage:
+    name: str
+    target: str
     kind: str
     ref: str
     default: bool
@@ -51,8 +58,7 @@ class CiImage:
 @dataclass(frozen=True)
 class CiLane:
     name: str
-    device: str
-    image_name: str
+    target: str
     capacity_slots: int
     runner_variable: str
     runner: str
@@ -62,12 +68,14 @@ class CiLane:
 class PytestOverride:
     venv: str
     image: str | None = None
+    targets: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
 class PytestWorkload:
     job_timeout_minutes: dict[str, int]
-    step_timeout_seconds: dict[str, int]
+    step_timeout_minutes: dict[str, int]
+    images: dict[str, str]
     model_venvs: dict[str, str]
     framework_venvs: dict[str, str]
     combo_venvs: dict[str, str]
@@ -77,7 +85,9 @@ class PytestWorkload:
 @dataclass(frozen=True)
 class IntegrationOverride:
     job_timeout_minutes: int | None = None
-    step_timeout_seconds: int | None = None
+    step_timeout_minutes: int | None = None
+    image: str | None = None
+    targets: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -85,21 +95,22 @@ class IntegrationSuite:
     name: str
     runner: str
     job_timeout_minutes: dict[str, int]
-    step_timeout_seconds: dict[str, int]
+    step_timeout_minutes: dict[str, int]
+    images: dict[str, str]
     framework_venvs: dict[str, str]
     overrides: dict[str, IntegrationOverride]
 
-    def timeout_minutes(self, device: str, case_id: str) -> int:
+    def job_timeout_minutes_for(self, device: str, case_id: str) -> int:
         override = self.overrides.get(case_id)
         if override is not None and override.job_timeout_minutes is not None:
             return override.job_timeout_minutes
         return self.job_timeout_minutes[device]
 
-    def timeout_seconds(self, device: str, case_id: str) -> int:
+    def step_timeout_minutes_for(self, device: str, case_id: str) -> int:
         override = self.overrides.get(case_id)
-        if override is not None and override.step_timeout_seconds is not None:
-            return override.step_timeout_seconds
-        return self.step_timeout_seconds[device]
+        if override is not None and override.step_timeout_minutes is not None:
+            return override.step_timeout_minutes
+        return self.step_timeout_minutes[device]
 
 
 @dataclass(frozen=True)
@@ -116,6 +127,8 @@ class ScopeSuite:
 @dataclass(frozen=True)
 class Scope:
     name: str
+    targets: tuple[str, ...]
+    images: dict[str, str]
     pytest: dict[str, str]
     integration: dict[str, ScopeSuite]
     allow_skip: dict[str, tuple[str, ...]]
@@ -125,6 +138,7 @@ class Scope:
 class CiConfig:
     schema_version: int
     root: Path
+    targets: dict[str, CiTarget]
     images: dict[str, CiImage]
     venvs: dict[str, VenvSpec]
     lanes: dict[str, CiLane]
@@ -133,42 +147,88 @@ class CiConfig:
     scopes: dict[str, Scope]
     digest: str
 
-    def image_for(self, device: str, name: str | None = None) -> CiImage:
+    def target_for(self, name: str) -> CiTarget:
+        target = self.targets.get(name)
+        if target is None:
+            raise CiConfigError([Issue("unknown-target", name, f"unknown target {name!r}")])
+        return target
+
+    def targets_for(
+        self,
+        device: str,
+        allowed: Iterable[str],
+        required: Iterable[str] = (),
+    ) -> tuple[CiTarget, ...]:
+        required_names = tuple(dict.fromkeys(required))
+        required_targets = tuple(self.target_for(name) for name in required_names)
+        for target in required_targets:
+            if target.device != device:
+                raise CiConfigError([Issue(
+                    "target-device",
+                    target.name,
+                    f"target {target.name!r} is for {target.device}, not {device}",
+                )])
+        allowed_names = set(allowed)
+        candidates = required_targets or tuple(
+            target for target in self.targets.values() if target.device == device
+        )
+        return tuple(
+            target for target in candidates if target.name in allowed_names
+        )
+
+    def image_for(self, target: str | CiTarget, name: str | None = None) -> CiImage:
+        target_name = target.name if isinstance(target, CiTarget) else target
         if name:
             image = self.images.get(name)
             if image is None:
                 raise CiConfigError([Issue("unknown-image", name, f"unknown image {name!r}")])
-            if image.device != device:
+            if image.target != target_name:
                 raise CiConfigError([Issue(
-                    "image-device",
+                    "image-target",
                     name,
-                    f"image {name!r} is for {image.device}, not {device}",
+                    f"image {name!r} is for target {image.target!r}, not {target_name!r}",
                 )])
             return image
         defaults = [
             image for image in self.images.values()
-            if image.device == device and image.default
+            if image.target == target_name and image.default
         ]
         if len(defaults) != 1:
             raise CiConfigError([Issue(
                 "default-image",
-                device,
-                f"device {device!r} needs exactly one default image",
+                target_name,
+                f"target {target_name!r} needs exactly one default image",
             )])
         return defaults[0]
 
-    def lane_for(self, device: str, image_name: str, ranks: int) -> CiLane:
+    def resolve_image(
+        self,
+        target: str | CiTarget,
+        *,
+        explicit: str | None = None,
+        scope_images: dict[str, str] | None = None,
+        workload_images: dict[str, str] | None = None,
+    ) -> CiImage:
+        target_name = target.name if isinstance(target, CiTarget) else target
+        name = (
+            explicit
+            or (scope_images or {}).get(target_name)
+            or (workload_images or {}).get(target_name)
+        )
+        return self.image_for(target_name, name)
+
+    def lane_for(self, target: str | CiTarget, ranks: int) -> CiLane:
+        target_name = target.name if isinstance(target, CiTarget) else target
         matches = [
             lane for lane in self.lanes.values()
-            if lane.device == device
-            and lane.image_name == image_name
+            if lane.target == target_name
             and lane.capacity_slots >= ranks
         ]
         if not matches:
             raise CiConfigError([Issue(
                 "missing-lane",
-                f"{device}/{image_name}",
-                f"no lane for device={device} image={image_name} ranks={ranks}",
+                target_name,
+                f"no lane for target={target_name} ranks={ranks}",
             )])
         return min(matches, key=lambda lane: (lane.capacity_slots, lane.name))
 
@@ -179,9 +239,7 @@ class CiConfig:
         return scope
 
     def device_is_configured(self, device: str) -> bool:
-        return any(image.device == device for image in self.images.values()) or any(
-            lane.device == device for lane in self.lanes.values()
-        )
+        return any(target.device == device for target in self.targets.values())
 
     def integration_suite(self, name: str) -> IntegrationSuite:
         suite = self.integration.suites.get(name)
@@ -246,6 +304,9 @@ class CiConfig:
         return {
             "schema_version": self.schema_version,
             "resources": {
+                "targets": {
+                    key: asdict(value) for key, value in sorted(self.targets.items())
+                },
                 "images": {
                     key: asdict(value) for key, value in sorted(self.images.items())
                 },
@@ -265,6 +326,8 @@ class CiConfig:
             },
             "scopes": {
                 key: {
+                    "targets": list(value.targets),
+                    "images": dict(sorted(value.images.items())),
                     "pytest": value.pytest,
                     "integration": {
                         suite: asdict(selection)
@@ -333,9 +396,30 @@ def _timeouts(raw: Any, path: str, issues: list[Issue]) -> dict[str, int]:
     return result
 
 
+def _load_targets(raw: Any, issues: list[Issue]) -> dict[str, CiTarget]:
+    rows = _mapping(raw, "resources.targets", issues)
+    targets: dict[str, CiTarget] = {}
+    for name, value in rows.items():
+        where = f"resources.targets.{name}"
+        row = _row(value, where, {"device", "hardware"}, issues)
+        device = str(row.get("device") or "")
+        hardware = str(row.get("hardware") or "")
+        if device not in DEVICES:
+            issues.append(_issue(f"{where}.device", "unknown device"))
+        if device != "cpu" and not hardware:
+            issues.append(_issue(
+                f"{where}.hardware",
+                "hardware is required for accelerator targets",
+            ))
+        targets[name] = CiTarget(name=name, device=device, hardware=hardware)
+    if not targets:
+        issues.append(_issue("resources.targets", "at least one target is required"))
+    return targets
+
+
 def _load_images(
     raw: Any,
-    root: Path,
+    targets: dict[str, CiTarget],
     image_refs: dict[str, str],
     issues: list[Issue],
 ) -> dict[str, CiImage]:
@@ -343,37 +427,37 @@ def _load_images(
     images: dict[str, CiImage] = {}
     for name, value in rows.items():
         where = f"resources.images.{name}"
-        row = _row(value, where, {"device", "kind", "ref", "default"}, issues)
-        device = str(row.get("device") or "")
+        row = _row(value, where, {"target", "kind", "ref", "default"}, issues)
+        target = str(row.get("target") or "")
         kind = str(row.get("kind") or "")
         ref = str(image_refs.get(name) or row.get("ref") or "")
-        if device not in DEVICES:
-            issues.append(_issue(f"{where}.device", "unknown device"))
+        if target not in targets:
+            issues.append(_issue(f"{where}.target", "unknown target"))
         if kind not in {"host", "container"}:
             issues.append(_issue(f"{where}.kind", "must be host or container"))
         if not ref:
             issues.append(_issue(f"{where}.ref", "image ref is required"))
         images[name] = CiImage(
             name=name,
-            device=device,
+            target=target,
             kind=kind,
             ref=ref,
             default=bool(row.get("default", False)),
         )
-    for device in DEVICES:
+    for target in targets:
         defaults = [
             image for image in images.values()
-            if image.device == device and image.default
+            if image.target == target and image.default
         ]
         if len(defaults) > 1:
             issues.append(_issue(
                 "resources.images",
-                f"device {device} has multiple default images",
+                f"target {target} has multiple default images",
             ))
-        if any(image.device == device for image in images.values()) and not defaults:
+        if any(image.target == target for image in images.values()) and not defaults:
             issues.append(_issue(
                 "resources.images",
-                f"device {device} has no default image",
+                f"target {target} has no default image",
             ))
     return images
 
@@ -481,7 +565,7 @@ def _load_venvs(raw: Any, root: Path, issues: list[Issue]) -> dict[str, VenvSpec
 
 def _load_lanes(
     raw: Any,
-    images: dict[str, CiImage],
+    targets: dict[str, CiTarget],
     issues: list[Issue],
 ) -> dict[str, CiLane]:
     rows = _mapping(raw, "resources.lanes", issues)
@@ -491,22 +575,15 @@ def _load_lanes(
         row = _row(
             value,
             where,
-            {"device", "image", "capacity_slots", "runner_variable", "runner"},
+            {"target", "capacity_slots", "runner_variable", "runner"},
             issues,
         )
-        device = str(row.get("device") or "")
-        image_name = str(row.get("image") or "")
-        image = images.get(image_name)
-        if device not in DEVICES:
-            issues.append(_issue(f"{where}.device", "unknown device"))
-        if image is None:
-            issues.append(_issue(f"{where}.image", "unknown image"))
-        elif image.device != device:
-            issues.append(_issue(where, "image and lane devices differ"))
+        target = str(row.get("target") or "")
+        if target not in targets:
+            issues.append(_issue(f"{where}.target", "unknown target"))
         lane = CiLane(
             name=name,
-            device=device,
-            image_name=image_name,
+            target=target,
             capacity_slots=_int(
                 row.get("capacity_slots"), f"{where}.capacity_slots", issues, 1
             ),
@@ -516,25 +593,47 @@ def _load_lanes(
         if not lane.runner_variable or not lane.runner:
             issues.append(_issue(where, "runner_variable and runner are required"))
         lanes[name] = lane
-    for device in DEVICES:
-        defaults = [
-            image for image in images.values()
-            if image.device == device and image.default
-        ]
-        if defaults and not any(
-            lane.device == device and lane.image_name == defaults[0].name
-            for lane in lanes.values()
-        ):
+    for target in targets:
+        if not any(lane.target == target for lane in lanes.values()):
             issues.append(_issue(
                 "resources.lanes",
-                f"device {device} has no lane for its default image",
+                f"target {target} has no lane",
             ))
     return lanes
+
+
+def _target_images(
+    raw: Any,
+    path: str,
+    targets: dict[str, CiTarget],
+    images: dict[str, CiImage],
+    issues: list[Issue],
+) -> dict[str, str]:
+    rows = _mapping(raw or {}, path, issues)
+    result: dict[str, str] = {}
+    for target, value in rows.items():
+        if target not in targets:
+            issues.append(_issue(f"{path}.{target}", "unknown target"))
+            continue
+        image_name = str(value or "")
+        image = images.get(image_name)
+        if image is None:
+            issues.append(_issue(f"{path}.{target}", f"unknown image {image_name!r}"))
+            continue
+        if image.target != target:
+            issues.append(_issue(
+                f"{path}.{target}",
+                f"image {image_name!r} belongs to target {image.target!r}",
+            ))
+            continue
+        result[target] = image_name
+    return result
 
 
 def _load_pytest(
     raw: Any,
     venvs: dict[str, VenvSpec],
+    targets: dict[str, CiTarget],
     images: dict[str, CiImage],
     root: Path,
     issues: list[Issue],
@@ -542,13 +641,20 @@ def _load_pytest(
     row = _row(
         raw,
         "workloads.pytest",
-        {"defaults", "model_venvs", "framework_venvs", "combo_venvs", "overrides"},
+        {
+            "defaults",
+            "images",
+            "model_venvs",
+            "framework_venvs",
+            "combo_venvs",
+            "overrides",
+        },
         issues,
     )
     defaults = _row(
         row.get("defaults"),
         "workloads.pytest.defaults",
-        {"job_timeout_minutes", "step_timeout_seconds"},
+        {"job_timeout_minutes", "step_timeout_minutes"},
         issues,
     )
     model_venvs = _mapping(
@@ -576,16 +682,31 @@ def _load_pytest(
     overrides: dict[str, PytestOverride] = {}
     for path, value in overrides_raw.items():
         where = f"workloads.pytest.overrides.{path}"
-        override = _row(value, where, {"venv", "image"}, issues)
+        override = _row(value, where, {"venv", "image", "targets"}, issues)
         venv = str(override.get("venv") or "")
         image = str(override.get("image") or "") or None
+        targets_value = _strings(override.get("targets"), f"{where}.targets", issues)
         if venv not in venvs:
             issues.append(_issue(f"{where}.venv", "unknown venv"))
         if image and image not in images:
             issues.append(_issue(f"{where}.image", "unknown image"))
+        for target in targets_value:
+            if target not in targets:
+                issues.append(_issue(f"{where}.targets", f"unknown target {target!r}"))
+        if image in images and targets_value and images[image].target not in targets_value:
+            issues.append(_issue(
+                f"{where}.image",
+                "image target is not included in targets",
+            ))
+        if len(set(targets_value)) != len(targets_value):
+            issues.append(_issue(f"{where}.targets", "contains duplicates"))
         if not (root / path).is_file():
             issues.append(_issue(where, "test file is missing"))
-        overrides[path] = PytestOverride(venv=venv, image=image)
+        overrides[path] = PytestOverride(
+            venv=venv,
+            image=image,
+            targets=targets_value,
+        )
 
     return PytestWorkload(
         job_timeout_minutes=_timeouts(
@@ -593,9 +714,16 @@ def _load_pytest(
             "workloads.pytest.defaults.job_timeout_minutes",
             issues,
         ),
-        step_timeout_seconds=_timeouts(
-            defaults.get("step_timeout_seconds"),
-            "workloads.pytest.defaults.step_timeout_seconds",
+        step_timeout_minutes=_timeouts(
+            defaults.get("step_timeout_minutes"),
+            "workloads.pytest.defaults.step_timeout_minutes",
+            issues,
+        ),
+        images=_target_images(
+            row.get("images"),
+            "workloads.pytest.images",
+            targets,
+            images,
             issues,
         ),
         model_venvs={key: str(value) for key, value in model_venvs.items()},
@@ -608,6 +736,8 @@ def _load_pytest(
 def _load_integration(
     raw: Any,
     venvs: dict[str, VenvSpec],
+    targets: dict[str, CiTarget],
+    images: dict[str, CiImage],
     root: Path,
     issues: list[Issue],
 ) -> IntegrationWorkload:
@@ -619,7 +749,7 @@ def _load_integration(
         suite = _row(
             value,
             where,
-            {"runner", "defaults", "framework_venvs", "overrides"},
+            {"runner", "defaults", "images", "framework_venvs", "overrides"},
             issues,
         )
         runner = str(suite.get("runner") or "")
@@ -628,7 +758,7 @@ def _load_integration(
         defaults = _row(
             suite.get("defaults"),
             f"{where}.defaults",
-            {"job_timeout_minutes", "step_timeout_seconds"},
+            {"job_timeout_minutes", "step_timeout_minutes"},
             issues,
         )
         frameworks = _mapping(
@@ -647,20 +777,41 @@ def _load_integration(
             override = _row(
                 item,
                 override_where,
-                {"job_timeout_minutes", "step_timeout_seconds"},
+                {"job_timeout_minutes", "step_timeout_minutes", "image", "targets"},
                 issues,
             )
             job_timeout = override.get("job_timeout_minutes")
-            step_timeout = override.get("step_timeout_seconds")
+            step_timeout = override.get("step_timeout_minutes")
+            image = str(override.get("image") or "") or None
+            target_values = _strings(
+                override.get("targets"), f"{override_where}.targets", issues
+            )
+            if image and image not in images:
+                issues.append(_issue(f"{override_where}.image", "unknown image"))
+            for target in target_values:
+                if target not in targets:
+                    issues.append(_issue(
+                        f"{override_where}.targets",
+                        f"unknown target {target!r}",
+                    ))
+            if image in images and target_values and images[image].target not in target_values:
+                issues.append(_issue(
+                    f"{override_where}.image",
+                    "image target is not included in targets",
+                ))
+            if len(set(target_values)) != len(target_values):
+                issues.append(_issue(f"{override_where}.targets", "contains duplicates"))
             overrides[case_id] = IntegrationOverride(
                 job_timeout_minutes=(
                     _int(job_timeout, f"{override_where}.job_timeout_minutes", issues, 1)
                     if job_timeout is not None else None
                 ),
-                step_timeout_seconds=(
-                    _int(step_timeout, f"{override_where}.step_timeout_seconds", issues, 1)
+                step_timeout_minutes=(
+                    _int(step_timeout, f"{override_where}.step_timeout_minutes", issues, 1)
                     if step_timeout is not None else None
                 ),
+                image=image,
+                targets=target_values,
             )
         suites[name] = IntegrationSuite(
             name=name,
@@ -668,8 +819,15 @@ def _load_integration(
             job_timeout_minutes=_timeouts(
                 defaults.get("job_timeout_minutes"), f"{where}.defaults.job_timeout_minutes", issues
             ),
-            step_timeout_seconds=_timeouts(
-                defaults.get("step_timeout_seconds"), f"{where}.defaults.step_timeout_seconds", issues
+            step_timeout_minutes=_timeouts(
+                defaults.get("step_timeout_minutes"), f"{where}.defaults.step_timeout_minutes", issues
+            ),
+            images=_target_images(
+                suite.get("images"),
+                f"{where}.images",
+                targets,
+                images,
+                issues,
             ),
             framework_venvs={
                 framework: str(venv) for framework, venv in frameworks.items()
@@ -682,13 +840,41 @@ def _load_integration(
 def _load_scopes(
     raw: Any,
     suites: dict[str, IntegrationSuite],
+    targets: dict[str, CiTarget],
+    images: dict[str, CiImage],
     issues: list[Issue],
 ) -> dict[str, Scope]:
     rows = _mapping(raw, "scopes", issues)
     scopes: dict[str, Scope] = {}
     for name, value in rows.items():
         where = f"scopes.{name}"
-        row = _row(value, where, {"pytest", "integration", "allow_skip"}, issues)
+        row = _row(
+            value,
+            where,
+            {"targets", "images", "pytest", "integration", "allow_skip"},
+            issues,
+        )
+        scope_targets = _strings(row.get("targets"), f"{where}.targets", issues)
+        if not scope_targets:
+            issues.append(_issue(f"{where}.targets", "at least one target is required"))
+        if len(set(scope_targets)) != len(scope_targets):
+            issues.append(_issue(f"{where}.targets", "contains duplicates"))
+        for target in scope_targets:
+            if target not in targets:
+                issues.append(_issue(f"{where}.targets", f"unknown target {target!r}"))
+        scope_images = _target_images(
+            row.get("images"),
+            f"{where}.images",
+            targets,
+            images,
+            issues,
+        )
+        for target in scope_images:
+            if target not in scope_targets:
+                issues.append(_issue(
+                    f"{where}.images.{target}",
+                    "image target is not selected by the scope",
+                ))
         pytest_row = _mapping(row.get("pytest"), f"{where}.pytest", issues)
         _unknown_keys(pytest_row, set(SUITES), f"{where}.pytest", issues)
         pytest_modes: dict[str, str] = {}
@@ -758,6 +944,8 @@ def _load_scopes(
             )
         scopes[name] = Scope(
             name=name,
+            targets=scope_targets,
+            images=scope_images,
             pytest=pytest_modes,
             integration=integration,
             allow_skip=allow_skip,
@@ -784,24 +972,35 @@ def load(root: Path, *, image_refs: dict[str, str] | None = None) -> CiConfig:
             "schema_version", f"expected {SCHEMA_VERSION}", "unsupported-schema"
         ))
     resources = _row(
-        document.get("resources"), "resources", {"images", "venvs", "lanes"}, issues
+        document.get("resources"),
+        "resources",
+        {"targets", "images", "venvs", "lanes"},
+        issues,
     )
+    targets = _load_targets(resources.get("targets"), issues)
     images = _load_images(
-        resources.get("images"), root, image_refs or {}, issues
+        resources.get("images"), targets, image_refs or {}, issues
     )
     venvs = _load_venvs(resources.get("venvs"), root, issues)
-    lanes = _load_lanes(resources.get("lanes"), images, issues)
+    lanes = _load_lanes(resources.get("lanes"), targets, issues)
     workloads = _row(
         document.get("workloads"), "workloads", {"pytest", "integration"}, issues
     )
-    pytest = _load_pytest(workloads.get("pytest"), venvs, images, root, issues)
-    integration = _load_integration(workloads.get("integration"), venvs, root, issues)
-    scopes = _load_scopes(document.get("scopes"), integration.suites, issues)
+    pytest = _load_pytest(
+        workloads.get("pytest"), venvs, targets, images, root, issues
+    )
+    integration = _load_integration(
+        workloads.get("integration"), venvs, targets, images, root, issues
+    )
+    scopes = _load_scopes(
+        document.get("scopes"), integration.suites, targets, images, issues
+    )
     if issues:
         raise CiConfigError(issues)
     config = CiConfig(
         schema_version=SCHEMA_VERSION,
         root=root,
+        targets=targets,
         images=images,
         venvs=venvs,
         lanes=lanes,
@@ -845,7 +1044,8 @@ def main(argv: list[str]) -> int:
             print(canonical_json(payload))
         return 0
     print(
-        f"ci config OK ({len(config.images)} images, {len(config.venvs)} venvs, "
+        f"ci config OK ({len(config.targets)} targets, {len(config.images)} images, "
+        f"{len(config.venvs)} venvs, "
         f"{len(config.lanes)} lanes, {len(config.integration.suites)} integration suites)"
     )
     return 0

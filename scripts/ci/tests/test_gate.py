@@ -8,6 +8,7 @@ from scripts.ci.contracts.artifacts import (
     Issue,
     JobResult,
     PytestEvidence,
+    PytestSpec,
     StepResult,
     build_plan,
     build_plan_artifact,
@@ -232,6 +233,53 @@ def test_unsupported_route_cannot_also_be_executed(pr_plan) -> None:
     broken = replace(pr_plan, coverage=coverage)
     decision = decide(broken, _results(pr_plan))
     assert "coverage-routes" in {failure["code"] for failure in decision.failures}
+
+
+def test_same_pytest_file_on_distinct_targets_is_allowed(pr_plan) -> None:
+    source_job = next(
+        job for job in pr_plan.jobs
+        if job.id == "pytest-core-npu-npu-default-default"
+    )
+    source_step = source_job.steps[0]
+    assert isinstance(source_step.spec, PytestSpec)
+
+    def target_job(target: str, suffix: str):
+        runtime = replace(
+            source_job.runtime,
+            target=target,
+            image=replace(source_job.runtime.image, name=f"{target}-image"),
+        )
+        return replace(
+            source_job,
+            id=f"{source_job.id}-{suffix}",
+            runtime=runtime,
+            steps=(replace(source_step, id=f"{source_job.id}-{suffix}/run"),),
+        )
+
+    jobs = (
+        target_job("npu-a3", "a3"),
+        target_job("npu-a5", "a5"),
+    )
+    files = len(source_step.spec.files)
+    plan = build_plan(
+        scope=pr_plan.scope,
+        source=pr_plan.source,
+        inputs=pr_plan.inputs,
+        coverage={
+            "pytest": {
+                "core": {"mode": "all", "files": files, "routes": files * 2},
+                "model": {"mode": "none", "files": 0, "routes": 0},
+                "adapter": {"mode": "none", "files": 0, "routes": 0},
+            },
+            "integration": {"base_suite": {"mode": "none", "cases": []}},
+            "unsupported_routes": [],
+            "jobs": 2,
+        },
+        jobs=jobs,
+    )
+    decision = decide(plan, _results(plan))
+    assert decision.status == "passed"
+    assert "duplicate-route" not in {failure["code"] for failure in decision.failures}
 
 
 def test_failed_planner_artifact_fails(pr_plan) -> None:

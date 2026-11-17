@@ -14,7 +14,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Union, get_args, get_origin, get_type_hints
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 JOB_RESULT_FILENAME = "job-result.json"
 SUITES = ("core", "model", "adapter")
 JOB_KINDS = ("pytest", "integration")
@@ -70,6 +70,7 @@ class VenvSpec(Contract):
 @dataclass(frozen=True)
 class Runtime(Contract):
     device: str
+    target: str
     ranks: int
     lane: str
     image: ImageRef
@@ -108,7 +109,7 @@ class Step(Contract):
     id: str
     kind: str
     ranks: int
-    timeout_seconds: int
+    timeout_minutes: int
     spec: PytestSpec | IntegrationSpec
 
 
@@ -432,6 +433,9 @@ def _validate(value: Any, path: str) -> None:
     if isinstance(value, Runtime):
         if value.device not in DEVICES:
             _fail(f"{path}.device", f"has unknown device {value.device!r}")
+        for name in ("target", "lane"):
+            if not getattr(value, name):
+                _fail(f"{path}.{name}", "must not be empty")
         if value.ranks < 1:
             _fail(f"{path}.ranks", "must be >= 1")
     if isinstance(value, PytestSpec) and value.suite not in SUITES:
@@ -443,8 +447,8 @@ def _validate(value: Any, path: str) -> None:
         if not value.runner.script:
             _fail(f"{path}.runner.script", "must not be empty")
     if isinstance(value, Step):
-        if value.ranks < 1 or value.timeout_seconds < 1:
-            _fail(path, "ranks and timeout_seconds must be >= 1")
+        if value.ranks < 1 or value.timeout_minutes < 1:
+            _fail(path, "ranks and timeout_minutes must be >= 1")
         if (value.kind == "pytest") != isinstance(value.spec, PytestSpec):
             _fail(path, "kind does not match spec")
     if isinstance(value, Job):

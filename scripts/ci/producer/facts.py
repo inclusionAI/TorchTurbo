@@ -53,6 +53,7 @@ class IntegrationFact:
     case_id: str
     framework: str
     platform: str
+    targets: tuple[str, ...]
     ranks: int
     compare: bool
     update_golden: bool
@@ -229,6 +230,8 @@ def _integration_facts(
             case_id = item.get("case_id")
             framework = item.get("framework")
             platform = item.get("platform")
+            target = item.get("target")
+            targets_value = item.get("targets")
             ranks = item.get("ranks")
             compare = item.get("compare")
             update_golden = item.get("update_golden")
@@ -252,6 +255,52 @@ def _integration_facts(
             if not isinstance(platform, str) or platform not in DEVICES:
                 issues.append(_issue(f"{where}.platform", "unknown platform", "integration-manifest"))
                 platform = ""
+            if target is not None and targets_value is not None:
+                issues.append(_issue(
+                    f"{where}.targets",
+                    "declare target or targets, not both",
+                    "integration-manifest",
+                ))
+            if target is not None and (not isinstance(target, str) or not target):
+                issues.append(_issue(
+                    f"{where}.target",
+                    "target must be a non-empty string",
+                    "integration-manifest",
+                ))
+            if targets_value is not None and (
+                not isinstance(targets_value, list)
+                or not all(isinstance(value, str) and value for value in targets_value)
+            ):
+                issues.append(_issue(
+                    f"{where}.targets",
+                    "targets must be a list of non-empty strings",
+                    "integration-manifest",
+                ))
+                targets_value = []
+            targets = (
+                (target,) if isinstance(target, str) and target
+                else tuple(targets_value or ())
+            )
+            if len(set(targets)) != len(targets):
+                issues.append(_issue(
+                    f"{where}.targets",
+                    "contains duplicates",
+                    "integration-manifest",
+                ))
+            for target_name in targets:
+                configured = config.targets.get(target_name)
+                if configured is None:
+                    issues.append(_issue(
+                        f"{where}.targets",
+                        f"unknown target {target_name!r}",
+                        "integration-manifest",
+                    ))
+                elif platform and configured.device != platform:
+                    issues.append(_issue(
+                        f"{where}.targets",
+                        f"target {target_name!r} is for {configured.device}, not {platform}",
+                        "integration-manifest",
+                    ))
             if not isinstance(ranks, int) or isinstance(ranks, bool) or ranks < 1:
                 issues.append(_issue(f"{where}.ranks", "ranks must be an integer >= 1", "integration-manifest"))
                 ranks = 1
@@ -290,6 +339,7 @@ def _integration_facts(
                 case_id=case_id,
                 framework=framework,
                 platform=platform,
+                targets=targets,
                 ranks=ranks,
                 compare=compare,
                 update_golden=update_golden,

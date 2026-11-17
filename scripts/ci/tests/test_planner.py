@@ -15,7 +15,13 @@ from scripts.ci.contracts.artifacts import (
     plan_digest,
     write_json,
 )
-from scripts.ci.producer.ci_config import CiConfig, ScopeSuite
+from scripts.ci.producer.ci_config import (
+    CiConfig,
+    CiImage,
+    CiLane,
+    CiTarget,
+    ScopeSuite,
+)
 from scripts.ci.producer.facts import TestFacts
 from scripts.ci.producer.planner import (
     PlanError,
@@ -107,6 +113,58 @@ def test_nightly_scope(config: CiConfig, facts: TestFacts, nightly_plan: Plan) -
         "qwen3_5_moe/sft_2npu",
     ]
     assert validate_plan(nightly_plan, config, facts) == []
+
+
+def test_integration_case_target_routes_to_a5(
+    config: CiConfig, facts: TestFacts, source
+) -> None:
+    target = CiTarget(name="npu-a5", device="npu", hardware="a5")
+    image = CiImage(
+        name="npu-a5-default",
+        target=target.name,
+        kind="container",
+        ref="swr.example/torchturbo_npu:a5",
+        default=True,
+    )
+    lane = CiLane(
+        name="npu-a5/default-2",
+        target=target.name,
+        capacity_slots=2,
+        runner_variable="CI_NPU_A5_2_RUNNER",
+        runner="linux-aarch64-a5-800i-2",
+    )
+    pr_scope = config.scope("pull_request")
+    a5_scope = replace(
+        pr_scope,
+        targets=(*pr_scope.targets, target.name),
+        images={**pr_scope.images, target.name: image.name},
+    )
+    a5_config = replace(
+        config,
+        targets={**config.targets, target.name: target},
+        images={**config.images, image.name: image},
+        lanes={**config.lanes, lane.name: lane},
+        scopes={**config.scopes, pr_scope.name: a5_scope},
+    )
+    a5_facts = replace(
+        facts,
+        integration=tuple(
+            replace(case, targets=("npu-a5",))
+            if case.case_id == "qwen3_5_moe/sft_2npu" else case
+            for case in facts.integration
+        ),
+    )
+
+    plan = build(a5_config, a5_facts, "pull_request", source)
+    job = next(
+        item for item in plan.jobs
+        if item.id == "integration-base-suite-qwen3-5-moe-sft-2npu"
+    )
+    assert job.runtime.device == "npu"
+    assert job.runtime.target == "npu-a5"
+    assert job.runtime.image.name == "npu-a5-default"
+    assert job.runtime.lane == "npu-a5/default-2"
+    assert validate_plan(plan, a5_config, a5_facts) == []
 
 
 def test_target_integration_job(

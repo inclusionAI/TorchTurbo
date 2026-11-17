@@ -65,6 +65,7 @@ class TestCaseSpec:
     metrics: dict[str, dict[str, float]]
     ngpu: int = 2
     platform: str = "npu"
+    targets: tuple[str, ...] = ()
 
     @property
     def config_path(self) -> Path:
@@ -360,7 +361,7 @@ def case_manifest(spec: TestCaseSpec) -> dict[str, Any]:
     """Describe one case for CI without running it."""
     case = load_case(spec)
     golden_path = spec.config_path.parent / f"golden_values_{spec.platform}.json"
-    return {
+    manifest = {
         "case_id": spec.test_name,
         "description": spec.test_descr,
         "framework": spec.framework,
@@ -373,6 +374,9 @@ def case_manifest(spec: TestCaseSpec) -> dict[str, Any]:
         "config": spec.config_path.relative_to(REPO_ROOT).as_posix(),
         "golden": golden_path.relative_to(REPO_ROOT).as_posix(),
     }
+    if spec.targets:
+        manifest["targets"] = list(spec.targets)
+    return manifest
 
 
 def install_dependencies(spec: TestCaseSpec) -> None:

@@ -17,6 +17,7 @@ from .ci_config import (
     CiConfigError,
     CiImage,
     CiLane,
+    CiTarget,
     IntegrationSuite,
     Scope,
     load as load_config,
@@ -62,6 +63,7 @@ class PlanError(ValueError):
 class _PytestGroup:
     suite: str
     device: str
+    target: CiTarget
     image: CiImage
     venv_name: str
     entries: list[PytestFact] = field(default_factory=list)
@@ -100,6 +102,7 @@ def source_for(
 def _runtime(
     config: CiConfig,
     device: str,
+    target: str,
     ranks: int,
     image: CiImage,
     venv_name: str,
@@ -107,6 +110,7 @@ def _runtime(
 ) -> Runtime:
     return Runtime(
         device=device,
+        target=target,
         ranks=ranks,
         lane=lane.name,
         image=image.as_ref(),
@@ -144,49 +148,84 @@ def _build_pytest_jobs(
             continue
         override = config.pytest.overrides.get(fact.path)
         image_name = override.image if override is not None else None
-        route_count = 0
+        required_targets = override.targets if override is not None else ()
+        if image_name in config.images and not required_targets:
+            required_targets = (config.images[image_name].target,)
+        invalid_targets = [
+            name for name in required_targets
+            if config.targets[name].device not in fact.devices
+        ]
+        if invalid_targets:
+            issues.append(_issue(
+                fact.path,
+                f"target override {invalid_targets[0]!r} has no matching test device",
+                "target-device",
+            ))
+            continue
         for device in fact.devices:
             ranks = fact.ranks_by_device.get(device, 1)
             if not config.device_is_configured(device):
                 unsupported.add((fact.path, device))
                 continue
+            required_for_device = tuple(
+                name for name in required_targets
+                if config.targets[name].device == device
+            )
+            if required_targets and not required_for_device:
+                continue
             try:
-                image = config.image_for(device, image_name)
-                lane = config.lane_for(device, image.name, ranks)
+                targets = config.targets_for(
+                    device,
+                    scope.targets,
+                    required_for_device,
+                )
             except CiConfigError as exc:
                 issues.extend(exc.issues)
                 continue
-            route_count += 1
-            selected_routes[fact.suite].add((fact.path, device))
-            key = (fact.suite, device, image.name, venv_name)
-            group = groups.setdefault(
-                key,
-                _PytestGroup(fact.suite, device, image, venv_name),
-            )
-            group.entries.append(fact)
-            group.max_ranks = max(group.max_ranks, ranks)
-        if route_count == 0 and not any(
-            not config.device_is_configured(device) for device in fact.devices
-        ):
-            issues.append(_issue(
-                fact.path,
-                "selected test has no executable route",
-                "missing-route",
-            ))
+            if not targets:
+                continue
+            for target in targets:
+                try:
+                    image = config.resolve_image(
+                        target,
+                        explicit=image_name,
+                        scope_images=scope.images,
+                        workload_images=config.pytest.images,
+                    )
+                    config.lane_for(target, ranks)
+                except CiConfigError as exc:
+                    issues.extend(exc.issues)
+                    continue
+                key = (fact.suite, target.name, image.name, venv_name)
+                group = groups.setdefault(
+                    key,
+                    _PytestGroup(
+                        suite=fact.suite,
+                        device=device,
+                        target=target,
+                        image=image,
+                        venv_name=venv_name,
+                    ),
+                )
+                group.entries.append(fact)
+                group.max_ranks = max(group.max_ranks, ranks)
+                selected_routes[fact.suite].add((fact.path, target.name))
 
     jobs: list[Job] = []
     for key in sorted(groups):
         group = groups[key]
         job_timeout = config.pytest.job_timeout_minutes.get(group.device)
-        step_timeout = config.pytest.step_timeout_seconds.get(group.device)
+        step_timeout = config.pytest.step_timeout_minutes.get(group.device)
         if job_timeout is None or step_timeout is None:
             issues.append(_issue(
                 f"workloads.pytest.defaults.{group.device}",
                 "missing pytest timeout for selected device",
             ))
             continue
-        job_id = _slug(f"pytest-{'-'.join(key)}")
-        lane = config.lane_for(group.device, group.image.name, group.max_ranks)
+        job_id = _slug(
+            f"pytest-{group.suite}-{group.device}-{group.image.name}-{group.venv_name}"
+        )
+        lane = config.lane_for(group.target, group.max_ranks)
         steps_by_key: dict[tuple[str, str], list[PytestFact]] = {}
         for entry in group.entries:
             steps_by_key.setdefault(
@@ -201,7 +240,7 @@ def _build_pytest_jobs(
                 ranks=max(
                     entry.ranks_by_device.get(group.device, 1) for entry in entries
                 ),
-                timeout_seconds=step_timeout,
+                timeout_minutes=step_timeout,
                 spec=PytestSpec(
                     suite=group.suite,
                     frameworks=tuple(sorted({
@@ -226,6 +265,7 @@ def _build_pytest_jobs(
             runtime=_runtime(
                 config,
                 group.device,
+                group.target.name,
                 group.max_ranks,
                 group.image,
                 group.venv_name,
@@ -335,15 +375,28 @@ def _build_integration_jobs(
                     "missing-integration-resource",
                 ))
                 continue
+            override = suite.overrides.get(case.case_id)
+            explicit_image = override.image if override is not None else None
+            required_targets = (
+                override.targets if override is not None and override.targets
+                else case.targets
+            )
+            if explicit_image in config.images and not required_targets:
+                required_targets = (config.images[explicit_image].target,)
             try:
-                image = config.image_for(case.platform)
-                lane = config.lane_for(case.platform, image.name, case.ranks)
+                targets = config.targets_for(
+                    case.platform,
+                    scope.targets,
+                    required_targets,
+                )
             except CiConfigError as exc:
                 issues.extend(exc.issues)
                 continue
+            if not targets:
+                continue
             try:
-                job_timeout = suite.timeout_minutes(case.platform, case.case_id)
-                step_timeout = suite.timeout_seconds(case.platform, case.case_id)
+                job_timeout = suite.job_timeout_minutes_for(case.platform, case.case_id)
+                step_timeout = suite.step_timeout_minutes_for(case.platform, case.case_id)
             except KeyError:
                 issues.append(_issue(
                     f"workloads.integration.suites.{suite_name}.defaults.{case.platform}",
@@ -351,28 +404,45 @@ def _build_integration_jobs(
                     "missing-timeout",
                 ))
                 continue
-            job_id = _slug(f"integration-{suite_name}-{case.case_id}")
-            jobs.append(Job(
-                id=job_id,
-                kind="integration",
-                allowed_skip_reasons=scope.allow_skip.get(case.platform, ()),
-                timeout_minutes=job_timeout,
-                runtime=_runtime(
-                    config,
-                    case.platform,
-                    case.ranks,
-                    image,
-                    venv_name,
-                    lane,
-                ),
-                steps=(Step(
-                    id=f"{job_id}/run",
+            for target in targets:
+                try:
+                    image = config.resolve_image(
+                        target,
+                        explicit=explicit_image,
+                        scope_images=scope.images,
+                        workload_images=suite.images,
+                    )
+                    lane = config.lane_for(target, case.ranks)
+                except CiConfigError as exc:
+                    issues.extend(exc.issues)
+                    continue
+                base_id = _slug(f"integration-{suite_name}-{case.case_id}")
+                job_id = (
+                    _slug(f"{base_id}-{target.name}")
+                    if len(targets) > 1 else base_id
+                )
+                jobs.append(Job(
+                    id=job_id,
                     kind="integration",
-                    ranks=case.ranks,
-                    timeout_seconds=step_timeout,
-                    spec=_integration_spec(suite, case),
-                ),),
-            ))
+                    allowed_skip_reasons=scope.allow_skip.get(case.platform, ()),
+                    timeout_minutes=job_timeout,
+                    runtime=_runtime(
+                        config,
+                        case.platform,
+                        target.name,
+                        case.ranks,
+                        image,
+                        venv_name,
+                        lane,
+                    ),
+                    steps=(Step(
+                        id=f"{job_id}/run",
+                        kind="integration",
+                        ranks=case.ranks,
+                        timeout_minutes=step_timeout,
+                        spec=_integration_spec(suite, case),
+                    ),),
+                ))
     return jobs, coverage
 
 

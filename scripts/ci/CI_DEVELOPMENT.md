@@ -1,4 +1,6 @@
-# CI 架构与本地校验
+# CI 开发与本地校验
+
+> 测试范围、PR/nightly 策略和架构设计见 `scripts/ci/CI_DESIGN.md`。
 
 CI 只有一条数据流：
 
@@ -20,10 +22,10 @@ Executor 只消费 Plan 中的一个 Job；Gate 只消费 Plan 与 JobResult。�
 ```text
 scripts/ci/
   config/
-    ci.yml            唯一 CI 配置：resources / workloads / scopes
+    ci.yml            唯一 CI 配置：targets/images/lanes、workloads、scopes
     envs/             Python 依赖清单
   contracts/
-    artifacts.py      schema v2 artifact 编解码与校验
+    artifacts.py      schema v3 artifact 编解码与校验
   producer/
     ci_config.py      CiConfig loader
     facts.py          pytest 扫描 + integration suite manifest
@@ -49,12 +51,13 @@ scripts/ci/
 | 阶段 | 输入 | 输出 | 不做什么 |
 |---|---|---|---|
 | lint | 源码、workflow、ci.yml、tests | annotations | 不选择用例 |
-| Planner | CiConfig、TestFacts、scope、change scope、镜像覆盖 | `plan.json` | 不安装环境、不执行测试 |
+| Planner | CiConfig、TestFacts、scope、change scope | `plan.json` | 不安装环境、不执行测试；不把 image 选择推给 workflow |
 | Executor | PlanArtifact + 一个 `job_id` | `job-result.json` | 不读取 CiConfig/TestFacts |
 | Gate | PlanArtifact + 全部 JobResult | `decision.json` | 不重新选测 |
 
 Planner 按 CPU/NPU/GPU 输出 matrix。matrix 项只包含 `job_id`、`image_ref`、
 `runner_variable`、`runner`、`timeout_minutes`，完整 Job 只存在于 PlanArtifact。
+Planner 和 `ci.yml` 中 Job/Step 超时统一使用分钟，Executor 在启动子进程时转换为秒。
 
 Executor 执行前先写 `infra_error/executor-incomplete` 占位结果，结束时原子覆盖。即使
 runner 被外部杀死，Gate 仍能区分“缺结果”和“执行未完成”。
@@ -111,16 +114,21 @@ integration 结果上传前会删除 `training/`、`initial_checkpoint/`、`tens
 
 ## 扩展点
 
-- 新增镜像或 lane：改 `resources.images` / `resources.lanes`。Planner 选择容量最小且满足
-  ranks 的 lane，不在 consumer 写平台分支。
+- 新增硬件代际：增加 `resources.targets`，并提供该 target 的默认 image 和 lane。
+- 新增镜像版本：增加 `resources.images`；需要按 scope、workload 或单个 test/case
+  覆盖时，分别使用 scope `images[target]`、workload `images[target]` 或 override
+  `image`。选择顺序是“显式 > scope > workload > target 默认”。
+- 新增 lane：改 `resources.lanes`，lane 只绑定 target 和 runner 容量，不绑定 image。
+  Planner 选择容量最小且满足 ranks 的 lane，不在 consumer 写平台分支。
 - 新增 venv：改 `resources.venvs`，可用 `extends` 复用依赖链；依赖文件内容计入 digest。
 - 新增 pytest：补 device marker 和依赖事实即可。必要时增加 `model_venvs`、
   `framework_venvs`、`combo_venvs` 或文件 override。
 - 新增 adapter：补 framework venv 映射和测试事实。PR 是否运行由 `scopes` 决定。
 - 新增 integration case：在 suite 中增加 case；PR 使用 `explicit`，不会自动纳入。
 - 新增 integration suite：在 `workloads.integration.suites` 增加 runner 和默认超时。
-- 新增 platform：增加 image、lane 和 workload timeout；integration case 的 platform 来自
-  manifest，不在配置中重复。
+- 新增 platform：增加 target、默认 image、lane 和 workload timeout。integration case
+  的 platform 来自 manifest；需要限定硬件代际时，在 manifest 增加 `target` 或
+  `targets`，pytest 则在 path override 中增加 `targets`。
 
 资源完全不存在于 CI 能力范围时，Planner 把路由写入 `coverage.unsupported_routes`；
 资源存在但无法满足 lane/ranks 时 Planner 直接失败，不会静默丢路由。

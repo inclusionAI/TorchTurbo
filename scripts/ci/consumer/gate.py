@@ -54,11 +54,12 @@ def _plan_failures(plan: Plan) -> list[dict[str, Any]]:
         failures.append(_failure("plan-schema", f"unsupported schema {plan.schema_version}"))
     job_ids: set[str] = set()
     step_ids: set[str] = set()
-    test_routes: set[tuple[str, str]] = set()
+    test_routes: set[tuple[str, str, str]] = set()
+    executed_device_routes: set[tuple[str, str]] = set()
     pytest_files = {"core": set(), "model": set(), "adapter": set()}
     pytest_routes: Counter[str] = Counter()
     integration_cases: dict[str, set[str]] = {}
-    integration_routes: set[tuple[str, str]] = set()
+    integration_routes: set[tuple[str, str, str]] = set()
     for job in plan.jobs:
         if job.id in job_ids:
             failures.append(_failure("duplicate-job", "duplicate job id", job_id=job.id))
@@ -80,10 +81,11 @@ def _plan_failures(plan: Plan) -> list[dict[str, Any]]:
                     failures.append(_failure("pytest-suite", "unknown pytest suite", step_id=step.id))
                     continue
                 for path in step.spec.files:
-                    route = (path, job.runtime.device)
+                    route = (path, job.runtime.target, job.runtime.device)
                     if route in test_routes:
                         failures.append(_failure("duplicate-route", f"duplicate route {route}", step_id=step.id))
                     test_routes.add(route)
+                    executed_device_routes.add((path, job.runtime.device))
                     pytest_files[step.spec.suite].add(path)
                     pytest_routes[step.spec.suite] += 1
             elif isinstance(step.spec, IntegrationSpec):
@@ -94,7 +96,11 @@ def _plan_failures(plan: Plan) -> list[dict[str, Any]]:
                         job_id=job.id,
                         step_id=step.id,
                     ))
-                route = (step.spec.suite, step.spec.case_id)
+                route = (
+                    step.spec.suite,
+                    step.spec.case_id,
+                    job.runtime.target,
+                )
                 if route in integration_routes:
                     failures.append(_failure(
                         "duplicate-integration-case",
@@ -167,7 +173,7 @@ def _plan_failures(plan: Plan) -> list[dict[str, Any]]:
             route = (path, device)
             if route in seen_unsupported:
                 failures.append(_failure("coverage-routes", f"duplicate unsupported route {route}"))
-            if route in test_routes:
+            if route in executed_device_routes:
                 failures.append(_failure("coverage-routes", f"route is both executed and unsupported: {route}"))
             seen_unsupported.add(route)
     return failures

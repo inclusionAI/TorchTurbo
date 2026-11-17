@@ -337,13 +337,15 @@ def _step_failure(
     *,
     exit_code: int,
     timed_out: bool,
-    limit: int,
     deadline: float,
 ) -> dict[str, Any]:
     if timed_out and time.monotonic() >= deadline:
         return _job_timeout_failure(job, step.id)
     code = "step-timeout" if timed_out else "step-failed"
-    message = f"step timed out after {limit}s" if timed_out else f"step exited with code {exit_code}"
+    message = (
+        f"step timed out after {step.timeout_minutes} minutes"
+        if timed_out else f"step exited with code {exit_code}"
+    )
     return {"code": code, "step_id": step.id, "message": message}
 
 
@@ -365,7 +367,7 @@ def _execute_steps(
         case_ids = (
             (step.spec.case_id,) if isinstance(step.spec, IntegrationSpec) else ()
         )
-        limit, _ = _timeout_budget(deadline, step.timeout_seconds)
+        limit, _ = _timeout_budget(deadline, step.timeout_minutes * 60)
         if limit == 0:
             results.append(_step_result(step, "failed", 124, case_ids))
             return "failed", _job_timeout_failure(job, step.id), results, junit_paths, executed_files
@@ -402,7 +404,7 @@ def _execute_steps(
             status = "failed"
             failure = _step_failure(
                 job, step, exit_code=exit_code, timed_out=timed_out,
-                limit=limit, deadline=deadline,
+                deadline=deadline,
             )
         if status != "passed":
             elapsed = int(time.monotonic() - step_started)
