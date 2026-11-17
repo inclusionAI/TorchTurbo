@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from functools import lru_cache
 from itertools import pairwise
 from typing import Any
 
@@ -15,27 +14,8 @@ from ...packed_params import PackedParams
 from ...registry import register_op
 
 
+_KDA_CHUNK_SIZE = 64
 _MAX_KDA_SEQUENCES = 1024
-
-
-@lru_cache(maxsize=1)
-def _prepare_kda_batches(cu_host: tuple[int, ...], max_sequences: int):
-    """Cache token ranges and rebased host metadata without device transfers."""
-    num_sequences = len(cu_host) - 1
-    batches = []
-    for sequence_start in range(0, num_sequences, max_sequences):
-        sequence_end = min(sequence_start + max_sequences, num_sequences)
-        token_start, token_end = cu_host[sequence_start], cu_host[sequence_end]
-        boundaries = [
-            offset - token_start
-            for offset in cu_host[sequence_start:sequence_end + 1]
-        ]
-        indices = []
-        for sequence_index, (left, right) in enumerate(pairwise(boundaries)):
-            for chunk_index in range((right - left + 63) // 64):
-                indices.extend((sequence_index, chunk_index))
-        batches.append((token_start, token_end, (boundaries, indices)))
-    return batches
 
 
 class ChunkKDAFunction(torch.autograd.Function):
@@ -85,7 +65,7 @@ class ChunkKDAFunction(torch.autograd.Function):
             g,
             beta,
             scale,
-            64,
+            _KDA_CHUNK_SIZE,
             layout="NTD" if packed_metadata is not None else "BNSD",
             output_final_state=output_final_state,
             cu_seqlens=cu_seqlens,
@@ -157,7 +137,7 @@ class ChunkKDAFunction(torch.autograd.Function):
             dt_bias=bias,
             cu_seqlens=ctx.cu_seqlens,
             chunk_indices=ctx.chunk_indices,
-            chunk_size=64,
+            chunk_size=_KDA_CHUNK_SIZE,
             safe_gate=True,
             lower_bound=ctx.lower_bound,
             use_gate_in_kernel=ctx.use_gate_in_kernel,
@@ -255,21 +235,35 @@ def ascendc_chunk_kda(
     if packed_params is None:
         return run_chunk(inputs, None)
     cu_host = packed_params.cu_seqlens_list
-    if len(cu_host) - 1 <= _MAX_KDA_SEQUENCES:
+    num_sequences = len(cu_host) - 1
+    if num_sequences <= _MAX_KDA_SEQUENCES:
         metadata = (cu_host, packed_params.chunk_indices_list["64"])
         output, final_state = run_chunk(inputs, metadata)
         return output.unsqueeze(0), final_state
 
     outputs, final_states = [], []
-    batches = _prepare_kda_batches(tuple(cu_host), _MAX_KDA_SEQUENCES)
-    for token_start, token_end, metadata in batches:
+    for sequence_start in range(0, num_sequences, _MAX_KDA_SEQUENCES):
+        sequence_end = min(sequence_start + _MAX_KDA_SEQUENCES, num_sequences)
+        token_start = cu_host[sequence_start]
+        token_end = cu_host[sequence_end]
+        boundaries = [
+            offset - token_start
+            for offset in cu_host[sequence_start:sequence_end + 1]
+        ]
+        chunk_indices: list[int] = []
+        for sequence_index, (left, right) in enumerate(pairwise(boundaries)):
+            chunk_count = (right - left + _KDA_CHUNK_SIZE - 1) // _KDA_CHUNK_SIZE
+            for chunk_index in range(chunk_count):
+                chunk_indices.extend((sequence_index, chunk_index))
         group_inputs = [tensor[:, token_start:token_end] for tensor in inputs]
-        output, final_state = run_chunk(group_inputs, metadata)
+        output, final_state = run_chunk(group_inputs, (boundaries, chunk_indices))
         outputs.append(output)
         if output_final_state:
             final_states.append(final_state)
+
     output = torch.cat(outputs, dim=0).unsqueeze(0)
-    return output, torch.cat(final_states, dim=0) if output_final_state else None
+    final_state = torch.cat(final_states, dim=0) if output_final_state else None
+    return output, final_state
 
 
 @register_op(

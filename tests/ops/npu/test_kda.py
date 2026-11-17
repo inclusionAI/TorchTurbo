@@ -48,15 +48,12 @@ def test_large_varlen_kda_matches_smaller_groups(monkeypatch, num_sequences, out
             result.append(final_state.detach())
         return result
 
-    try:
-        baseline = run(127)
-        actual = run(1024)
-        torch.npu.synchronize()
-        names = ("output", "dq", "dk", "dv", "dg", "dbeta", "dA_log", "dt_bias", "final_state")
-        for name, expected, result in zip(names, baseline, actual):
-            torch.testing.assert_close(
-                result.float(), expected.float(), rtol=2e-2, atol=2e-2,
-                msg=lambda message, name=name: f"{name}: {message}",
-            )
-    finally:
-        kda._prepare_kda_batches.cache_clear()
+    baseline = run(127)
+    actual = run(1024)
+    torch.npu.synchronize()
+    names = ("output", "dq", "dk", "dv", "dg", "dbeta", "dA_log", "dt_bias", "final_state")
+    for name, expected, result in zip(names, baseline, actual):
+        torch.testing.assert_close(
+            result.float(), expected.float(), rtol=2e-2, atol=2e-2,
+            msg=lambda message, name=name: f"{name}: {message}",
+        )

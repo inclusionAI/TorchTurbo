@@ -15,13 +15,6 @@ from torchturbo.ops.providers.npu import kda
 from torchturbo.runtime.npu import NpuRuntime
 
 
-@pytest.fixture(autouse=True)
-def clear_metadata_cache():
-    kda._prepare_kda_batches.cache_clear()
-    yield
-    kda._prepare_kda_batches.cache_clear()
-
-
 def _inputs(lengths, batch=1):
     generator = torch.Generator().manual_seed(42)
     num_tokens = sum(lengths)
@@ -146,23 +139,6 @@ def test_batched_outputs_and_gradients_match_single_call(
     assert [metadata[0] for metadata in calls[1:4]] == [
         [0, 1, 64, 128, 193], [0, 0, 2, 2, 129], [0, 1],
     ]
-
-
-def test_batch_metadata_cache_reuses_and_refreshes_all_groups():
-    boundaries = [0, 0, 65, 65, 128, 129]
-    before = kda._prepare_kda_batches(tuple(boundaries), 2)
-    assert before == [
-        (0, 65, ([0, 0, 65], [1, 0, 1, 1])),
-        (65, 128, ([0, 0, 63], [1, 0])),
-        (128, 129, ([0, 1], [0, 0])),
-    ]
-    assert kda._prepare_kda_batches(tuple(boundaries), 2) is before
-    boundaries[2] = 64
-    after = kda._prepare_kda_batches(tuple(boundaries), 2)
-    assert after is not before
-    assert after[0] == (0, 64, ([0, 0, 64], [1, 0]))
-    assert after[1] == (64, 128, ([0, 1, 64], [0, 0, 1, 0]))
-    assert kda._prepare_kda_batches(tuple(boundaries), 2) is after
 
 
 @pytest.mark.parametrize("max_sequences", [2, 1024])
