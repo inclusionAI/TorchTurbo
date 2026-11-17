@@ -14,7 +14,6 @@ from ...packed_params import PackedParams
 from ...registry import register_op
 
 
-_KDA_CHUNK_SIZE = 64
 _MAX_KDA_SEQUENCES = 1024
 
 
@@ -293,7 +292,7 @@ def ascendc_chunk_kda(
         if packed_params is not None:
             metadata = (
                 packed_params.cu_seqlens_list,
-                packed_params.chunk_indices_list[str(_KDA_CHUNK_SIZE)],
+                packed_params.chunk_indices_list["64"],
             )
         return run_chunk(qkv[0], qkv[1], qkv[2], g, beta, metadata)
 
