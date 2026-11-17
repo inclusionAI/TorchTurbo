@@ -78,3 +78,28 @@ class TestActivate:
 
         with pytest.raises(ValueError, match="No adapter registered"):
             torchturbo.activate("nonexistent_framework_xyz")
+
+    def test_activate_patches_dynamic_module_loading(self, monkeypatch):
+        import torchturbo
+        from torchturbo.utils import transformers_utils
+
+        dynamic_module_utils = pytest.importorskip("transformers.dynamic_module_utils")
+        monkeypatch.setattr(
+            dynamic_module_utils,
+            "get_class_in_module",
+            dynamic_module_utils.get_class_in_module,
+        )
+        monkeypatch.setattr(
+            transformers_utils,
+            "_patched_get_class_in_module",
+            transformers_utils._patched_get_class_in_module,
+        )
+        adapter = mock.Mock()
+        monkeypatch.setattr(torchturbo, "get_adapter", lambda name: adapter)
+
+        assert torchturbo.activate("fake") is adapter
+        assert (
+            dynamic_module_utils.get_class_in_module
+            is transformers_utils._patched_get_class_in_module
+        )
+        adapter.activate.assert_called_once_with()

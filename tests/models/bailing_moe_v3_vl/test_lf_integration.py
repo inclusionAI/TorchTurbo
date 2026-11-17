@@ -30,8 +30,11 @@ def components():
     from transformers import AutoProcessor
 
     from torchturbo.models.bailing_moe_v3_vl.lf_template import register
+    from torchturbo.utils.transformers_utils import patch_dynamic_module_loading
 
     register()
+    # Launchers install this through torchturbo.activate() before loading.
+    patch_dynamic_module_loading()
     processor = AutoProcessor.from_pretrained(
         reference, trust_remote_code=True, local_files_only=True
     )

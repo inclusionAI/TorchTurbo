@@ -18,6 +18,9 @@ def processor():
     pytest.importorskip("llamafactory")
     from transformers import AutoProcessor
 
+    from torchturbo.utils.transformers_utils import patch_dynamic_module_loading
+
+    patch_dynamic_module_loading()
     processor = AutoProcessor.from_pretrained(
         reference, trust_remote_code=True, local_files_only=True
     )

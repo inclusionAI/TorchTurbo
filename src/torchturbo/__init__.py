@@ -50,6 +50,7 @@ from .registry import (
     get_all_adapters,
     register_adapter,
 )
+from .utils.transformers_utils import patch_dynamic_module_loading
 
 
 __version__ = "0.1.0"
@@ -143,12 +144,15 @@ def activate(name: str | None = None) -> BaseAdapter | None:
       present. In a multi-framework install this refuses to guess and returns
       ``None``; name the adapter explicitly instead.
 
+    Activating an adapter also patches Transformers remote-code loading, so
+    launchers must activate before loading models or processors.
     """
     if name is not None:
         adapter = get_adapter(name)
         if adapter is None:
             raise ValueError(f"No adapter registered for {name!r}")
         logger.info_rank0("Activating adapter for %r", name)
+        patch_dynamic_module_loading()
         adapter.activate()
         return adapter
 
@@ -163,6 +167,7 @@ def activate(name: str | None = None) -> BaseAdapter | None:
         if adapter is None:
             return None
         logger.info_rank0("Auto-activating adapter for %r", framework)
+        patch_dynamic_module_loading()
         adapter.activate()
         return adapter
 
