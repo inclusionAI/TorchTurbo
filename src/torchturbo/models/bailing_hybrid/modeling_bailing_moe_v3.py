@@ -1242,6 +1242,8 @@ class BailingMoeV3PreTrainedModel(PreTrainedModel):
             module.weight.data.normal_(mean=0.0, std=std)
             if module.padding_idx is not None:
                 module.weight.data[module.padding_idx].zero_()
+        elif isinstance(module, BailingMoeV3KimiDeltaAttention):
+            nn.init.zeros_(module.dt_bias)
 
 
 BAILINGMOEV3_INPUTS_DOCSTRING = r"""

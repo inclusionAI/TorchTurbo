@@ -1,0 +1,150 @@
+{
+  "metrics": {
+    "loss": {
+      "1": 7.672069549560547,
+      "2": 7.6594648361206055,
+      "3": 7.648426055908203,
+      "4": 7.641959190368652
+    },
+    "grad_norm": {
+      "1": 4.806527614593506,
+      "2": 4.807402610778809,
+      "3": 4.80823278427124,
+      "4": 4.808872222900391
+    }
+  },
+  "case": {
+    "UPDATE_GOLDEN": true,
+    "MODEL_ARGS": {
+      "model_type": "qwen3_5_moe",
+      "image_token_id": 2007,
+      "video_token_id": 2008,
+      "vision_start_token_id": 2005,
+      "vision_end_token_id": 2006,
+      "text_config": {
+        "hidden_size": 128,
+        "num_hidden_layers": 2,
+        "layer_types": [
+          "linear_attention",
+          "full_attention"
+        ],
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "head_dim": 32,
+        "linear_num_key_heads": 4,
+        "linear_num_value_heads": 8,
+        "linear_key_head_dim": 128,
+        "linear_value_head_dim": 128,
+        "linear_conv_kernel_dim": 4,
+        "moe_intermediate_size": 64,
+        "shared_expert_intermediate_size": 64,
+        "num_experts": 8,
+        "num_experts_per_tok": 4,
+        "mtp_num_hidden_layers": 0,
+        "max_position_embeddings": 512,
+        "use_cache": false,
+        "tie_word_embeddings": false
+      },
+      "vision_config": {
+        "depth": 2,
+        "hidden_size": 64,
+        "intermediate_size": 128,
+        "num_heads": 4,
+        "patch_size": 16,
+        "spatial_merge_size": 2,
+        "temporal_patch_size": 2,
+        "out_hidden_size": 128,
+        "num_position_embeddings": 1024
+      }
+    },
+    "TRAIN_ARGS": {
+      "model": null,
+      "tokenizer": "assets/tokenizer/qwen3_5_moe",
+      "stage": "sft",
+      "do_train": true,
+      "dataset_dir": "assets/sft_test",
+      "dataset": "data",
+      "template": "qwen3_5_nothink",
+      "finetuning_type": "full",
+      "flash_attn": "fa2",
+      "max_steps": 4,
+      "per_device_train_batch_size": 1,
+      "per_device_eval_batch_size": 1,
+      "gradient_accumulation_steps": 1,
+      "eval_accumulation_steps": 1,
+      "cutoff_len": 512,
+      "neat_packing": true,
+      "preprocessing_num_workers": 1,
+      "dataloader_num_workers": 0,
+      "overwrite_cache": true,
+      "lr_scheduler_type": "cosine",
+      "learning_rate": 1.25e-05,
+      "warmup_ratio": 0.0,
+      "logging_strategy": "steps",
+      "logging_steps": 1,
+      "seed": 42,
+      "bf16": true,
+      "report_to": "tensorboard",
+      "ddp_timeout": 1800000000
+    },
+    "ENGINE_CONFIG": {
+      "backend": "fsdp2",
+      "mixed_precision": "bf16",
+      "parallel_plan": {
+        "sp_size": 1,
+        "ep_size": 1
+      },
+      "freeze_policy": {
+        "vision_tower": true,
+        "multi_modal_projector": true
+      },
+      "mtp": {
+        "enabled": false
+      }
+    },
+    "LAUNCH_ARGS": {
+      "nproc_per_node": 2,
+      "nnodes": 1,
+      "node_rank": 0,
+      "master_addr": "127.0.0.1",
+      "master_port": 29500
+    },
+    "ENV_VARS": {
+      "TOKENIZERS_PARALLELISM": "false",
+      "HF_HUB_OFFLINE": "1",
+      "HF_DATASETS_OFFLINE": "1",
+      "HCCL_CONNECT_TIMEOUT": "7200",
+      "HCCL_EXEC_TIMEOUT": "7200",
+      "HCCL_EVENT_TIMEOUT": "14500",
+      "ACL_DEVICE_SYNC_TIMEOUT": "14400",
+      "HCCL_OP_EXPANSION_MODE": "AI_CPU",
+      "ASCEND_GLOBAL_LOG_LEVEL": "3",
+      "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
+      "HCCL_ASYNC_ERROR_HANDLING": "0",
+      "HCCL_IF_BASE_PORT": "29972",
+      "GLOO_SOCKET_IFNAME": "eth0",
+      "GLOO_LOG_LEVEL": "DEBUG",
+      "MULTI_STREAM_MEMORY_REUSE": "2",
+      "VIDEO_PLACEHOLDER": "<qwen3_5_video_placeholder>",
+      "AUDIO_PLACEHOLDER": "<qwen3_5_audio_placeholder>",
+      "IMAGE_PLACEHOLDER": "<qwen3_5_image_placeholder>",
+      "WANDB_DISABLED": "True",
+      "ALLOW_EXTRA_ARGS": "True",
+      "TRANSFORMERS_VERBOSITY": "error"
+    },
+    "FRAMEWORK": "llamafactory",
+    "MODE": "train",
+    "TEST_TYPE": "regular",
+    "COMPARE": false,
+    "METRICS": {
+      "loss": {
+        "atol": 1e-05,
+        "rtol": 0.001
+      },
+      "grad_norm": {
+        "atol": 1e-05,
+        "rtol": 0.001
+      }
+    }
+  }
+}
