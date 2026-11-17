@@ -96,7 +96,8 @@ def test_cached_and_forced_loads_update_parent_binding(checkpoint):
     assert vars(parent)[name] is sys.modules[module_name]
 
     reloaded = dynamic_module_utils.get_class_in_module(
-        "Processor", Path(*module_name.split(".")).with_suffix(".py"),
+        "Processor",
+        Path(*module_name.split(".")).with_suffix(".py"),
         force_reload=True,
     )
     assert reloaded is not processor_class
