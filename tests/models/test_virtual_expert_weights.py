@@ -300,6 +300,79 @@ def test_backward_retains_runtime_after_layer_owner_is_released(cpu_dispatch):
     assert x.grad is not None and torch.isfinite(x.grad).all()
 
 
+def _check_finalize_rebuild(config, group, device):
+    from torchturbo.models.modules.moe.virtual_expert_load_balancer import VirtualExpertLoadBalancer
+
+    def make_layer():
+        layer = MoELayer(
+            config, group,
+            submodules=MoESubmodules(experts=ModuleSpec(module=GroupedMLP)),
+        ).to(device)
+        with torch.no_grad():
+            for parameter in layer.parameters():
+                parameter.fill_(0.2)
+        inputs = torch.ones(1, 2, config.hidden_size, device=device, dtype=config.params_dtype, requires_grad=True)
+        layer(inputs)[0].sum().backward()
+        return layer
+
+    layers = [make_layer(), make_layer()]
+    managers = [layer.token_dispatcher._comm_manager for layer in layers]
+    storage = managers[0].virtual_experts.storage
+    shared = managers[0]._shared_runtime
+    planner = shared.planner
+    slots = storage.slot_weights
+    assert managers[1].virtual_experts.storage is storage
+    assert managers[1]._shared_runtime is shared
+    expected_parameters = [p.detach().clone() for p in layers[0].parameters()]
+    VirtualExpertLoadBalancer.finalize()
+    VirtualExpertLoadBalancer.finalize()
+    assert storage.weight_arena is None and storage.grad_arena is None
+    assert storage.weight_handle is None and storage.grad_handle is None
+    assert all(slot.numel() == 0 for slot in slots)
+    assert planner.scratch is None and planner.gathered_counts is None
+    assert shared.planner is None
+    assert not VirtualExpertLoadBalancer.storages and not VirtualExpertLoadBalancer.runtimes
+    for parameter, expected in zip(layers[0].parameters(), expected_parameters):
+        torch.testing.assert_close(parameter, expected)
+    replacement = make_layer()
+    assert replacement.token_dispatcher._comm_manager.virtual_experts.storage is not storage
+    assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in replacement.parameters())
+    VirtualExpertLoadBalancer.finalize()
+
+
+def test_finalize_releases_shared_resources_before_rebuilding_layers(cpu_dispatch):
+    _check_finalize_rebuild(_virtual_config(), None, torch.device("cpu"))
+
+
+def test_storage_cleans_partial_allocation_on_failure(cpu_dispatch, monkeypatch):
+    from torchturbo.models.modules.moe.virtual_expert_load_balancer import (
+        _VirtualExpertConfig, _VirtualExpertStorage,
+    )
+
+    runtime = cpu_dispatch.device_runtime
+    allocate = runtime.allocate_communication_buffer
+    calls = 0
+
+    def fail_gradient_allocation(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("gradient allocation failed")
+        return allocate(*args, **kwargs)
+
+    monkeypatch.setattr(runtime, "allocate_communication_buffer", fail_gradient_allocation)
+    config = _VirtualExpertConfig(
+        None, torch.device("cpu"), 2, (torch.Size((4, 3)), torch.Size((3, 4))),
+        torch.float32, torch.float32,
+    )
+    storage = object.__new__(_VirtualExpertStorage)
+    with pytest.raises(RuntimeError, match="gradient allocation failed"):
+        storage.__init__(config)
+    assert storage.weight_arena is None and storage.grad_arena is None
+    assert storage.weight_handle is None and storage.grad_handle is None
+    assert storage.slot_weights == ()
+
+
 def test_inference_workspace_can_run_training_planner(monkeypatch, cpu_dispatch):
     monkeypatch.setattr(dist, "get_world_size", lambda group=None: 2)
 
@@ -308,7 +381,10 @@ def test_inference_workspace_can_run_training_planner(monkeypatch, cpu_dispatch)
 
     monkeypatch.setattr(dist, "all_gather_into_tensor", gather)
     with torch.inference_mode():
-        workspace = VirtualExpertPlannerWorkspace.allocate(4, 2, torch.device("cpu"))
+        workspace = VirtualExpertPlannerWorkspace(
+            num_experts=4, device=torch.device("cpu"), group=None,
+            runtime=cpu_dispatch.device_runtime,
+        )
         cpu_dispatch.plan_virtual_expert_routes(
             torch.zeros((3, 1), dtype=torch.int64), 4, None, workspace=workspace,
         )

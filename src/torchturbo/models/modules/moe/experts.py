@@ -42,7 +42,14 @@ class _VirtualExpertLinear(torch.autograd.Function):
         ctx.save_for_backward(hidden, weight)
         ctx.counts, ctx.weight_grads, ctx.fc_layer = counts, weight_grads, fc_layer
         if hidden.shape[0] == 0:
-            return hidden.new_empty((0, weight.shape[-1]))
+            # Match GEMM autocast so an empty partition cannot promote the other one.
+            dtype = hidden.dtype
+            if (
+                torch.is_autocast_enabled(hidden.device.type)
+                and hidden.dtype != torch.float64 and weight.dtype != torch.float64
+            ):
+                dtype = torch.get_autocast_dtype(hidden.device.type)
+            return hidden.new_empty((0, weight.shape[-1]), dtype=dtype)
         return ops.grouped_matmul(hidden, weight, counts, trans_b=False)
 
     @staticmethod

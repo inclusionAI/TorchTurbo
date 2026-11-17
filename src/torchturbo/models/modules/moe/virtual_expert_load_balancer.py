@@ -67,7 +67,7 @@ def plan_virtual_expert_routes(
     if alignment != 1:
         raise ValueError("Compact virtual-expert transport requires alignment=1.")
     plan = ops.plan_virtual_expert_routes(
-        top_indices.contiguous(), workspace.local_counts.numel(), workspace.ep_group,
+        top_indices.contiguous(), workspace.gathered_counts.shape[1], workspace.ep_group,
         workspace=workspace, async_finish=True,
     )
     return VirtualExpertPlan(
@@ -80,9 +80,12 @@ class _VirtualExpertRuntime:
     """Planner scratch and communication streams shared by compatible layers."""
 
     def __init__(
-        self, runtime: DeviceRuntime, num_experts: int, ep_size: int, device: torch.device,
+        self, runtime: DeviceRuntime, num_experts: int, device: torch.device,
+        group: dist.ProcessGroup | None,
     ) -> None:
-        self.planner = VirtualExpertPlannerWorkspace.allocate(num_experts, ep_size, device)
+        self.planner = VirtualExpertPlannerWorkspace(
+            num_experts=num_experts, device=device, group=group, runtime=runtime,
+        )
         self.planner_stream: object | None = None
         self.weight_streams: tuple[object, object] | None = None
         self.grad_stream: object | None = None
@@ -90,6 +93,12 @@ class _VirtualExpertRuntime:
             self.planner_stream = runtime.new_stream()
             self.weight_streams = (runtime.new_stream(), runtime.new_stream())
             self.grad_stream = runtime.new_stream()
+
+    def destroy(self) -> None:
+        """Release planner resources before the process group is destroyed."""
+        if self.planner is not None:
+            self.planner.destroy()
+        self.planner = self.planner_stream = self.weight_streams = self.grad_stream = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,9 +118,20 @@ class _VirtualExpertStorage:
 
     def __init__(self, config: _VirtualExpertConfig) -> None:
         self.config = config
+        self._runtime = get_device_runtime()
+        self.weight_arena = self.grad_arena = self.weight_handle = self.grad_handle = None
+        self.slot_weights = ()
+        self.last_use: object | None = None
+        try:
+            self._allocate(config)
+        except Exception:
+            self.destroy()
+            raise
+
+    def _allocate(self, config: _VirtualExpertConfig) -> None:
         self.member_numels = tuple(prod(shape) for shape in config.member_shapes)
         sections = tuple(config.num_local_experts * size for size in self.member_numels)
-        runtime = get_device_runtime()
+        runtime = self._runtime
         with torch.inference_mode(False):
             self.weight_arena, self.weight_handle = runtime.allocate_communication_buffer(
                 sum(sections), dtype=config.dtype, device=config.device, group=config.group,
@@ -123,7 +143,21 @@ class _VirtualExpertStorage:
             section.view(config.num_local_experts, *shape)
             for section, shape in zip(self.weight_arena.split(sections), config.member_shapes)
         )
-        self.last_use: object | None = None
+
+    def destroy(self) -> None:
+        """Drop model-owned arena bindings after all graphs have finished.
+
+        The device allocator retains ownership of any process-lifetime memory.
+        """
+        if self.weight_arena is None and self.grad_arena is None:
+            return
+        self._runtime.synchronize()
+        with torch.no_grad():
+            for slot in self.slot_weights:
+                slot.set_()
+        self.slot_weights = ()
+        self.weight_arena = self.grad_arena = self.weight_handle = self.grad_handle = None
+        self.last_use = None
 
     def record_use(self) -> None:
         """Keep subsequent pushes behind all readers of the current contents."""
@@ -140,10 +174,93 @@ class _VirtualExperts:
     FSDP reshard. Plans retain each graph's replica slots and gradient results.
     """
 
-    def __init__(self, storage: _VirtualExpertStorage) -> None:
+    def __init__(self, storage: _VirtualExpertStorage, experts: GroupedMLP) -> None:
         self.storage = storage
         self.config = storage.config
+        self.experts = experts
         self.runtime_weights: tuple[tuple[torch.Tensor, torch.Tensor | None], ...] | None = None
+
+    @property
+    def source_parameters(self) -> tuple[torch.nn.Parameter, torch.nn.Parameter]:
+        """Read optimizer-owned parameters after any FSDP unshard or replacement."""
+        return self.experts.weight1, self.experts.weight2
+
+    def native_weights(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """View the current parameters using the initialized expert layout."""
+        weight1, weight2 = self.source_parameters
+        shape1, shape2 = self.config.member_shapes
+        return (
+            weight1.view(self.config.num_local_experts, *shape1),
+            weight2.view(self.config.num_local_experts, *shape2),
+        )
+
+    @staticmethod
+    def prepare_source_weights(experts: GroupedMLP | None) -> None:
+        """Unshard source weights on every EDP peer, including idle EP groups."""
+        if torch_version() >= (2, 6, 0):
+            from torch.distributed.fsdp._fully_shard import FSDPModule
+        else:
+            from torch.distributed._composable.fsdp.fully_shard import FSDPModule
+        if isinstance(experts, FSDPModule):
+            unshard = experts.unshard(async_op=True)
+            if unshard is not None:
+                unshard.wait()
+
+    def forward(
+        self,
+        forward: Callable[[torch.Tensor, torch.Tensor, torch.Tensor], tuple[torch.Tensor, None]],
+        hidden_states: torch.Tensor, tokens_per_expert: torch.Tensor, probs: torch.Tensor,
+        plan: VirtualExpertPlan, load_balancer: VirtualExpertLoadBalancer,
+    ) -> tuple[torch.Tensor, None]:
+        """Bind runtime tensors inside the expert checkpoint and FSDP boundary."""
+        storage = self.storage
+        w1, w2 = self.native_weights()
+        replica1 = replica2 = None
+        try:
+            if plan.has_global_replicas:
+                num_replicas = sum(plan.weight_context.receive_splits)
+                with torch.no_grad():
+                    replica1, replica2, _, _ = ops.virtual_expert_weight_exchange(
+                        w1, w2, None, None,
+                        plan.weight_context, prefetched=plan.slot_weights,
+                        out=storage.slot_weights, grad_buffer=storage.grad_arena,
+                        buffer_handles=(storage.weight_handle, storage.grad_handle),
+                    )
+                replica1, replica2 = replica1[:num_replicas], replica2[:num_replicas]
+                # Return parameter gradients before FSDP's post-backward reduction.
+                # Expert-only checkpoint replay must capture the same gate here.
+                hidden_states, probs = _VirtualExpertGradComplete.apply(
+                    w1, w2, hidden_states, probs, plan, load_balancer,
+                )
+            else:
+                tokens_per_expert = tokens_per_expert[:self.config.num_local_experts]
+            self.runtime_weights = ((w1, replica1), (w2, replica2))
+            self.experts.bind_virtual_experts(load_balancer)
+            return forward(hidden_states, tokens_per_expert, probs)
+        finally:
+            # Release unsharded views before FSDP's post-forward hook.
+            self.experts._runtime_weights = None
+            self.experts._runtime_weight_grads = None
+            self.experts._runtime_weight_hook = None
+            self.runtime_weights = None
+            storage.record_use()
+
+    def prepare_fc_weights(
+        self, fc_layer: int, hidden_states: torch.Tensor, probs: torch.Tensor,
+        plan: VirtualExpertPlan, load_balancer: VirtualExpertLoadBalancer,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Attach one FC's readiness gate before its native and replica GEMMs."""
+        native, replica = self.runtime_weights[fc_layer]
+        return _VirtualExpertFCReady.apply(
+            hidden_states, probs, native.detach(), replica,
+            native.requires_grad, fc_layer, plan, load_balancer,
+        )
+
+    @staticmethod
+    def hand_off_wgrads(fc_layer: int, plan: VirtualExpertPlan) -> torch.Tensor | None:
+        """Consume this execution's completed owner gradient for native autograd."""
+        result, plan.grad_results[fc_layer] = plan.grad_results[fc_layer], None
+        return result
 
 
 class _VirtualExpertHook(torch.autograd.Function):
@@ -249,7 +366,7 @@ class VirtualExpertLoadBalancer:
         config: MoEConfig,
     ) -> None:
         """Initialize virtual-expert state without initializing the transport parent."""
-        self.ep_size = dist.get_world_size(group) if group is not None else 1
+        self.ep_size = dist.get_world_size(group)
         if not (
             self.ep_size == config.expert_model_parallel_size
             and num_experts == config.num_moe_experts
@@ -294,8 +411,9 @@ class VirtualExpertLoadBalancer:
         )
         shared = self.runtimes.get(key)
         if shared is None:
-            shared = _VirtualExpertRuntime(runtime, key[3], self.ep_size, hidden_states.device)
-            shared.planner.ep_group = self.group
+            shared = _VirtualExpertRuntime(
+                runtime, key[3], hidden_states.device, self.group,
+            )
             self.runtimes[key] = shared
         self._shared_runtime = shared
         self.planner_stream = shared.planner_stream
@@ -304,20 +422,38 @@ class VirtualExpertLoadBalancer:
         if self._experts is not None:
             # FSDP may cast weights during unshard. Build the layout from the
             # actual compute weights without retaining any unsharded views.
-            self._prepare_source_weights()
-            w1, w2 = self._native_weights()
+            _VirtualExperts.prepare_source_weights(self._experts)
+            w1, w2 = self.source_parameters
             config = _VirtualExpertConfig(
                 self.group, w1.device, self.num_owned_experts,
-                (w1.shape[1:], w2.shape[1:]), w1.dtype,
+                (
+                    w1.view(self.num_owned_experts, self.config.hidden_size, -1).shape[1:],
+                    w2.view(self.num_owned_experts, -1, self.config.hidden_size).shape[1:],
+                ), w1.dtype,
                 torch.float32 if w1.dtype in (torch.float16, torch.bfloat16) else w1.dtype,
             )
             storage = self.storages.get(config)
             if storage is None:
                 storage = _VirtualExpertStorage(config)
                 self.storages[config] = storage
-            self.virtual_experts = _VirtualExperts(storage)
+            self.virtual_experts = _VirtualExperts(storage, self._experts)
             self._experts.register_forward_pre_hook(self._wait_weight_push)
         self.planner = shared.planner
+
+    @classmethod
+    def finalize(cls) -> None:
+        """Release shared model resources before the process group is destroyed.
+
+        Call after training and all live graphs have finished. Bound layers
+        must not execute again; construct new layers to initialize new resources.
+        NPU standalone arenas and SHMEM teams remain owned by the process.
+        """
+        for storage in tuple(cls.storages.values()):
+            storage.destroy()
+        for runtime in tuple(cls.runtimes.values()):
+            runtime.destroy()
+        cls.storages.clear()
+        cls.runtimes.clear()
 
     @property
     def num_runtime_experts(self) -> int:
@@ -418,12 +554,12 @@ class VirtualExpertLoadBalancer:
         """Push both FCs' weights into this pass's shared slots."""
         runtime = get_device_runtime()
         plan = self._plan
-        self._prepare_source_weights()
+        _VirtualExperts.prepare_source_weights(self._experts)
         # An unfinished device plan has no host replica count yet. Every EP
         # rank must still submit its push, including ranks with no local work.
         if self.virtual_experts is None or plan.has_global_replicas is False:
             return
-        w1, w2 = self._native_weights()
+        w1, w2 = self.virtual_experts.native_weights()
         storage = self.virtual_experts.storage
         if self.weight_streams is not None:
             plan.prefetch_done = runtime.new_event()
@@ -514,20 +650,13 @@ class VirtualExpertLoadBalancer:
             for result in plan.grad_results:
                 if result is not None:
                     runtime.record_stream(result, current)
-        results = tuple(plan.grad_results)
-        plan.grad_results[:] = [None, None]
+        grad2 = _VirtualExperts.hand_off_wgrads(1, plan)
+        grad1 = _VirtualExperts.hand_off_wgrads(0, plan)
         plan.grad_reduce_done = None
         plan.started.clear()
-        return results
+        return grad1, grad2
 
     # ---- native expert and execution adapters ------------------------------------------------
-
-    def _native_weights(self) -> tuple[torch.Tensor, torch.Tensor]:
-        weight1, weight2 = self.source_parameters
-        return (
-            weight1.view(self.num_owned_experts, self.config.hidden_size, -1),
-            weight2.view(self.num_owned_experts, -1, self.config.hidden_size),
-        )
 
     def _expert_forward(
         self,
@@ -536,69 +665,22 @@ class VirtualExpertLoadBalancer:
         tokens_per_expert: torch.Tensor,
         permuted_probs: torch.Tensor,
     ) -> tuple[torch.Tensor, None]:
-        """Prepare and bind runtime tensors inside the expert checkpoint boundary."""
-        plan = self._plan
-        virtual_experts = self.virtual_experts
-        storage = virtual_experts.storage
+        """Join the push inside the callable captured by expert-only checkpointing."""
         # Expert-only checkpoint replay invokes forward without module hooks.
         self._wait_weight_push()
-        w1, w2 = self._native_weights()
-        replica1 = replica2 = None
-        try:
-            if plan.has_global_replicas:
-                num_replicas = sum(plan.weight_context.receive_splits)
-                with torch.no_grad():
-                    replica1, replica2, _, _ = ops.virtual_expert_weight_exchange(
-                        w1, w2, None, None,
-                        plan.weight_context, prefetched=plan.slot_weights,
-                        out=storage.slot_weights,
-                        grad_buffer=storage.grad_arena,
-                        buffer_handles=(storage.weight_handle, storage.grad_handle),
-                    )
-                replica1, replica2 = replica1[:num_replicas], replica2[:num_replicas]
-                # This gate must be inside the expert FSDP input hook. Returning
-                # parameter gradients after dispatch backward would miss FSDP's
-                # post-backward reduction. Checkpoint replay captures it here.
-                permuted_local_hidden_states, permuted_probs = _VirtualExpertGradComplete.apply(
-                    w1, w2, permuted_local_hidden_states, permuted_probs, plan, self,
-                )
-            else:
-                tokens_per_expert = tokens_per_expert[:self.num_owned_experts]
-            virtual_experts.runtime_weights = ((w1, replica1), (w2, replica2))
-            self._experts.bind_virtual_experts(self)
-            return forward(permuted_local_hidden_states, tokens_per_expert, permuted_probs)
-        finally:
-            # Release unsharded native views before FSDP's post-forward hook.
-            self._experts._runtime_weights = None
-            self._experts._runtime_weight_grads = None
-            self._experts._runtime_weight_hook = None
-            virtual_experts.runtime_weights = None
-            storage.record_use()
+        return self.virtual_experts.forward(
+            forward, permuted_local_hidden_states, tokens_per_expert, permuted_probs,
+            self._plan, self,
+        )
 
     def prepare_fc_weights(
         self, fc_layer: int,
         hidden_states: torch.Tensor, probs: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Attach one FC's readiness gate before its native and replica GEMMs."""
-        native, replica = self.virtual_experts.runtime_weights[fc_layer]
-        return _VirtualExpertFCReady.apply(
-            hidden_states, probs, native.detach(), replica,
-            native.requires_grad, fc_layer, self._plan, self,
+        """Delegate runtime FC binding to the expert weight bridge."""
+        return self.virtual_experts.prepare_fc_weights(
+            fc_layer, hidden_states, probs, self._plan, self,
         )
-
-    def _prepare_source_weights(self) -> None:
-        """Make source expert weights available for the current execution stream.
-
-        FSDP preparation includes every EDP peer, including idle EP groups.
-        """
-        if torch_version() >= (2, 6, 0):
-            from torch.distributed.fsdp._fully_shard import FSDPModule
-        else:
-            from torch.distributed._composable.fsdp.fully_shard import FSDPModule
-        if isinstance(self._experts, FSDPModule):
-            unshard = self._experts.unshard(async_op=True)
-            if unshard is not None:
-                unshard.wait()
 
     def _finish_expert_backward(self, plan: VirtualExpertPlan) -> None:
         previous_plan = self._plan

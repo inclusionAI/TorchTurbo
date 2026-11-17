@@ -98,5 +98,12 @@ class TorchNpuGroupedMatmul(OpImpl):
         group_list: torch.Tensor,
         *,
         trans_b: bool = False,
-    ):
+    ) -> torch.Tensor:
+        if (
+            torch.is_autocast_enabled(x.device.type)
+            and x.dtype != torch.float64 and weight.dtype != torch.float64
+        ):
+            # Cast outside the custom Function so autograd restores input dtypes.
+            dtype = torch.get_autocast_dtype(x.device.type)
+            x, weight = x.to(dtype), weight.to(dtype)
         return _TorchNpuGroupedMatmul.apply(x, weight, group_list, trans_b)

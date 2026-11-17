@@ -8,13 +8,18 @@ import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
 
 from tests.models.test_moon_ep_distributed import _check_moon, _check_shared_moon_layers
+from tests.models.test_virtual_expert_weights import _check_finalize_rebuild
 from tests.ops.npu.test_virtual_expert_weight_exchange import weight_env
 from torchturbo.ops import OpPolicy, get_or_create_ops
 from torchturbo.runtime import is_npu_available
 import torchturbo.runtime.runtime as runtime_module
 from torchturbo.models.modules.moe.virtual_expert_load_balancer import (
-    _VirtualExpertConfig, _VirtualExpertStorage,
+    _VirtualExpertConfig, _VirtualExpertStorage, VirtualExpertLoadBalancer,
 )
+from torchturbo.models.modules.moe.experts import GroupedMLP, _VirtualExpertLinear
+from torchturbo.models.modules.moe.module import ModuleSpec
+from torchturbo.models.modules.moe.moe_config import MoEConfig
+from torchturbo.models.modules.moe.moe_layer import MoELayer, MoESubmodules
 
 pytestmark = pytest.mark.skipif(not is_npu_available(), reason="NPU is unavailable")
 
@@ -45,6 +50,7 @@ def moe_env(weight_env, monkeypatch):
         "ep_all_to_all", reject_weight_all_to_all,
     )
     yield runtime, group
+    VirtualExpertLoadBalancer.finalize()
 
 
 @pytest.fixture(scope="module")
@@ -128,6 +134,84 @@ def test_npu_storage_rejects_inconsistent_world_layout(moe_env, mismatch):
     )
     with pytest.raises(RuntimeError, match="identical buffer sizes and dtypes"):
         _VirtualExpertStorage(config)
+
+
+@pytest.mark.parametrize("inference_init", [False, True])
+def test_npu_runtime_initializes_shared_communication_before_routing(
+    moe_env, monkeypatch, inference_init,
+):
+    runtime, group = moe_env
+    config = MoEConfig(
+        hidden_size=12, moe_ffn_hidden_size=10, num_moe_experts=2 * dist.get_world_size(group),
+        expert_model_parallel_size=dist.get_world_size(group), moe_router_topk=2,
+        gated_linear_unit=True, activation_func=torch.nn.functional.silu,
+        moe_router_dtype="fp32", params_dtype=torch.bfloat16,
+        moe_token_dispatcher_type="flex", moe_virtual_expert_load_balance=True,
+    )
+    layers = [
+        MoELayer(config, group, submodules=MoESubmodules(experts=ModuleSpec(module=GroupedMLP)))
+        .to(runtime.device)
+        for _ in range(2)
+    ]
+    with torch.no_grad():
+        for layer in layers:
+            for parameter in layer.parameters():
+                parameter.normal_(std=0.1)
+    inputs = torch.randn((1, 5, 12), device=runtime.device, dtype=torch.bfloat16, requires_grad=True)
+    managers = [layer.token_dispatcher._comm_manager for layer in layers]
+    with torch.inference_mode(inference_init):
+        for manager in managers:
+            manager.wrap_layer_input(inputs)
+            assert manager.planner.histogram_handle is not None
+            assert manager.virtual_experts.storage.weight_handle is not None
+            assert manager.virtual_experts.storage.grad_handle is not None
+    assert managers[0].planner is managers[1].planner
+    assert managers[0].virtual_experts.storage is managers[1].virtual_experts.storage
+
+    def reject_late_allocation(*args, **kwargs):
+        pytest.fail("Routing and backward must reuse the communication buffers initialized at input")
+
+    monkeypatch.setattr(type(runtime), "allocate_communication_buffer", reject_late_allocation)
+    outputs = [layer(inputs)[0] for layer in layers]
+    sum(output.sum() for output in outputs).backward()
+    assert inputs.grad is not None and torch.isfinite(inputs.grad).all()
+    for layer in layers:
+        assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in layer.parameters())
+
+
+def test_npu_finalize_rebuilds_layers_with_default_world_group(moe_env):
+    runtime, group = moe_env
+    config = MoEConfig(
+        hidden_size=12, moe_ffn_hidden_size=10, num_moe_experts=2 * dist.get_world_size(group),
+        expert_model_parallel_size=dist.get_world_size(group), moe_router_topk=2,
+        gated_linear_unit=True, activation_func=torch.nn.functional.silu,
+        params_dtype=torch.bfloat16, moe_token_dispatcher_type="flex",
+        moe_virtual_expert_load_balance=True,
+    )
+    _check_finalize_rebuild(config, None, runtime.device)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("impl", ["torch_grouped_matmul", "torch_npu_grouped_matmul"])
+def test_npu_empty_linear_partition_preserves_autocast_dtype(moe_env, monkeypatch, dtype, impl):
+    runtime, _ = moe_env
+    monkeypatch.setattr(importlib.import_module("torchturbo.ops.ops"), "_OPS", None)
+    get_or_create_ops(
+        device_runtime=runtime, default_policy=OpPolicy.NATIVE,
+        overrides={"grouped_matmul": impl},
+    )
+    inputs = torch.ones((2, 4), device=runtime.device, requires_grad=True)
+    ref_inputs = inputs.detach().clone().requires_grad_()
+    weights = torch.ones((1, 4, 3), device=runtime.device)
+    with torch.autocast("npu", dtype=dtype):
+        active = _VirtualExpertLinear.apply(inputs, weights, torch.tensor([2]), [None, None], 0)
+        empty = _VirtualExpertLinear.apply(inputs[:0], weights, torch.tensor([0]), [None, None], 0)
+        output = torch.cat((active, empty))
+        expected = ref_inputs @ weights[0]
+    torch.testing.assert_close(output, expected)
+    output.sum().backward()
+    expected.sum().backward()
+    torch.testing.assert_close(inputs.grad, ref_inputs.grad)
 
 
 @pytest.mark.parametrize("boundary,reentrant", [

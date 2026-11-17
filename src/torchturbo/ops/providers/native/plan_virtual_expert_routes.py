@@ -249,7 +249,7 @@ class TorchPlanVirtualExpertRoutes(OpImpl):
 
         ep_rank = dist.get_rank(ep_group)
         route_positions, local_counts = _route_metadata(top_indices, num_experts)
-        global_counts = workspace.global_counts if workspace is not None else torch.empty(
+        global_counts = workspace.gathered_counts.view(-1) if workspace is not None else torch.empty(
             ep_size * num_experts, dtype=local_counts.dtype, device=local_counts.device,
         )
         dist.all_gather_into_tensor(global_counts, local_counts, group=ep_group)

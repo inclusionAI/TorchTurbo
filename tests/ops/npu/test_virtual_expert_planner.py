@@ -11,6 +11,7 @@ from datetime import timedelta
 import pytest
 import torch
 import torch.distributed as dist
+from torch.utils._python_dispatch import TorchDispatchMode
 
 from torchturbo.ops import OpDispatcher, OpPolicy
 from torchturbo.ops.moe import VirtualExpertPlannerWorkspace
@@ -113,7 +114,9 @@ def test_workspace_rejects_different_group_before_planner_kernels(planner_env, m
         pytest.skip("Requires a workspace backed by SHMEM")
     num_experts = 2 * ep_size
     routes = torch.zeros((7, 1), dtype=torch.int64, device=runtime.device)
-    workspace = VirtualExpertPlannerWorkspace.allocate(num_experts, ep_size, routes.device)
+    workspace = VirtualExpertPlannerWorkspace(
+        num_experts=num_experts, device=routes.device, group=group, runtime=runtime,
+    )
     dispatcher.plan_virtual_expert_routes(
         routes, num_experts, group, workspace=workspace,
         impl="npu_triton_plan_virtual_expert_routes",
@@ -124,7 +127,7 @@ def test_workspace_rejects_different_group_before_planner_kernels(planner_env, m
         pytest.fail("A workspace bound to another EP group reached planner kernels")
 
     try:
-        monkeypatch.setattr(virtual_expert_planner, "_plan_routes", reject_kernels)
+        monkeypatch.setattr(virtual_expert_planner, "launch_virtual_expert_planner", reject_kernels)
         with pytest.raises(ValueError, match="different EP group"):
             dispatcher.plan_virtual_expert_routes(
                 routes, num_experts, other_group, workspace=workspace,
@@ -149,7 +152,9 @@ def test_async_plans_keep_metadata_when_workspace_is_reused(
     ]
     with torch.inference_mode(inference_warmup):
         workspace = (
-            VirtualExpertPlannerWorkspace.allocate(num_experts, ep_size, runtime.device)
+            VirtualExpertPlannerWorkspace(
+                num_experts=num_experts, device=runtime.device, group=group, runtime=runtime,
+            )
             if managed_workspace else None
         )
         dispatcher.plan_virtual_expert_routes(
@@ -316,7 +321,7 @@ def test_device_placement_keeps_int64_boundaries(planner_env, num_local_experts)
     )
     from torchturbo.ops.providers.npu._kernels.virtual_expert_planner import _place_routes
 
-    _, group = planner_env
+    dispatcher, group = planner_env
     num_ranks = dist.get_world_size(group)
     rank = dist.get_rank(group)
     num_experts = num_ranks * num_local_experts
@@ -325,8 +330,12 @@ def test_device_placement_keeps_int64_boundaries(planner_env, num_local_experts)
     counts[:, 1::2] = 0
     counts = counts * (2**32 + 1)
     counts[0, 0] += 3
+    workspace = VirtualExpertPlannerWorkspace(
+        num_experts=num_experts, device=dispatcher.device_runtime.device,
+        group=group, runtime=dispatcher.device_runtime,
+    )
     allocations, copies, boundaries, slots, prefixes, statistics = _place_routes(
-        counts.to("npu"), rank,
+        counts.to("npu"), rank, workspace,
     )
     expected_allocations, expected_copies = plan_placement(counts)
     torch.testing.assert_close(allocations.cpu(), expected_allocations)
@@ -334,12 +343,69 @@ def test_device_placement_keeps_int64_boundaries(planner_env, num_local_experts)
     torch.testing.assert_close(boundaries.cpu(), expected_allocations.cumsum(1))
     torch.testing.assert_close(prefixes.cpu(), counts.cumsum(0) - counts)
     expected_table = build_remap_table(counts, expected_allocations, expected_copies, rank)
-    torch.testing.assert_close(slots.cpu(), expected_table[:, 1 + num_ranks:])
+    replica_slots = expected_table[:, 1 + num_ranks:] - num_local_experts
+    active = replica_slots >= 0
+    torch.testing.assert_close(slots.cpu()[active], replica_slots[active])
     sent, received = count_routes(counts, expected_allocations, expected_copies, rank)
     torch.testing.assert_close(statistics[:num_ranks].cpu(), sent)
     torch.testing.assert_close(
         statistics[num_ranks:].cpu().reshape_as(received), received,
     )
+
+
+def test_launcher_uses_workspace_topology_and_raw_replica_slots(planner_env):
+    from torchturbo.ops.providers.npu._kernels.virtual_expert_planner import launch_virtual_expert_planner
+
+    dispatcher, group = planner_env
+    size, rank = dist.get_world_size(group), dist.get_rank(group)
+    workspace = VirtualExpertPlannerWorkspace(
+        num_experts=2 * size, device=dispatcher.device_runtime.device,
+        group=group, runtime=dispatcher.device_runtime,
+    )
+    routes = torch.zeros((4, 1), dtype=torch.int64, device=workspace.scratch.device)
+    mapped, copies = launch_virtual_expert_planner(routes, workspace)
+    torch.testing.assert_close(mapped.cpu(), torch.full((4, 1), 0 if rank == 0 else 4 * rank + 2))
+    expected_copies = torch.full((size, 2), -1)
+    expected_copies[1:, 0] = 0
+    torch.testing.assert_close(copies.cpu(), expected_copies)
+    torch.testing.assert_close(workspace.field("virtual_expert_slots")[0, 1:].cpu(), torch.zeros(size - 1, dtype=torch.int64))
+    workspace.destroy()
+
+
+def test_placement_reuses_scratch_and_retains_independent_copy_tables(planner_env):
+    from torchturbo.ops.providers.npu._kernels.virtual_expert_planner import _place_routes
+
+    dispatcher, group = planner_env
+    ep_size = dist.get_world_size(group)
+    num_experts = 3 * ep_size
+    workspace = VirtualExpertPlannerWorkspace(
+        num_experts=num_experts, device=dispatcher.device_runtime.device,
+        group=group, runtime=dispatcher.device_runtime,
+    )
+    counts = torch.zeros((ep_size, num_experts), dtype=torch.int64, device="npu")
+    counts[:, 0] = 12
+    first = _place_routes(counts, dist.get_rank(group), workspace)
+    first_copies = first[1].clone()
+    allocations = []
+
+    class RecordAllocations(TorchDispatchMode):
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            result = func(*args, **(kwargs or {}))
+            if func == torch.ops.aten.empty.memory_format:
+                allocations.append(result)
+            return result
+
+    counts.zero_()
+    counts[:, -1] = 12
+    with RecordAllocations():
+        second = _place_routes(counts, dist.get_rank(group), workspace)
+    # Only the copy table belongs to the new plan; placement intermediates reuse scratch.
+    assert len(allocations) == 1 and allocations[0].data_ptr() == second[1].data_ptr()
+    for index in (0, 2, 3, 4, 5):
+        assert first[index].data_ptr() == second[index].data_ptr()
+        assert second[index].untyped_storage().data_ptr() == workspace.scratch.data_ptr()
+    assert first[1].data_ptr() != second[1].data_ptr()
+    torch.testing.assert_close(first[1], first_copies)
 
 
 def test_stable_occurrences_across_multiple_tiles_per_program(planner_env):
@@ -361,7 +427,7 @@ def test_remap_preserves_large_source_occurrence_ordinals(planner_env, source_pr
     boundaries = torch.tensor([
         [source_prefix, source_prefix + 2], [0, 0], [0, 0], [0, 0],
     ], device="npu")
-    slots = torch.tensor([[0, 2], [1, -1], [-1, 0], [-1, 1]], device="npu")
+    slots = torch.tensor([[-1, 0], [-1, -1], [-1, -1], [-1, -1]], device="npu")
     mapped = torch.empty_like(routes)
     _remap_kernel[(1,)](
         routes, histograms, prefixes, boundaries, slots, mapped,

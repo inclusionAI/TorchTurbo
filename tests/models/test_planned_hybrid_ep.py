@@ -14,6 +14,7 @@ from torchturbo.models.modules.moe.moe_config import MoEConfig
 from torchturbo.models.modules.moe.token_dispatcher import _VirtualExpertHybridEPManager
 from torchturbo.ops import OpPolicy, get_or_create_ops
 from torchturbo.runtime.cpu import CpuRuntime
+import torchturbo.runtime.runtime as runtime_module
 from tests.models.moonep_reference_cases import MEGATRON_PLANNER_CASES
 
 
@@ -36,13 +37,15 @@ def _run_planned_dispatch(rank, size, init_file, policy, mask_padding):
         timeout=timedelta(seconds=30),
     )
     try:
+        runtime = CpuRuntime()
+        runtime_module._SELECTED_RUNTIME = runtime
         overrides = {
             "plan_virtual_expert_routes": "torch_plan_virtual_expert_routes",
             "hybrid_ep_dispatch": "torch_hybrid_ep_dispatch",
             "hybrid_ep_combine": "torch_hybrid_ep_combine",
         }
         dispatcher = get_or_create_ops(
-            device_runtime=CpuRuntime(), default_policy=policy,
+            device_runtime=runtime, default_policy=policy,
             overrides=overrides if policy == OpPolicy.CUSTOM else None,
         )
         for topk in (1, 2, 4):

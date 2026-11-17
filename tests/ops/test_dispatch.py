@@ -240,10 +240,15 @@ def test_npu_planner_workspace_rejects_another_group_before_stream_use(monkeypat
     monkeypatch.setattr(NpuRuntime, "allocate_communication_buffer", allocate)
     stream = SimpleNamespace(wait_event=waited.append)
     monkeypatch.setattr(torch, "npu", SimpleNamespace(current_stream=lambda: stream), raising=False)
-    workspace = VirtualExpertPlannerWorkspace.allocate(4, 2, torch.device("cpu"))
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: 2)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda group: 0)
     group = None if default_group else object()
-    _prepare_workspace(workspace, group)
+    workspace = VirtualExpertPlannerWorkspace(
+        num_experts=4, device=torch.device("cpu"), group=group, runtime=NpuRuntime(),
+    )
     handle = workspace.histogram_handle
+    assert handle is not None
+    assert allocations == [group]
     workspace.last_use = object()
     _prepare_workspace(workspace, group)
     assert allocations == [group]

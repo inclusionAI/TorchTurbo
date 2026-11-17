@@ -89,6 +89,50 @@ def test_autocast_partitions_return_fp32_owner_gradients(
         assert plan.native_grads == plan.replica_grads == plan.grad_results == [None, None]
 
 
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("routes", [[[0], [2]], [[0], [0]], [[2], [2]]])
+@pytest.mark.parametrize("checkpointed", [False, True])
+def test_autocast_empty_partitions_preserve_swiglu_outputs_and_probability_gradients(
+    monkeypatch, cpu_dispatch, dtype, routes, checkpointed,
+):
+    config = _virtual_config()
+    config.hidden_size = config.moe_ffn_hidden_size = 1
+    config.gated_linear_unit = True
+    config.activation_func = torch.nn.functional.silu
+    experts = GroupedMLP(2, False, config)
+    with torch.no_grad():
+        for parameter in experts.parameters():
+            parameter.fill_(1)
+    reference = copy.deepcopy(experts)
+    manager = _VirtualExpertHybridEPManager(None, 2, 2, config)
+    manager.bind_experts(experts)
+    if checkpointed:
+        experts.forward = partial(checkpoint, experts.forward, use_reentrant=False)
+    copies = torch.tensor([[0, -1]])
+    plan = VirtualExpertPlan(
+        torch.tensor(routes), copies, None, build_weight_exchange_context(copies, None), True,
+    )
+    module = importlib.import_module("torchturbo.models.modules.moe.virtual_expert_load_balancer")
+    monkeypatch.setattr(module, "plan_virtual_expert_routes", lambda *args, **kwargs: plan)
+    inputs = torch.ones(2, 1, requires_grad=True)
+    ref_inputs = inputs.detach().clone().requires_grad_()
+    probabilities = torch.full((2, 1), 0.50390625, requires_grad=True)
+    ref_probabilities = probabilities.detach().clone().requires_grad_()
+    with torch.autocast("cpu", dtype=dtype):
+        tokens = manager.wrap_layer_input(inputs)
+        manager.setup_metadata(torch.zeros(2, 1, dtype=torch.int64), probabilities)
+        tokens = manager.dispatch(tokens)
+        output, _ = experts(tokens, manager.tokens_per_expert, manager.dispatched_probs)
+        output = manager.finalize_layer_output(manager.combine(output))
+        manager.release_routing_state()
+        expected, _ = reference(ref_inputs, torch.tensor([2, 0]), ref_probabilities.flatten())
+    torch.testing.assert_close(output, expected)
+    output.sum().backward()
+    expected.sum().backward()
+    torch.testing.assert_close(inputs.grad, ref_inputs.grad)
+    torch.testing.assert_close(probabilities.grad, ref_probabilities.grad)
+
+
 def test_bf16_partitions_preserve_fp32_weight_gradients(monkeypatch, cpu_dispatch):
     config = _virtual_config()
     config.hidden_size = config.moe_ffn_hidden_size = 1

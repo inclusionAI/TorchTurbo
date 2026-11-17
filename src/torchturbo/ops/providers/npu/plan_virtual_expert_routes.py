@@ -39,26 +39,20 @@ def _finish_plan(virtual_experts, copies, statistics, sorted_ids, route_order, g
 
 
 @cache
-def _standalone_workspace(num_experts, ep_size, device, group):
+def _standalone_workspace(num_experts, device, group):
+    from torchturbo.runtime.npu import NpuRuntime
+
     # SHMEM rendezvous allocations live for the process lifetime. Retain the
     # workspace for the same lifetime instead of allocating on every call.
-    return VirtualExpertPlannerWorkspace.allocate(num_experts, ep_size, device)
+    return VirtualExpertPlannerWorkspace(
+        num_experts=num_experts, device=device, group=group, runtime=NpuRuntime(),
+    )
 
 
 def _prepare_workspace(workspace, group):
     import torch_npu  # noqa: F401
-    from torchturbo.runtime.npu import NpuRuntime
 
-    if workspace.histogram_handle is None:
-        with torch.inference_mode(False):
-            workspace.global_counts, workspace.histogram_handle = (
-                NpuRuntime().allocate_communication_buffer(
-                    workspace.global_counts.numel(), dtype=torch.int64,
-                    device=workspace.global_counts.device, group=group,
-                )
-            )
-        workspace.ep_group = group
-    elif workspace.ep_group is not group:
+    if workspace.ep_group is not group:
         raise ValueError("NPU planner workspace is bound to a different EP group.")
     if workspace.last_use is not None:
         torch.npu.current_stream().wait_event(workspace.last_use)
@@ -105,20 +99,20 @@ class NpuPlanVirtualExpertRoutes(OpImpl):
             )
 
         import torch_npu  # noqa: F401
-        from ._kernels.virtual_expert_planner import _plan_routes, _sort_routes
+        from ._kernels.virtual_expert_planner import launch_virtual_expert_planner, _sort_routes
 
         if workspace is None:
-            workspace = _standalone_workspace(num_experts, ep_size, top_indices.device, ep_group)
+            workspace = _standalone_workspace(num_experts, top_indices.device, ep_group)
         _prepare_workspace(workspace, ep_group)
-        virtual_experts, copies, statistics = _plan_routes(
-            top_indices, num_experts, ep_group, workspace,
-        )
-        workspace.last_use = torch.npu.Event()
-        workspace.last_use.record(torch.npu.current_stream())
+        virtual_experts, copies = launch_virtual_expert_planner(top_indices, workspace)
+        statistics = workspace.field("statistics")
         sorted_ids, route_order = _sort_routes(virtual_experts)
         if not async_finish:
+            copies_cpu, statistics_cpu = copies.cpu(), statistics.cpu()
+            workspace.last_use = torch.npu.Event()
+            workspace.last_use.record(torch.npu.current_stream())
             return _finish_plan(
-                virtual_experts, copies.cpu(), statistics.cpu(), sorted_ids,
+                virtual_experts, copies_cpu, statistics_cpu, sorted_ids,
                 route_order, ep_group, None, copies,
             )
         copies_cpu = torch.empty(copies.shape, dtype=copies.dtype, device="cpu", pin_memory=True)
@@ -129,6 +123,8 @@ class NpuPlanVirtualExpertRoutes(OpImpl):
         statistics_cpu.copy_(statistics, non_blocking=True)
         ready = torch.npu.Event()
         ready.record(torch.npu.current_stream())
+        # The next planner must also wait for the shared statistics' host copy.
+        workspace.last_use = ready
         plan = VirtualExpertPlan(
             virtual_experts, copies, None, None, None, ep_group=ep_group,
         )

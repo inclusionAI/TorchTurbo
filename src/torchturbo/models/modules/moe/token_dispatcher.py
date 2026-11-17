@@ -335,13 +335,13 @@ class _HybridEPManager(_DispatchManager):
         group: dist.ProcessGroup,
         num_local_experts: int,
         num_experts: int,
-        router_topk: int,
         config: MoEConfig,
+        router_topk: int | None = None,
     ) -> None:
         self.group = group
         self.num_local_experts = num_local_experts
         self.num_experts = num_experts
-        self.router_topk = router_topk
+        self.router_topk = router_topk if router_topk is not None else config.moe_router_topk
         self.config = config
 
         self.routing_map: torch.Tensor | None = None

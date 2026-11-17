@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 import torch
-import torch.distributed as dist
 import triton
 import triton.language as tl
 
@@ -154,13 +153,13 @@ def _copies_kernel(
     values = tl.load(
         allocations + experts * EP_SIZE + destination, valid_remote, other=-1,
     ).to(tl.int64)
-    expert_slots = tl.where(native, experts % NUM_LOCAL_EXPERTS, -1)
+    expert_slots = tl.full((BLOCK_EXPERTS,), -1, tl.int64)
     for slot in range(NUM_LOCAL_EXPERTS):
         maximum = tl.max(values, axis=0)
         expert = tl.max(tl.where(valid_remote & (values == maximum), experts, -1), axis=0)
         selected = tl.where(maximum > 0, expert, -1)
         tl.store(copies + destination * NUM_LOCAL_EXPERTS + slot, selected)
-        expert_slots = tl.where(experts == selected, NUM_LOCAL_EXPERTS + slot, expert_slots)
+        expert_slots = tl.where(experts == selected, slot, expert_slots)
         values = tl.where(experts == expert, -1, values)
     tl.store(slots + experts * EP_SIZE + destination, expert_slots, experts < NUM_EXPERTS)
 
@@ -255,8 +254,11 @@ def _remap_kernel(
                 valid & (probe < EP_SIZE), other=9223372036854775807,
             )
             destination = tl.where(boundary <= ordinal, probe, destination)
-        local_slot = tl.load(slots + ids * EP_SIZE + destination, valid, other=0)
-        runtime = destination * (2 * NUM_LOCAL_EXPERTS) + local_slot
+        remote = valid & (destination != ids // NUM_LOCAL_EXPERTS)
+        slot = tl.load(slots + ids * EP_SIZE + destination, remote, other=0)
+        runtime = destination * (2 * NUM_LOCAL_EXPERTS) + tl.where(
+            remote, NUM_LOCAL_EXPERTS + slot, ids % NUM_LOCAL_EXPERTS,
+        )
         tl.store(mapped + positions, runtime, valid)
         padding = tl.sum((~valid).to(tl.int32), axis=0)
         running += tl.histogram(ids, BLOCK_EXPERTS).to(tl.int64) - tl.where(experts == 0, padding, 0)
@@ -308,7 +310,7 @@ def _publish_histograms_kernel(
 
 
 def _place_routes(
-    counts: torch.Tensor, rank: int,
+    counts: torch.Tensor, rank: int, workspace,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Return device allocations, copies, boundaries, slots, prefixes and splits."""
     ep_size, num_experts = counts.shape
@@ -316,14 +318,14 @@ def _place_routes(
     block_ep = triton.next_power_of_2(ep_size)
     block_local = triton.next_power_of_2(num_local_experts)
     block_experts = triton.next_power_of_2(num_experts)
-    totals = torch.empty(num_experts, dtype=torch.int64, device=counts.device)
-    loads = torch.empty(ep_size, dtype=torch.int64, device=counts.device)
-    prefixes = torch.empty_like(counts)
-    allocations = torch.empty((num_experts, ep_size), dtype=torch.int64, device=counts.device)
-    boundaries = torch.empty_like(allocations)
-    slots = torch.empty_like(allocations)
+    totals = workspace.field("global_tokens_per_expert")
+    loads = workspace.field("balance")
+    prefixes = workspace.field("source_prefixes")
+    allocations = workspace.field("allocation")
+    boundaries = workspace.field("destination_boundaries")
+    slots = workspace.field("virtual_expert_slots")
     copies = torch.empty((ep_size, num_local_experts), dtype=torch.int64, device=counts.device)
-    statistics = torch.empty(ep_size * (1 + 2 * num_local_experts), dtype=torch.int64, device=counts.device)
+    statistics = workspace.field("statistics")
     _totals_kernel[(ep_size,)](
         counts, totals, loads, prefixes, ep_size, num_experts, num_local_experts,
         block_ep, block_local,
@@ -342,13 +344,14 @@ def _place_routes(
     return allocations, copies, boundaries, slots, prefixes, statistics
 
 
-def _plan_routes(
-    top_indices: torch.Tensor, num_experts: int, group: dist.ProcessGroup,
-    workspace,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def launch_virtual_expert_planner(
+    top_indices: torch.Tensor, workspace, alignment: int = 1,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Exchange device histograms and remap stable local route occurrences."""
-    ep_size = dist.get_world_size(group)
-    rank = dist.get_rank(group)
+    if alignment != 1:
+        raise ValueError("Compact virtual-expert transport requires alignment=1.")
+    ep_size, num_experts = workspace.gathered_counts.shape
+    rank = workspace.rank
     routes = top_indices.contiguous()
     num_routes = routes.numel()
     route_tile = 512
@@ -356,14 +359,14 @@ def _plan_routes(
     routes_per_program = triton.cdiv(num_routes, num_programs * route_tile) * route_tile
     block_experts = triton.next_power_of_2(num_experts)
     # Fixed program rows bound scratch independently of local token count.
-    histograms = workspace.histograms[:num_programs]
+    histograms = workspace.field("program_histogram")[:num_programs]
     _histogram_kernel[(num_programs,)](
         routes, histograms, num_routes, num_experts, routes_per_program,
         block_experts, route_tile,
     )
-    local_counts = workspace.local_counts
+    local_counts = workspace.field("tokens_per_expert")
     torch.sum(histograms, dim=0, out=local_counts)
-    gathered = workspace.global_counts
+    gathered = workspace.gathered_counts
     handle = workspace.histogram_handle
     handle.peer_ptrs.record_stream(torch.npu.current_stream())
     # Finish all readers of the previous plan before publishing this rank's
@@ -373,8 +376,8 @@ def _plan_routes(
         local_counts, handle.peer_ptrs, rank, num_experts, 256,
     )
     handle.barrier()
-    _, copies, boundaries, slots, prefixes, statistics = _place_routes(
-        gathered.reshape(ep_size, num_experts), rank,
+    _, copies, boundaries, slots, prefixes, _ = _place_routes(
+        gathered, rank, workspace,
     )
     mapped = torch.empty(top_indices.shape, dtype=torch.int64, device=routes.device)
     if num_routes:
@@ -384,4 +387,4 @@ def _plan_routes(
             (ep_size - 1).bit_length(), routes_per_program, block_experts,
             triton.next_power_of_2(num_programs), 128,
         )
-    return mapped, copies, statistics
+    return mapped, copies

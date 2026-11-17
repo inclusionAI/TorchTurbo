@@ -12,18 +12,29 @@ from torchturbo.engine.config import EngineConfig
 from torchturbo.models.modules.moe.experts import GroupedMLP
 from torchturbo.models.modules.moe.module import ModuleSpec
 from torchturbo.models.modules.moe.moe_layer import MoELayer, MoERuntimeInputs, MoESubmodules
-from torchturbo.models.modules.moe.token_dispatcher import _VirtualExpertHybridEPManager
+from torchturbo.models.modules.moe.token_dispatcher import (
+    _HybridEPManager, _VirtualExpertHybridEPManager,
+)
 from torchturbo.models.modules.moe.virtual_expert_load_balancer import VirtualExpertLoadBalancer
 from torchturbo.parallel import FSDPPlanSpec
 from tests.models.test_virtual_expert_weights import _virtual_config, cpu_dispatch
 
 
 @pytest.mark.parametrize("options", [{}, {"router_topk": None}, {"router_topk": 2}])
-def test_manager_uses_megatron_constructor_order_and_config_topk(cpu_dispatch, options):
+@pytest.mark.parametrize("manager_cls", [_HybridEPManager, _VirtualExpertHybridEPManager])
+def test_manager_uses_megatron_constructor_order_and_config_topk(cpu_dispatch, options, manager_cls):
     config = replace(_virtual_config(), moe_router_topk=2)
-    manager = _VirtualExpertHybridEPManager(None, 2, 2, config, **options)
+    manager = manager_cls(None, 2, 2, config, **options)
     assert manager.router_topk == 2
-    assert manager.num_runtime_experts == 4
+    assert manager.num_experts == (4 if manager_cls is _VirtualExpertHybridEPManager else 2)
+
+
+def test_manager_resolves_none_to_the_default_world_group(cpu_dispatch, monkeypatch):
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group=None: 2)
+    config = replace(_virtual_config(), num_moe_experts=4, expert_model_parallel_size=2)
+    manager = _VirtualExpertHybridEPManager(None, 2, 4, config)
+    assert manager.ep_size == 2
+    assert manager.num_experts == 8
 
 
 @pytest.mark.parametrize("arguments,config_changes", [
