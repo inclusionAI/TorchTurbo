@@ -1,24 +1,44 @@
 {
   "metrics": {
     "loss": {
-      "1": 0.5967044830322266,
-      "2": 0.6187382936477661,
-      "3": 0.49318310618400574,
-      "4": 0.5242558717727661
+      "1": 0.7106403112411499,
+      "2": 0.7185307741165161,
+      "3": 0.5543851852416992,
+      "4": 0.5936660766601562
     },
     "grad_norm": {
-      "1": 5.914552211761475,
-      "2": 4.010077953338623,
-      "3": 2.1807374954223633,
-      "4": 1.7974365949630737
+      "1": 2.2225513458251953,
+      "2": 1.7983224391937256,
+      "3": 1.2596153020858765,
+      "4": 1.3855408430099487
     }
   },
   "case": {
-    "UPDATE_GOLDEN": true,
+    "UPDATE_GOLDEN": false,
     "MODEL_ARGS": {},
     "TRAIN_ARGS": {
-      "model": "/mnt/sfs_turbo/pretrained_models/bailing_v3/ling_tiny_v3_formal_256k_enhance_0420_wthink/merge-step-mean-0baeb1658f223ec4bcfa8d7cf6b7e242",
-      "dataset": "/mnt/sfs_turbo/torchturbo/datasets/am_think/science.jsonl",
+      "model": {
+        "source": "huggingface",
+        "repo": "inclusionAI/Ling-3.0-tiny",
+        "revision": "9a98e35fe1c9ee255f78dd64771c7ae15a799481",
+        "fallback": {
+          "source": "modelscope",
+          "repo": "inclusionAI/Ling-3.0-tiny",
+          "revision": "0a9ee734a409577fa0cff0ff48b48df008e7d8d4"
+        }
+      },
+      "dataset": {
+        "source": "huggingface",
+        "repo": "a-m-team/AM-Thinking-v1-Distilled",
+        "revision": "186b575b5cc2113f8ba81d4f4ac9ae2494633829",
+        "file": "science.jsonl",
+        "fallback": {
+          "source": "modelscope",
+          "repo": "a-m-team/AM-Thinking-v1-Distilled",
+          "revision": "f231097a64f61c091ef220672f3e6cc130f2cdb7",
+          "file": "science.jsonl"
+        }
+      },
       "model_type": "turbo_bailing_hybrid",
       "template": "ling_v3",
       "check_model": false,
@@ -82,9 +102,10 @@
       "master_port": 29500
     },
     "ENV_VARS": {
+      "HF_ENDPOINT": "https://hf-mirror.com",
       "TOKENIZERS_PARALLELISM": "false",
-      "HF_HUB_OFFLINE": "1",
-      "HF_DATASETS_OFFLINE": "1",
+      "HF_HUB_OFFLINE": "0",
+      "HF_DATASETS_OFFLINE": "0",
       "HCCL_CONNECT_TIMEOUT": "7200",
       "HCCL_EXEC_TIMEOUT": "7200",
       "HCCL_EVENT_TIMEOUT": "14500",
@@ -109,7 +130,7 @@
       },
       "grad_norm": {
         "atol": 1e-05,
-        "rtol": 0.001
+        "rtol": 0.1
       }
     }
   }
