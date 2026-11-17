@@ -114,6 +114,54 @@ def test_merges_fused_grouped_moe_lora(tmp_path):
     )
 
 
+@pytest.mark.parametrize("weight_suffix", ["", ".weight"])
+def test_merges_standard_per_expert_lora_into_fused_base(tmp_path, weight_suffix):
+    base_gate_up = torch.randn(2, 4, 3, dtype=torch.bfloat16)
+    base_down = torch.randn(2, 3, 2, dtype=torch.bfloat16)
+    gate_a = torch.randn(2, 2, 3)
+    gate_b = torch.randn(2, 2, 2)
+    up_a = torch.randn(2, 2, 3)
+    up_b = torch.randn(2, 2, 2)
+    down_a = torch.randn(2, 2, 2)
+    down_b = torch.randn(2, 3, 2)
+    prefix = "model.mlp.experts"
+    adapter = {}
+    for expert in range(2):
+        for projection, a, b in (
+            ("gate_proj", gate_a[expert], gate_b[expert]),
+            ("up_proj", up_a[expert], up_b[expert]),
+            ("down_proj", down_a[expert], down_b[expert]),
+        ):
+            adapter[f"base_model.model.{prefix}.{expert}.{projection}.lora_A.weight"] = a
+            adapter[f"base_model.model.{prefix}.{expert}.{projection}.lora_B.weight"] = b
+
+    merged, _ = _merge_and_load(
+        tmp_path,
+        {
+            f"{prefix}.gate_up_proj{weight_suffix}": base_gate_up,
+            f"{prefix}.down_proj{weight_suffix}": base_down,
+        },
+        adapter,
+    )
+
+    expected_gate_up = base_gate_up.float()
+    expected_down = base_down.float()
+    for expert in range(2):
+        expected_gate_up[expert, :2] += 2.0 * (
+            gate_b[expert] @ gate_a[expert]
+        )
+        expected_gate_up[expert, 2:] += 2.0 * (up_b[expert] @ up_a[expert])
+        expected_down[expert] += 2.0 * (down_b[expert] @ down_a[expert])
+    assert torch.equal(
+        merged[f"{prefix}.gate_up_proj{weight_suffix}"],
+        expected_gate_up.to(torch.bfloat16),
+    )
+    assert torch.equal(
+        merged[f"{prefix}.down_proj{weight_suffix}"],
+        expected_down.to(torch.bfloat16),
+    )
+
+
 def test_merges_per_expert_grouped_moe_lora(tmp_path):
     base_gate = torch.randn(2, 3, dtype=torch.bfloat16)
     base_up = torch.randn(2, 3, dtype=torch.bfloat16)

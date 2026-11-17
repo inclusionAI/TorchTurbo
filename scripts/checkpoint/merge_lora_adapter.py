@@ -12,15 +12,22 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import shutil
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
 
 ADAPTER_PREFIX = "base_model.model."
+PER_EXPERT_SUFFIX = re.compile(
+    r"^(?P<parent>.+\.mlp\.experts)\.(?P<expert>\d+)\."
+    r"(?P<projection>gate_proj|up_proj|down_proj)$"
+)
 
 
 @dataclass(frozen=True)
@@ -128,6 +135,113 @@ def _delta_for_standard_module(
     return factor * torch.matmul(b, a)
 
 
+def _base_tensor_key(tensors: Mapping[str, Any], root: str) -> str | None:
+    """Resolve either a bare parameter key or an ``nn.Module.weight`` key."""
+    if root in tensors:
+        return root
+    weighted_name = f"{root}.weight"
+    if weighted_name in tensors:
+        return weighted_name
+    return None
+
+
+def _fused_base_root(clean_name: str) -> str | None:
+    """Return the fused base tensor root for a per-expert adapter target."""
+    match = PER_EXPERT_SUFFIX.match(clean_name)
+    if match is None:
+        return None
+    projection = match.group("projection")
+    parent = match.group("parent")
+    if projection in ("gate_proj", "up_proj"):
+        return f"{parent}.gate_up_proj"
+    return f"{parent}.down_proj"
+
+
+def _split_fused_standard_expert_modules(
+    modules: dict[str, set[str]], key_map: dict[str, str]
+) -> tuple[dict[tuple[str, str], list[tuple[str, int, str]]], dict[str, set[str]]]:
+    """Split per-expert targets into fused-base groups and ordinary modules."""
+    fused_groups: dict[tuple[str, str], list[tuple[str, int, str]]] = {}
+    ordinary_modules: dict[str, set[str]] = {}
+    for module, parts in modules.items():
+        clean = module.removeprefix(ADAPTER_PREFIX)
+        match = PER_EXPERT_SUFFIX.match(clean)
+        if match is None or parts != {"lora_A", "lora_B"}:
+            ordinary_modules[module] = parts
+            continue
+
+        parent = match.group("parent")
+        projection = match.group("projection")
+        target_kind = (
+            "gate_up" if projection in ("gate_proj", "up_proj") else "down"
+        )
+        root = _fused_base_root(clean)
+        assert root is not None
+        if _base_tensor_key(key_map, root) is None:
+            # Bailing-style checkpoints have physical per-expert tensors and
+            # take the ordinary same-name path below.
+            ordinary_modules[module] = parts
+            continue
+
+        entry = (module, int(match.group("expert")), projection)
+        fused_groups.setdefault((parent, target_kind), []).append(entry)
+    return fused_groups, ordinary_modules
+
+
+def _apply_fused_standard_expert_groups(
+    tensors: dict[str, torch.Tensor],
+    groups: dict[tuple[str, str], list[tuple[str, int, str]]],
+    adapter_path: Path,
+    factor: float,
+) -> None:
+    """Merge per-expert PEFT tensors into fused Qwen-style MoE weights."""
+    for (parent, target_kind), entries in sorted(groups.items()):
+        root = (
+            f"{parent}.gate_up_proj"
+            if target_kind == "gate_up"
+            else f"{parent}.down_proj"
+        )
+        target = _base_tensor_key(tensors, root)
+        if target is None:
+            continue
+
+        weight = tensors[target]
+        intermediate_size = weight.shape[1] // 2
+        with safe_open(adapter_path, framework="pt") as adapter_file:
+            for module, expert_index, projection in entries:
+                a = adapter_file.get_tensor(f"{module}.lora_A.weight").to(
+                    torch.float32
+                )
+                b = adapter_file.get_tensor(f"{module}.lora_B.weight").to(
+                    torch.float32
+                )
+                delta = factor * torch.matmul(b, a)
+
+                if projection == "down_proj":
+                    base_slice = weight[expert_index]
+                else:
+                    rows = (
+                        slice(0, intermediate_size)
+                        if projection == "gate_proj"
+                        else slice(intermediate_size, 2 * intermediate_size)
+                    )
+                    base_slice = weight[expert_index, rows]
+                if base_slice.shape != delta.shape:
+                    raise ValueError(
+                        f"Cannot merge {module}: adapter delta has shape "
+                        f"{tuple(delta.shape)}, but the fused base slice has "
+                        f"shape {tuple(base_slice.shape)}."
+                    )
+
+                merged_slice = (
+                    base_slice.to(torch.float32) + delta
+                ).to(weight.dtype)
+                if projection == "down_proj":
+                    weight[expert_index] = merged_slice
+                else:
+                    weight[expert_index, rows] = merged_slice
+
+
 def _grouped_deltas(
     adapter_path: Path, module: str, factor: float
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -143,9 +257,10 @@ def _grouped_deltas(
 
 def _target_keys_for_module(module: str, key_map: dict[str, str]) -> dict[str, str]:
     clean = module.removeprefix(ADAPTER_PREFIX)
-    fused_w1 = f"{clean}.gate_up_proj.weight"
-    fused_w2 = f"{clean}.down_proj.weight"
-    if fused_w1 in key_map:
+    fused_w1 = _base_tensor_key(key_map, f"{clean}.gate_up_proj")
+    fused_w2 = _base_tensor_key(key_map, f"{clean}.down_proj")
+    if fused_w1 is not None:
+        assert fused_w2 is not None
         return {fused_w1: "w1-fused", fused_w2: "w2-fused"}
     targets: dict[str, str] = {}
     kinds = {"gate_proj": "w1-gate", "up_proj": "w1-up", "down_proj": "w2-expert"}
@@ -171,11 +286,20 @@ def _apply_module(
     clean = module.removeprefix(ADAPTER_PREFIX)
     factor = scaling(config)
     if parts == {"lora_A", "lora_B"}:
-        target = f"{clean}.weight"
-        if target not in tensors:
+        target = _base_tensor_key(tensors, clean)
+        if target is not None:
+            delta = _delta_for_standard_module(adapter_path, module, factor)
+            tensors[target] = (
+                tensors[target].to(torch.float32) + delta
+            ).to(tensors[target].dtype)
             return
-        delta = _delta_for_standard_module(adapter_path, module, factor)
-        tensors[target] = (tensors[target].to(torch.float32) + delta).to(tensors[target].dtype)
+
+        # ``tensors`` contains only the current shard, so an absent target is
+        # not necessarily invalid. Fused per-expert targets were split out and
+        # are handled by _apply_fused_standard_expert_groups. For an ordinary
+        # target, consult the complete index and wait for its owning shard.
+        if _base_tensor_key(key_map, clean) is None:
+            raise ValueError(f"No base weight found for LoRA target {clean}.")
         return
     if parts != {"lora_A", "lora_B", "lora_A2", "lora_B2"}:
         raise ValueError(f"Incomplete LoRA tensor pair for {module}: {sorted(parts)}.")
@@ -222,6 +346,7 @@ def merge_adapter_to_base(base_dir: Path, adapter_dir: Path, output_dir: Path) -
     if not shards:
         raise FileNotFoundError(f"No safetensors shards found under {base_dir}.")
     key_map = _base_key_map(base_dir, shards)
+    fused_groups, modules = _split_fused_standard_expert_modules(modules, key_map)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     for shard in shards:
@@ -229,6 +354,9 @@ def merge_adapter_to_base(base_dir: Path, adapter_dir: Path, output_dir: Path) -
         with safe_open(shard, framework="pt") as shard_file:
             for key in list(shard_file.keys()):
                 tensors[key] = shard_file.get_tensor(key)
+        _apply_fused_standard_expert_groups(
+            tensors, fused_groups, adapter_path, scaling(config)
+        )
         for module, parts in sorted(modules.items()):
             _apply_module(tensors, module, parts, adapter_path, config, key_map)
         save_file(tensors, output_dir / shard.name, metadata={"format": "pt"})
