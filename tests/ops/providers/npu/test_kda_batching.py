@@ -74,8 +74,7 @@ def test_sequence_count_boundaries(monkeypatch, num_sequences, output_final_stat
     output, final_state = _call(tensors, packed, output_final_state)
 
     assert [len(metadata[0]) - 1 for metadata in calls] == [
-        min(kda._MAX_KDA_SEQUENCES, num_sequences - start)
-        for start in range(0, num_sequences, kda._MAX_KDA_SEQUENCES)
+        min(1024, num_sequences - start) for start in range(0, num_sequences, 1024)
     ]
     assert output.shape == (1, num_sequences, 2, 4)
     assert (final_state is not None) == output_final_state
@@ -99,7 +98,7 @@ def test_explicit_dispatch_reaches_batched_provider(monkeypatch, use_raw_offsets
         use_gate_in_kernel=True, safe_gate=True, lower_bound=-5.0,
         output_final_state=True, impl="ascendc_kda", **metadata,
     )
-    assert [len(group[0]) - 1 for group in calls] == [1023, 2]
+    assert [len(group[0]) - 1 for group in calls] == [1024, 1]
     assert output.shape == (1, 1025, 2, 4)
     assert final_state.shape == (1025, 2, 4, 4)
 
@@ -169,8 +168,8 @@ def test_padding_tail_counts_as_an_isolated_sequence(monkeypatch):
     tensors, _ = _inputs([1027])
     packed = build_packed_params(torch.arange(1025), chunk_sizes=(64,), total_tokens=1027)
     output, final_state = _call(tensors, packed)
-    assert [len(metadata[0]) - 1 for metadata in calls] == [1023, 2]
-    assert calls[-1] == ([0, 1, 4], [0, 0, 1, 0])
+    assert [len(metadata[0]) - 1 for metadata in calls] == [1024, 1]
+    assert calls[-1] == ([0, 3], [0, 0])
     assert output.shape == (1, 1027, 2, 4)
     assert final_state.shape == (1025, 2, 4, 4)
 

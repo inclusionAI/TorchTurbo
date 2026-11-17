@@ -15,7 +15,7 @@ from ...registry import register_op
 
 
 _KDA_CHUNK_SIZE = 64
-_MAX_KDA_SEQUENCES = 1023
+_MAX_KDA_SEQUENCES = 1024
 
 
 class ChunkKDAFunction(torch.autograd.Function):
