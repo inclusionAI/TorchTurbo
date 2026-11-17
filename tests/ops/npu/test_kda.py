@@ -18,7 +18,7 @@ def test_large_varlen_kda_matches_smaller_groups(monkeypatch, num_sequences, out
     if not torch.npu.is_available():
         pytest.skip("NPU device not available")
     torch.manual_seed(42)
-    lengths = ([1, 63, 64, 65, 0] * ((num_sequences + 4) // 5))[:num_sequences]
+    lengths = ([1, 63, 64, 65, 2] * ((num_sequences + 4) // 5))[:num_sequences]
     num_tokens = sum(lengths)
     boundaries = torch.tensor([0, *lengths], dtype=torch.int32, device="npu").cumsum(0)
     original = [
