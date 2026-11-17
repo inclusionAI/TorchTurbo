@@ -5,6 +5,7 @@ from __future__ import annotations
 from ...logging import get_logger
 from ...registry import BaseAdapter, register_adapter
 from .compat import get_swift_version, is_swift_supported
+
 logger = get_logger(__name__)
 
 __all__ = ["MSSwiftAdapter"]
@@ -37,6 +38,7 @@ class MSSwiftAdapter(BaseAdapter):
 
         register_turbo_models_to_swift()
         register_turbo_trainers_to_swift()
+
         # Swap each stage's pipeline module global to the turbo class so native <stage>_main
         # builds it; a missing swift submodule (e.g. an absent RLHF stage) is skipped.
         for _spec in iter_stages():
