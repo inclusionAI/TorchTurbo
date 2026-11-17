@@ -351,14 +351,14 @@ class CheckpointConfig:
         hf_export: When training checkpoints also export HF safetensors:
             ``"final"`` exports with the final save only, ``"every"`` with
             every checkpoint. Defaults to ``"every"``.
-        hf_export_lora: How LoRA checkpoints are exported to HF format:
-            ``"merge"`` merges adapter deltas into the base weights, while
+        lora_export_mode: How LoRA checkpoints are exported to HF format:
+            ``"merged"`` merges adapter deltas into the base weights, while
             ``"adapter"`` writes a standalone PEFT adapter directory. Defaults
-            to ``"merge"``.
+            to ``"merged"``.
     """
 
     hf_export: Literal["final", "every"] = "every"
-    hf_export_lora: Literal["merge", "adapter"] = "merge"
+    lora_export_mode: Literal["merged", "adapter"] = "merged"
 
     def __post_init__(self) -> None:
         if self.hf_export not in ("final", "every"):
@@ -366,10 +366,10 @@ class CheckpointConfig:
                 "checkpoint.hf_export must be 'final' or 'every', got "
                 f"{self.hf_export!r}"
             )
-        if self.hf_export_lora not in ("merge", "adapter"):
+        if self.lora_export_mode not in ("merged", "adapter"):
             raise ValueError(
-                "checkpoint.hf_export_lora must be 'merge' or 'adapter', "
-                f"got {self.hf_export_lora!r}"
+                "checkpoint.lora_export_mode must be 'merged' or 'adapter', "
+                f"got {self.lora_export_mode!r}"
             )
 
 

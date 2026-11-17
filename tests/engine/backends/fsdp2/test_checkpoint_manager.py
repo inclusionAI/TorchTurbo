@@ -174,7 +174,7 @@ def test_save_hf_adapter_exports_a_peft_adapter_directory(tmp_path):
         str(tmp_path),
         source_path="unused",
         weight_converter=object(),
-        hf_export_lora="adapter",
+        lora_export_mode="adapter",
     )
 
     saved = load_file(str(tmp_path / "adapter_model.safetensors"))
@@ -243,7 +243,7 @@ def test_save_hf_adapter_splits_grouped_experts_into_hf_lora_format(
         str(tmp_path),
         source_path="unused",
         weight_converter=object(),
-        hf_export_lora="adapter",
+        lora_export_mode="adapter",
     )
 
     saved = load_file(str(tmp_path / "adapter_model.safetensors"))
@@ -289,7 +289,7 @@ def test_save_hf_adapter_splits_grouped_experts_into_hf_lora_format(
 
 def test_adapter_export_requires_lora(manager, tmp_path):
     config = EngineConfig.from_dict(
-        {"checkpoint": {"hf_export": "final", "hf_export_lora": "adapter"}}
+        {"checkpoint": {"hf_export": "final", "lora_export_mode": "adapter"}}
     )
     manager._config = config
     model = ConvertibleModel()
@@ -308,7 +308,7 @@ def test_save_model_uses_adapter_hf_export_mode(manager, tmp_path):
     from safetensors.torch import load_file
 
     manager._config = EngineConfig.from_dict(
-        {"checkpoint": {"hf_export": "final", "hf_export_lora": "adapter"}}
+        {"checkpoint": {"hf_export": "final", "lora_export_mode": "adapter"}}
     )
     model = peft.get_peft_model(
         ConvertibleModel(),

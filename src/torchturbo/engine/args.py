@@ -155,8 +155,8 @@ class TorchTurboArgs:
     hf_export:
         Whether to export HF safetensors with the final training checkpoint
         or every training checkpoint. Defaults to every checkpoint.
-    hf_export_lora:
-        How LoRA checkpoints are exported: 'merge' (default) merges adapter
+    lora_export_mode:
+        How LoRA checkpoints are exported: 'merged' (default) merges adapter
         deltas into the base weights, and 'adapter' writes a standalone PEFT
         adapter directory.
     log_level:
@@ -193,7 +193,7 @@ class TorchTurboArgs:
     freeze_multi_modal_projector: bool = False
     freeze_language_model: bool = False
     hf_export: str | None = None
-    hf_export_lora: str | None = None
+    lora_export_mode: str | None = None
     profiling: bool = False
     memory_snapshot_steps: int | None = None
     log_level: LogLevel = LogLevel.INFO
@@ -706,13 +706,13 @@ _TURBO_ARG_SPECS: tuple[TurboArgSpec, ...] = (
         ),
     ),
     TurboArgSpec(
-        name="hf_export_lora",
-        args_name="hf_export_lora",
-        config_path="checkpoint.hf_export_lora",
-        cli_name="--tt_hf_export_lora",
-        choices=("merge", "adapter"),
+        name="lora_export_mode",
+        args_name="lora_export_mode",
+        config_path="checkpoint.lora_export_mode",
+        cli_name="--tt_lora_export_mode",
+        choices=("merged", "adapter"),
         help=(
-            "How LoRA checkpoints are exported to HF format: 'merge' "
+            "How LoRA checkpoints are exported to HF format: 'merged' "
             "(default) merges adapter deltas into the base weights, while "
             "'adapter' writes a standalone PEFT adapter directory."
         ),

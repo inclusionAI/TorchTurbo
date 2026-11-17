@@ -230,8 +230,8 @@ checkpoint-<step>/
 - `every`（默认）：每次保存 checkpoint 时，同时导出 HF 模型。
 - `final`：只在训练结束时导出 HF 模型，中间的 checkpoint 仍保存 DCP。
 
-LoRA 训练可使用 `--tt_hf_export_lora` 控制导出内容，对应配置字段为
-`checkpoint.hf_export_lora`：`merge`（默认）导出合并后的完整模型权重；
+LoRA 训练可使用 `--tt_lora_export_mode` 控制导出内容，对应配置字段为
+`checkpoint.lora_export_mode`：`merged`（默认）导出合并后的完整模型权重；
 `adapter` 导出独立的 PEFT 适配器目录（`adapter_config.json` 和
 `adapter_model.safetensors`）。
 

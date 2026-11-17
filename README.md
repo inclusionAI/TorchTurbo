@@ -264,8 +264,8 @@ is `checkpoint.hf_export`:
 - `every` (default): export an HF model with every checkpoint.
 - `final`: export an HF model only at the end of training. Intermediate checkpoints still save DCP.
 
-For LoRA runs, `--tt_hf_export_lora` controls the export content. The
-corresponding config field is `checkpoint.hf_export_lora`: `merge` (default)
+For LoRA runs, `--tt_lora_export_mode` controls the export content. The
+corresponding config field is `checkpoint.lora_export_mode`: `merged` (default)
 writes merged model weights, and `adapter` writes a standalone PEFT adapter
 directory (`adapter_config.json` and `adapter_model.safetensors`).
 

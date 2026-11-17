@@ -105,9 +105,9 @@ class FSDP2CheckpointManager(BaseCheckpointManager):
         *,
         source_path: str,
         weight_converter: BaseWeightConverter,
-        hf_export_lora: str = "merge",
+        lora_export_mode: str = "merged",
     ) -> None:
-        if hf_export_lora == "adapter":
+        if lora_export_mode == "adapter":
             self._save_adapter(model, output_dir)
             return
         self._hf_saver(model, source_path, weight_converter).save_model(output_dir)
