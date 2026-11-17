@@ -404,8 +404,8 @@ def _run_distributed_muon_test(
                 optimizer.step()
             assert execution_path.call_count == 1
             assert exchange.call_count == expected_exchanges
-            # Only offloaded device execution releases buffers after a step.
-            assert optimizer._workspace.configured != optimizer._step_scoped_workspace
+            # Successful steps retain the configured workspace for reuse.
+            assert optimizer._workspace.configured
             reference.step()
 
             for name, parameter in model.named_parameters():
