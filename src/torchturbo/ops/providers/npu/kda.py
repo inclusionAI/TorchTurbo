@@ -30,7 +30,7 @@ def _prepare_kda_metadata(cu_seqlens, _version):
 
 
 class ChunkKDAFunction(torch.autograd.Function):
-    """Connect the head-major AscendC KDA training operators."""
+    """Connect token-major model tensors to the AscendC KDA operators."""
 
     @staticmethod
     def forward(
@@ -49,7 +49,7 @@ class ChunkKDAFunction(torch.autograd.Function):
         cu_seqlens: torch.Tensor | None,
         use_qk_l2norm_in_kernel: bool,
         use_beta_sigmoid_in_kernel: bool,
-        export_intermediates: bool,
+        save_backward: bool,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         from fla_npu.ops.ascendc import chunk_kda_fwd
 
@@ -58,20 +58,21 @@ class ChunkKDAFunction(torch.autograd.Function):
             cu_host, indices = _prepare_kda_metadata(cu_seqlens, cu_seqlens._version)
         packed = cu_host is not None
         ctx.g_dtype, ctx.beta_dtype = g.dtype, beta.dtype
-        g = g.transpose(1, 2)
-        beta = beta.transpose(1, 2)
         if packed:
             g, beta = g.squeeze(0), beta.squeeze(0)
         g, beta = g.contiguous(), beta.contiguous()
         q_hat = k_hat = q_rstd = k_rstd = None
-        if use_qk_l2norm_in_kernel:
-            q_hat = torch.empty_like(q)
-            k_hat = torch.empty_like(k)
-            q_rstd = torch.empty(q.shape[:-1], dtype=torch.float32, device=q.device)
-            k_rstd = torch.empty(k.shape[:-1], dtype=torch.float32, device=k.device)
+        # Normalization caches are head-major regardless of the input layout.
+        token_axis = 0 if packed else 1
+        head_shape = q.transpose(token_axis, token_axis + 1).shape
+        if use_qk_l2norm_in_kernel and save_backward:
+            q_hat = torch.empty(head_shape, dtype=q.dtype, device=q.device)
+            k_hat = torch.empty(head_shape, dtype=k.dtype, device=k.device)
+            q_rstd = torch.empty(head_shape[:-1], dtype=torch.float32, device=q.device)
+            k_rstd = torch.empty(head_shape[:-1], dtype=torch.float32, device=k.device)
         beta_eff = None
-        if use_beta_sigmoid_in_kernel:
-            beta_eff = torch.empty(beta.shape, dtype=torch.float32, device=beta.device)
+        if use_beta_sigmoid_in_kernel and save_backward:
+            beta_eff = torch.empty(head_shape[:-1], dtype=torch.float32, device=beta.device)
         outputs = chunk_kda_fwd(
             q,
             k,
@@ -80,7 +81,7 @@ class ChunkKDAFunction(torch.autograd.Function):
             beta,
             scale,
             64,
-            layout="NTD" if packed else "BNSD",
+            layout="TND" if packed else "BSND",
             output_final_state=output_final_state,
             cu_seqlens=cu_host,
             chunk_indices=indices,
@@ -89,7 +90,7 @@ class ChunkKDAFunction(torch.autograd.Function):
             use_gate_in_kernel=use_gate_in_kernel,
             A_log=A_log,
             dt_bias=dt_bias,
-            disable_recompute=export_intermediates,
+            disable_recompute=False,
             use_exp2=True,
             use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
             use_beta_sigmoid_in_kernel=use_beta_sigmoid_in_kernel,
@@ -99,16 +100,13 @@ class ChunkKDAFunction(torch.autograd.Function):
             k_rstd_out=k_rstd,
             beta_eff_out=beta_eff,
         )
-        output, final_state, gk, aqk, akk, w, _u, qg, kg, v_new, h, _state = outputs
-        # Backward consumes normalized Q/K and effective beta, not raw inputs.
+        output, final_state, _gk, aqk, akk, _w, _u, _qg, _kg, _v_new, _h, _state = outputs
         if q_hat is not None:
             q, k = q_hat, k_hat
-        if beta_eff is not None:
-            beta = beta_eff
-        if export_intermediates:
+        if save_backward:
             ctx.save_for_backward(
-                q, k, v, g, beta, A_log, dt_bias, gk, aqk, akk, w, qg, kg, v_new, h,
-                q_rstd, k_rstd,
+                q, k, v, g, beta, A_log, dt_bias, aqk, akk,
+                q_rstd, k_rstd, beta_eff,
             )
         ctx.scale = scale
         ctx.lower_bound = lower_bound
@@ -129,11 +127,7 @@ class ChunkKDAFunction(torch.autograd.Function):
         grad_output: torch.Tensor,
         grad_final_state: torch.Tensor | None,
     ) -> tuple[torch.Tensor | None, ...]:
-        from fla_npu.ops.ascendc import (
-            npu_chunk_gated_delta_rule_bwd_dhu,
-            npu_chunk_kda_bwd_finalize,
-            npu_chunk_kda_bwd_prepare,
-        )
+        from fla_npu.ops.ascendc import npu_chunk_kda_bwd
 
         # A zero grad is the discarded output's placeholder; a non-zero
         # one means the loss depends on final_state, which has no backward.
@@ -142,52 +136,29 @@ class ChunkKDAFunction(torch.autograd.Function):
                 "AscendC KDA does not support gradients through final_state."
             )
         (
-            q, k, v, g, beta, A_log, dt_bias, gk, aqk, akk, w, qg, kg, v_new, h,
-            q_rstd, k_rstd,
+            q, k, v, g, beta, A_log, dt_bias, aqk, akk,
+            q_rstd, k_rstd, beta_eff,
         ) = ctx.saved_tensors
         packed = ctx.cu_seqlens is not None
         if packed:
             grad_output = grad_output.squeeze(0)
-        token_axis = 0 if packed else 1
-        grad_output = grad_output.transpose(token_axis, token_axis + 1).contiguous()
-
-        cu, indices = ctx.cu_seqlens, ctx.chunk_indices
-        if packed and any(left == right for left, right in pairwise(cu)):
-            # Empty sequences consume no tokens or chunk storage.
-            cu = [cu[0]] + [right for left, right in pairwise(cu) if right > left]
-            indices = _chunk_indices(cu)
-        layout = "NTD" if packed else "BNSD"
-        d_aqk, dv_local, dq_raw = npu_chunk_kda_bwd_prepare(
-            aqk, v_new, grad_output, h, scale=ctx.scale, layout=layout,
-            chunk_size=64, cu_seqlens=cu, chunk_indices=indices,
-        )
-        # Dhu requires rank-4 token tensors even for a packed sequence.
-        scan_inputs = (qg, kg, w, grad_output, dv_local, gk)
-        if packed:
-            scan_inputs = tuple(t.unsqueeze(0) for t in scan_inputs)
-        qg_scan, kg_scan, w_scan, do_scan, dv_local_scan, gk_scan = scan_inputs
-        dh, _dh0, dv_scan = npu_chunk_gated_delta_rule_bwd_dhu(
-            qg_scan, kg_scan, w_scan, do_scan, dv_local_scan, ctx.scale, 64, gK=gk_scan,
-            cu_seqlens=cu, chunk_indices=indices, use_exp2=True,
-        )
-        if packed:
-            dh, dv_scan = dh.squeeze(0), dv_scan.squeeze(0)
-
-        if dt_bias is None:
-            bias = torch.zeros((q.size(-3), q.size(-1)), dtype=torch.float32, device=q.device)
-        else:
-            bias = dt_bias.reshape(q.size(-3), q.size(-1))
-        dq, dk, dv, dbeta, dg, dA, dbias = npu_chunk_kda_bwd_finalize(
-            q, k, v, gk, g, beta.float(), A_log, bias, akk, v_new, h, dh,
-            dv_scan, d_aqk, dq_raw,
-            scale=ctx.scale, lower_bound=ctx.lower_bound, chunk_size=64,
+        # Model tensors and output gradients stay token-major. The upstream
+        # backward rebuilds the omitted forward caches.
+        dq, dk, dv, dbeta, dg, _dh0, dA, dbias = npu_chunk_kda_bwd(
+            q, k, v, beta, None, aqk, akk, None, None, None, None, None,
+            grad_output.contiguous(), ctx.scale,
+            raw_g=g, A_log=A_log, dt_bias=dt_bias,
+            lower_bound=ctx.lower_bound, chunk_size=64,
             safe_gate=True, use_gate_in_kernel=ctx.use_gate_in_kernel,
-            use_exp2=True, q_rstd=q_rstd, k_rstd=k_rstd,
-            cu_seqlens=cu, chunk_indices=indices, output_layout=layout,
+            disable_recompute=False, use_exp2=True,
+            q_rstd=q_rstd, k_rstd=k_rstd,
+            cu_seqlens=ctx.cu_seqlens, chunk_indices=ctx.chunk_indices,
+            layout="TND" if packed else "BSND",
             use_beta_sigmoid_in_kernel=ctx.use_beta_sigmoid_in_kernel,
+            beta_eff=beta_eff,
         )
         dbias = None if dt_bias is None else dbias.reshape_as(dt_bias)
-        # Finalize already returns token-major gate/beta gradients.
+        # Gate and beta gradients have the original token-major layout.
         if packed:
             dg, dbeta = dg.unsqueeze(0), dbeta.unsqueeze(0)
         return (
@@ -268,7 +239,6 @@ def ascendc_chunk_kda(
 
     inputs = []
     for tensor in (q, k, v):
-        tensor = tensor.transpose(1, 2)
         if cu_seqlens is not None:
             tensor = tensor.squeeze(0)
         inputs.append(tensor.contiguous())
@@ -304,9 +274,7 @@ class AscendCKDA(OpImpl):
         try:
             from fla_npu.ops.ascendc import (  # noqa: F401
                 chunk_kda_fwd,
-                npu_chunk_gated_delta_rule_bwd_dhu,
-                npu_chunk_kda_bwd_finalize,
-                npu_chunk_kda_bwd_prepare,
+                npu_chunk_kda_bwd,
             )
         except ImportError:
             return False
