@@ -105,6 +105,7 @@ class MoELayer(BaseMoELayer):
         layer_number: Optional[int] = None,
         sp_group: dist.ProcessGroup | None = None,
     ) -> None:
+        self.megakernel_experts = None
         self.use_te = use_te
         self.submodules = submodules
         super(MoELayer, self).__init__(
@@ -153,24 +154,30 @@ class MoELayer(BaseMoELayer):
         probs, routing_map, expert_indices, logits = self.router(
             hidden_states, input_ids, self._runtime_inputs.padding_mask,
             self._runtime_inputs.accumulate_tokens_per_expert,
+            **({"routing_layout": "topk"} if self.megakernel_experts is not None else {}),
         )
         logits = logits.view(-1, logits.shape[-1])
 
-        dispatcher = self.token_dispatcher
-        # Reuse stage variables so completed layouts are not kept alive here.
-        expert_tokens, expert_probs = dispatcher.dispatch_preprocess(
-            hidden_states, routing_map, probs, expert_indices=expert_indices,
-        )
-        expert_tokens, expert_probs = dispatcher.token_dispatch(expert_tokens, expert_probs)
-        expert_tokens, tokens_per_expert, expert_probs = dispatcher.dispatch_postprocess(
-            expert_tokens, expert_probs,
-        )
-        expert_tokens, bias = self.experts(expert_tokens, tokens_per_expert, expert_probs)
-        assert bias is None, "Bias is not supported in MoEAlltoAllTokenDispatcher"
-        expert_tokens = dispatcher.combine_preprocess(expert_tokens)
-        expert_tokens = dispatcher.token_combine(expert_tokens)
-        expert_tokens = dispatcher.combine_postprocess(expert_tokens)
-        output = expert_tokens.to(hidden_states.dtype)
+        if self.megakernel_experts is not None:
+            output, _ = self.experts(
+                hidden_states, None, probs, megakernel_context=self.megakernel_experts.context_for(self.experts), expert_indices=expert_indices,
+            )
+        else:
+            dispatcher = self.token_dispatcher
+            # Reuse stage variables so completed layouts are not kept alive here.
+            expert_tokens, expert_probs = dispatcher.dispatch_preprocess(
+                hidden_states, routing_map, probs, expert_indices=expert_indices,
+            )
+            expert_tokens, expert_probs = dispatcher.token_dispatch(expert_tokens, expert_probs)
+            expert_tokens, tokens_per_expert, expert_probs = dispatcher.dispatch_postprocess(
+                expert_tokens, expert_probs,
+            )
+            expert_tokens, bias = self.experts(expert_tokens, tokens_per_expert, expert_probs)
+            assert bias is None, "Bias is not supported in MoEAlltoAllTokenDispatcher"
+            expert_tokens = dispatcher.combine_preprocess(expert_tokens)
+            expert_tokens = dispatcher.token_combine(expert_tokens)
+            expert_tokens = dispatcher.combine_postprocess(expert_tokens)
+            output = expert_tokens.to(hidden_states.dtype)
 
         if self.shared_expert is not None:
             shared_expert_output = self.shared_expert(hidden_states)

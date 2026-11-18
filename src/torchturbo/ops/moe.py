@@ -1,10 +1,11 @@
-"""Shared tensor contract for MoE permutation and unpermutation operators."""
+"""Shared tensor data and execution context for MoE operators."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
 import torch
+import torch.distributed as dist
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,3 +65,20 @@ def get_expert_indices(routing_map: torch.Tensor) -> torch.Tensor:
             "MoE permutation requires the same top-k count for every token."
         )
     return experts.view(num_tokens, topk)
+
+
+@dataclass(frozen=True, eq=False)
+class MegaMoeContext:
+    """One EP group's serial layers sharing geometry and HMC workspace.
+
+    Context identity scopes the provider cache to a model binding. Parameters
+    remain owned by the model and are supplied after FSDP unshards each layer.
+    """
+
+    ep_group: dist.ProcessGroup
+    hidden_size: int
+    intermediate_size: int
+    num_experts: int
+    top_k: int
+    swiglu_limit: float | None
+    clamp_after_silu: bool

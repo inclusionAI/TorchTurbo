@@ -7,7 +7,7 @@
   # Modified by the TorchTurbo contributors.
 
 from abc import ABC
-from typing import Optional
+from typing import Literal, Optional
 
 import torch
 import torch.distributed as dist
@@ -19,7 +19,7 @@ from .moe_utils import (
     mask_padding_tokens,
     z_loss_func,
 )
-from .utils import topk_softmax_with_capacity
+from .utils import _assignment_mask, _dense_topk_route, _select_topk_experts
 
 
 class RouterGatingLinearFunction(torch.autograd.Function):
@@ -280,14 +280,15 @@ class TopKRouter(Router):
         input_ids: Optional[torch.Tensor] = None,
         padding_mask: torch.Tensor | None = None,
         accumulate_tokens_per_expert: bool = True,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        *, routing_layout: Literal["dense", "topk"] = "dense",
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
         """Top-k routing function
 
         Args:
             logits (torch.Tensor): Logits tensor after gating.
 
         Returns:
-            Dense routing weights, boolean assignment mask, and the selected
+            Dense or selected routing weights, optional assignment mask, and the selected
             expert IDs in their native top-k order.
         """
         seq_length, bsz = logits.shape[:2]
@@ -300,7 +301,7 @@ class TopKRouter(Router):
 
         if self.routing_type == "none":
             # A naive top-k routing without load balancing
-            probs, routing_map, expert_indices = topk_softmax_with_capacity(
+            probs, expert_indices = _select_topk_experts(
                 logits,
                 self.topk,
                 use_pre_softmax=self.config.moe_router_pre_softmax,
@@ -315,6 +316,14 @@ class TopKRouter(Router):
             )
         else:
             raise ValueError(f"Unsupported MoE routing type: {self.routing_type}")
+
+        count_expert_load = self.enable_expert_bias and accumulate_tokens_per_expert and torch.is_grad_enabled()
+        if routing_layout == "dense":
+            probs, routing_map, expert_indices = _dense_topk_route(logits, probs, expert_indices)
+        elif routing_layout == "topk":
+            routing_map = _assignment_mask(logits, expert_indices) if count_expert_load else None
+        else:
+            raise ValueError(f"Unknown MoE routing layout: {routing_layout}")
 
         # Hash assignments are fixed, so learned-routing AUX does not apply.
         if (
@@ -335,11 +344,7 @@ class TopKRouter(Router):
 
         # Count each training forward once. Evaluation and the reentrant first
         # pass run without grad; non-reentrant recomputation disables counting.
-        if (
-            self.enable_expert_bias
-            and accumulate_tokens_per_expert
-            and torch.is_grad_enabled()
-        ):
+        if count_expert_load:
             with torch.no_grad():
                 bias_routing_map = mask_padding_tokens(
                     routing_map, padding_mask
@@ -361,12 +366,13 @@ class TopKRouter(Router):
         input_ids: Optional[torch.Tensor] = None,
         padding_mask: torch.Tensor | None = None,
         accumulate_tokens_per_expert: bool = True,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        *, routing_layout: Literal["dense", "topk"] = "dense",
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor]:
         """
         Forward pass of the router.
 
         Returns:
-            Dense routing weights, boolean assignment mask, selected expert
+            Dense or selected routing weights, optional assignment mask, selected expert
             IDs, and the router logits.
         """
         self._maintain_float32_expert_bias()
@@ -374,7 +380,7 @@ class TopKRouter(Router):
         logits = self.gating(input)
 
         probs, routing_map, expert_indices = self.routing(
-            logits, input_ids, padding_mask, accumulate_tokens_per_expert
+            logits, input_ids, padding_mask, accumulate_tokens_per_expert, routing_layout=routing_layout
         )
 
         return probs, routing_map, expert_indices, logits

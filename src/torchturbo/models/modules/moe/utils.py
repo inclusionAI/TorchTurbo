@@ -124,7 +124,7 @@ def maybe_move_tensor_to_cpu(
     return tensor
 
 
-def topk_softmax_with_capacity(
+def _select_topk_experts(
     logits: torch.Tensor,
     topk: int,
     use_pre_softmax: bool = False,
@@ -136,24 +136,8 @@ def topk_softmax_with_capacity(
     use_hash_routing: bool = False,
     hash_table: Optional[torch.Tensor] = None,
     input_ids: Optional[torch.Tensor] = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Select fixed-top-k experts and compute their routing probabilities.
-    Args:
-        logits (torch.Tensor): Logits tensor.
-        topk (int): The number of experts to select for each token.
-        use_pre_softmax (bool): Apply softmax before top-k instead of to selected logits.
-        num_groups (int): Number of groups for routed experts.
-        group_topk (int): Number of selected groups for each token.
-        scaling_factor (float): Scaling factor of routing score in top-k selection.
-        score_function (str): "softmax", "sigmoid", or "sqrtsoftplus".
-        expert_bias (torch.Tensor): The bias added to logits for expert routing.
-
-    Returns:
-        Dense weights, boolean assignment mask, and the selected expert IDs.
-        Both learned and hash routing return the compact top-k IDs in their
-        native order; the packed layout only needs a consistent pairing
-        between expert IDs, row indices, and gathered probabilities.
-    """
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return selected weights and expert IDs in matching Top-K order."""
     assert (
         logits.dim() == 2
     ), f"Expected 2D logits [num_tokens, num_experts], got {logits.dim()}."
@@ -221,13 +205,53 @@ def topk_softmax_with_capacity(
     if scaling_factor:
         probs = probs * scaling_factor
 
-    probs = probs.type_as(logits)
+    return probs.type_as(logits), top_indices
 
-    # TODO Try using element-wise operations instead of scatter?
-    topk_masked_gates = torch.zeros_like(logits).scatter(1, top_indices, probs)
-    topk_map = torch.zeros_like(logits).int().scatter(1, top_indices, 1).bool()
 
-    return topk_masked_gates, topk_map, top_indices
+def _assignment_mask(logits, indices):
+    return torch.zeros_like(logits).int().scatter(1, indices, 1).bool()
+
+
+def _dense_topk_route(logits, probs, indices):
+    weights = torch.zeros_like(logits).scatter(1, indices, probs)
+    return weights, _assignment_mask(logits, indices), indices
+
+
+def topk_softmax_with_capacity(
+    logits: torch.Tensor,
+    topk: int,
+    use_pre_softmax: bool = False,
+    num_groups: Optional[int] = None,
+    group_topk: Optional[int] = None,
+    scaling_factor: Optional[float] = None,
+    score_function: str = "softmax",
+    expert_bias: Optional[torch.Tensor] = None,
+    use_hash_routing: bool = False,
+    hash_table: Optional[torch.Tensor] = None,
+    input_ids: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Select fixed-top-k experts and compute their routing probabilities.
+    Args:
+        logits (torch.Tensor): Logits tensor.
+        topk (int): The number of experts to select for each token.
+        use_pre_softmax (bool): Apply softmax before top-k instead of to selected logits.
+        num_groups (int): Number of groups for routed experts.
+        group_topk (int): Number of selected groups for each token.
+        scaling_factor (float): Scaling factor of routing score in top-k selection.
+        score_function (str): "softmax", "sigmoid", or "sqrtsoftplus".
+        expert_bias (torch.Tensor): The bias added to logits for expert routing.
+
+    Returns:
+        Dense weights, boolean assignment mask, and the selected expert IDs.
+        Both learned and hash routing return the compact top-k IDs in their
+        native order; the packed layout only needs a consistent pairing
+        between expert IDs, row indices, and gathered probabilities.
+    """
+    probs, indices = _select_topk_experts(
+        logits, topk, use_pre_softmax, num_groups, group_topk, scaling_factor,
+        score_function, expert_bias, use_hash_routing, hash_table, input_ids,
+    )
+    return _dense_topk_route(logits, probs, indices)
 
 
 def ensure_divisibility(numerator, denominator):

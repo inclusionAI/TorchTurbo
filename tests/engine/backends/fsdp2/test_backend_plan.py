@@ -61,6 +61,7 @@ def make_backend(*, mtp_enabled=False):
     backend = FSDP2Backend.__new__(FSDP2Backend)
     backend.config = types.SimpleNamespace(
         mtp=types.SimpleNamespace(enabled=mtp_enabled),
+        moe=types.SimpleNamespace(enable_mega_moe=False),
         loss_chunk=types.SimpleNamespace(enabled=False),
     )
     return backend
@@ -74,7 +75,7 @@ def make_preparing_backend(order, sp_info):
     backend.get_ep_info = lambda: {"ep_size": 1}
     backend.get_sp_info = lambda: sp_info
     backend._init_mesh = lambda plan: order.append("init_mesh")
-    backend._replace_modules = lambda model, plan: order.append("replace") or model
+    backend._replace_modules = lambda model, plan, **kwargs: order.append("replace") or model
     backend._apply_activation_checkpointing = (
         lambda model, plan: order.append("activation_checkpointing") or model
     )
@@ -1336,3 +1337,50 @@ def test_activation_checkpointing_disabled_warns_and_skips_plan_targets(monkeypa
     assert len(warnings) == 1
     assert "skipping activation checkpointing" in warnings[0][0]
     assert not hasattr(model.layers[0], "_tt_original_forward")
+
+
+def test_peft_disables_megakernel_before_replacement(monkeypatch):
+    model = TaggedModule("root")
+    backend = make_preparing_backend([], {"sp_size": 1, "sp_group": None, "sp_rank": 0})
+    backend.config.moe.enable_mega_moe = True
+    selected = []
+    def replace_modules(value, plan, *, megakernel_experts):
+        selected.append(megakernel_experts)
+        return value
+
+    backend._replace_modules = replace_modules
+    monkeypatch.setattr("torchturbo.engine.peft.apply_peft", lambda value, config: value)
+    assert backend.prepare_model(model, FSDPParallelPlan(), peft_config=object()) is model
+    assert selected == [None]
+    assert backend.config.moe.enable_mega_moe
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_qwen_parallel_plan_uses_common_megakernel_binding(monkeypatch, enabled):
+    from torchturbo.engine.config import EngineConfig
+    from torchturbo.models.modules.moe.mega_moe import MegaKernelExperts
+    from torchturbo.models.modules.moe.moe_layer import MoELayer
+    from torchturbo.models.qwen3_5_moe.parallel_plan import get_parallel_plan
+
+    group = object()
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group=None: 2)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda group=None: 0)
+    backend = make_backend()
+    backend.config = EngineConfig()
+    backend.get_ep_info = lambda: {"ep_group": group, "ep_size": 2}
+    backend.get_sp_info = lambda: {"sp_group": None}
+    model = nn.Module()
+    model.config = types.SimpleNamespace(hidden_size=8, moe_intermediate_size=4,
+                                         num_experts=4, num_experts_per_tok=2)
+    model.mlp = nn.Module()
+    model.mlp.gate = model.mlp.experts = nn.Identity()
+    model.dense = nn.Identity()
+    spec = get_parallel_plan().plan["model.language_model.layers.*.mlp"]
+    plan = FSDPParallelPlan(plan={"mlp": spec, "dense": spec})
+    kernels = MegaKernelExperts(group) if enabled else None
+    backend._replace_modules(model, plan, megakernel_experts=kernels)
+    assert isinstance(model.mlp, MoELayer)
+    assert model.mlp.megakernel_experts is kernels
+    assert not hasattr(model.dense, "megakernel_experts")
+    if enabled:
+        assert kernels.layers[model.mlp.experts] is None

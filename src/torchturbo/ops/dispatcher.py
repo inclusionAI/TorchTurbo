@@ -12,7 +12,7 @@ from torchturbo.logging import get_logger
 from torchturbo.runtime import DeviceRuntime, TurboDevice
 
 from .base import OpImpl, OpImplKind, OpPolicy, OpSpec
-from .moe import MoEPermutation, get_expert_indices
+from .moe import MegaMoeContext, MoEPermutation, get_expert_indices
 from .packed_params import get_packed_params
 from .providers import iter_provider_modules
 from .registry import OpRegistry
@@ -525,6 +525,39 @@ class OpDispatcher:
     ):
         return self._dispatch(
             "lightning_indexer_metadata", *args, impl=impl, **kwargs
+        )
+
+    def mega_moe(
+        self,
+        inputs: torch.Tensor,
+        expert_indices: torch.Tensor,
+        probs: torch.Tensor,
+        experts: torch.nn.Module,
+        *,
+        context: MegaMoeContext,
+        impl: str | None = None,
+    ) -> torch.Tensor:
+        """Run expert-parallel SwiGLU with HMC's shared communication workspace.
+
+        Args:
+            inputs: Local BF16 source tokens, shaped [tokens, hidden_size].
+            expert_indices: Global expert IDs, shaped [tokens, top_k].
+            probs: Selected routing weights in the same slot order as the IDs.
+            experts: Current unsharded expert module. The provider reads its live parameters.
+            context: EP group and numerics shared by serial model layers.
+            impl: Optional provider selection, taking precedence over the override.
+
+        Returns:
+            Combined BF16 features shaped like inputs, differentiable with
+            respect to inputs, probs and both expert weights. Probabilities are
+            applied after SwiGLU and before FC2.
+
+        The NPU provider executes HMC MegaMoE. The CUDA provider raises
+        NotImplementedError. CPU and strict native policy have no implementation.
+        """
+        return self._dispatch(
+            "mega_moe", inputs, expert_indices, probs, experts,
+            context=context, impl=impl,
         )
 
     def moe_permutation(

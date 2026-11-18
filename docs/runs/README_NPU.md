@@ -301,3 +301,29 @@ DATASET=/datasets/AM-Thinking-v1-Distilled/science.jsonl \
     MODEL=/models/Ling-3.0-flash OUTPUT_DIR=/torchturbo/output \
     bash scripts/runs/bailing_v3/swift_sft.sh
 ```
+
+### HyperMulticore MegaMoE on Ascend A3
+
+For BF16 full-parameter training with TorchTurbo SwiGLU experts and expert parallelism,
+install a [HyperMulticore A3 wheel](https://github.com/mindspore-ai/hyper-multicore/blob/master/docs/build.md)
+built for the Torch and torch_npu versions in the training container on every node.
+After activating CANN and installing the wheel, run the following in each launcher shell
+before importing Torch:
+
+```bash
+source "$(command -v hyper_multicore_set_env.bash)"
+```
+
+Set the following in the YAML passed to `--tt_config` and configure an EP size
+greater than one. MegaMoE defaults to disabled. LoRA uses the standard TorchTurbo experts.
+
+```yaml
+engine_config:
+  moe:
+    enable_mega_moe: true
+```
+
+HyperMulticore determines communication workspace capacity from the current routing counts.
+
+On NPU, `ops.mega_moe` selects `hmc_mega_moe`. On CUDA, the default
+provider `cuda_mega_moe` raises `NotImplementedError` when called.

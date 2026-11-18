@@ -1429,3 +1429,11 @@ def test_gbs_negative_raises():
 def test_gbs_zero_raises():
     with pytest.raises(ValueError):
         build_from_args(TorchTurboArgs(gbs=0))
+
+
+def test_mega_moe_yaml_config(tmp_path):
+    path = _write(tmp_path, "mega.yaml", _engine_config("moe:\n  enable_mega_moe: true\n"))
+    config = _build_from_argv(["--tt_config", path])
+    assert config.moe.enable_mega_moe
+    assert not hasattr(config.moe, "local_token_capacity")
+    assert not _build_from_argv([]).moe.enable_mega_moe

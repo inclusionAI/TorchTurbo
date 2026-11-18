@@ -65,8 +65,8 @@ def test_completed_dispatch_stages_release_their_activation_buffers(monkeypatch)
     references = {}
 
     def observe_stage(name, stage):
-        def observed(*args):
-            result = stage(*args)
+        def observed(*args, **kwargs):
+            result = stage(*args, **kwargs)
             tensors = result if isinstance(result, tuple) else (result,)
             references[name] = [weakref.ref(tensor) for tensor in tensors]
             return result
@@ -372,3 +372,37 @@ def test_frozen_experts_preserve_the_router_gradient_graph(freeze_router):
         actual.sum().backward()
         expected.sum().backward()
         torch.testing.assert_close(layer.router.weight.grad, reference.router.weight.grad)
+
+
+def test_mega_moe_reads_fp32_master_weights_inside_expert_hooks(monkeypatch):
+    from torchturbo.ops.moe import MegaMoeContext
+    from torchturbo.ops.providers.npu.mega_moe import HmcMegaMoe
+    from torchturbo.ops import get_ops
+
+    layer = _layer(on_input=False, dtype=torch.float32)
+    order = []
+    layer.experts.register_forward_pre_hook(lambda module, args: order.append("unshard"))
+
+    class Executor(torch.nn.Module):
+        def forward(self, inputs, ids, probs, *, expert_weights):
+            assert order == ["unshard"]
+            assert ids.dtype == torch.int32 and probs.dtype == torch.float32
+            assert ids.shape == probs.shape == (6, 2)
+            w1, w2 = expert_weights
+            assert w1.shape == (2, 4, 6) and w2.shape == (2, 3, 4)
+            assert w1.dtype == w2.dtype == inputs.dtype == torch.bfloat16
+            coeff = probs[:, 0].reshape(3, 2, 1).to(inputs.dtype)
+            return inputs * coeff * (w1.mean() + w2.mean())
+
+    context = MegaMoeContext(object(), 4, 3, 2, 2, None, False)
+    provider = HmcMegaMoe()
+    provider._executors[context] = Executor()
+    monkeypatch.setattr(get_ops(), "mega_moe", provider)
+    from types import SimpleNamespace
+    layer.megakernel_experts = SimpleNamespace(context_for=lambda experts: context)
+    x = torch.randn(3, 2, 4, dtype=torch.bfloat16, requires_grad=True)
+    output, _ = layer(x)
+    output.float().sum().backward()
+    for p in (layer.experts.weight1, layer.experts.weight2, layer.router.weight):
+        assert p.grad is not None and p.grad.dtype == torch.float32
+    assert x.grad is not None

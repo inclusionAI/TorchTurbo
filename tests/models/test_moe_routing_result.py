@@ -70,3 +70,48 @@ def test_router_selected_weights_preserve_aux_and_z_loss_gradients(score_functio
     (selected * upstream).sum().backward()
     assert hidden.grad is not None
     assert router.weight.grad is not None
+
+
+@pytest.mark.parametrize("expert_bias", [False, True])
+def test_compact_router_matches_dense_gradients_and_bias_counts(expert_bias):
+    import copy
+
+    torch.manual_seed(31)
+    dense = TopKRouter(MoEConfig(
+        hidden_size=16, num_moe_experts=32, moe_router_topk=4,
+        moe_router_score_function="sigmoid", moe_router_dtype="fp32",
+        moe_router_enable_expert_bias=expert_bias, moe_aux_loss_coeff=0.1,
+        moe_z_loss_coeff=0.01, params_dtype=torch.float32,
+    ))
+    torch.nn.init.normal_(dense.weight, std=0.1)
+    compact = copy.deepcopy(dense)
+    x = torch.randn(4, 1, 16, requires_grad=True)
+    other = x.detach().clone().requires_grad_()
+    padded = torch.tensor([[False], [True], [False], [False]])
+    probs, mask, ids, _ = dense(x, padding_mask=padded)
+    selected, compact_mask, compact_ids, _ = compact(other, padding_mask=padded, routing_layout="topk")
+    reference = probs.gather(1, ids)
+    torch.testing.assert_close(compact_ids, ids)
+    torch.testing.assert_close(selected, reference)
+    if expert_bias:
+        torch.testing.assert_close(compact_mask, mask)
+        torch.testing.assert_close(compact.local_tokens_per_expert, dense.local_tokens_per_expert)
+    else:
+        assert compact_mask is None
+    upstream = torch.randn_like(selected)
+    reference.backward(upstream)
+    selected.backward(upstream)
+    torch.testing.assert_close(x.grad, other.grad)
+    torch.testing.assert_close(dense.weight.grad, compact.weight.grad)
+
+
+def test_topk_recompute_without_load_accounting_skips_assignment_mask():
+    router = TopKRouter(MoEConfig(
+        hidden_size=4, num_moe_experts=8, moe_router_topk=2,
+        moe_router_score_function="sigmoid", moe_router_enable_expert_bias=True,
+        params_dtype=torch.float32,
+    ))
+    hidden = torch.ones(3, 1, 4)
+    probs, mask, ids, _ = router(hidden, accumulate_tokens_per_expert=False, routing_layout="topk")
+    assert probs.shape == ids.shape == (3, 2)
+    assert mask is None
