@@ -1,0 +1,82 @@
+# Lint gate for pull requests: runs ruff check + ruff format --check on the
+# Python files actually touched by the PR (incremental gate).
+#
+# NOTE: this repo's pre-existing code is not lint-clean yet, so the check is
+# scoped to changed files instead of the whole tree. Fix locally with:
+#   ruff check --fix <files> && ruff format <files>
+
+name: PR Code Check
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  RUFF_VERSION: "0.17.3"
+
+jobs:
+  ruff:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install ruff
+        run: pip install ruff==${{ env.RUFF_VERSION }}
+
+      - name: Collect changed Python files
+        id: changed
+        run: |
+          set -eu
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            RANGE="${{ github.event.pull_request.base.sha }} ${{ github.sha }}"
+          elif [ "${{ github.event_name }}" = "push" ] && \
+               [ -n "${{ github.event.before }}" ] && \
+               git cat-file -e "${{ github.event.before }}" 2>/dev/null; then
+            RANGE="${{ github.event.before }} ${{ github.sha }}"
+          else
+            # push with unavailable before-sha (e.g. force push) or manual run:
+            # check the latest commit only.
+            RANGE="HEAD~1 HEAD"
+          fi
+          git diff --name-only --diff-filter=ACM $RANGE -- '*.py' > changed.txt
+          if [ -s changed.txt ]; then
+            echo "files<<EOF" >> "$GITHUB_OUTPUT"
+            cat changed.txt >> "$GITHUB_OUTPUT"
+            echo "EOF" >> "$GITHUB_OUTPUT"
+          else
+            echo "files=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run ruff lint and format check
+        run: |
+          set -eu
+          FILES="${{ steps.changed.outputs.files }}"
+          if [ -z "$FILES" ]; then
+            echo "No Python files changed — skipping lint check."
+            exit 0
+          fi
+          echo "Linting changed files:"
+          echo "$FILES" | sed 's/^/  - /'
+          failed=0
+          echo "$FILES" | xargs ruff check || failed=1
+          echo "$FILES" | xargs ruff format --check || failed=1
+          if [ "$failed" -eq 1 ]; then
+            echo ""
+            echo "=========================================="
+            echo "  Fix: ruff check --fix <files> && ruff format <files>"
+            echo "  Ruff version: ${{ env.RUFF_VERSION }}"
+            echo "=========================================="
+            exit 1
+          fi

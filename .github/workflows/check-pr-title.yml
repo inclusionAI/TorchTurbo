@@ -1,0 +1,54 @@
+# PR title gate: enforces the title convention documented in CONTRIBUTING.md —
+# the title must start with one of the allowed type prefixes, e.g. "feat: add HSDP support".
+
+name: Check PR Title
+
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize]
+
+permissions:
+  pull-requests: read
+
+jobs:
+  check-title:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check Title Format
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const title = context.payload.pull_request.title;
+
+            // ================= CONFIGURATION =================
+            // The 11 type prefixes required by CONTRIBUTING.md ("Create a pull request").
+            // Note: TorchTurbo uses plain type prefixes — no modules / [BREAKING] markers.
+            const allowedTypes = [
+              'fix', 'feat', 'docs', 'style', 'refactor', 'enhance',
+              'test', 'build', 'ci', 'chore', 'revert'
+            ];
+
+            // ================= LOGIC =================
+            // Regex breakdown:
+            // ^(type)     -> Title must start with an allowed type prefix
+            // (\(...\))?  -> Optional scope, e.g. "feat(parallel): ..." — still satisfies
+            //                "begins with a type prefix" per CONTRIBUTING.md
+            // :\s+        -> Colon followed by whitespace
+            // .+          -> Non-empty description
+            const regex = new RegExp(`^(${allowedTypes.join('|')})(\\([^)]+\\))?:\\s+.+`);
+
+            console.log(`Checking PR Title: "${title}"`);
+
+            if (!regex.test(title)) {
+              core.setFailed(
+                `❌ PR Title format error!\n\n` +
+                `Your title: "${title}"\n\n` +
+                `Expected format: "{type}: {description}"\n` +
+                `Allowed types: ${allowedTypes.join(', ')}\n` +
+                `Examples: "feat: add HSDP support", "fix: correct xxx OP precision"\n\n` +
+                `See the guide: https://github.com/inclusionAI/TorchTurbo/blob/main/CONTRIBUTING.md`
+              );
+              return;
+            }
+
+            console.log("✅ PR Title format is valid.");
