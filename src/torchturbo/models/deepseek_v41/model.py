@@ -141,6 +141,20 @@ class TurboDeepseekV41ForCausalLM(TurboVLMModel, DeepseekV41ForCausalLM):
         # Install the instance mHC helper before activation checkpointing,
         # so both the initial pass and recomputation use the same dispatch.
         # LI/KL patches target submodules and run in on_parallelized.
+        from torchturbo.runtime import is_npu_available
+
+        if is_npu_available():
+            from .npu import (
+                patch_deepseek_v41_npu_hc_post,
+                patch_deepseek_v41_npu_mhc,
+                patch_deepseek_v41_npu_rms_norm,
+            )
+
+            # mHC first: it validates the config constraints the hc_post
+            # patch relies on.
+            patch_deepseek_v41_npu_mhc(self)
+            patch_deepseek_v41_npu_rms_norm(self)
+            patch_deepseek_v41_npu_hc_post(self)
 
     def on_parallelized(self, parallel_context):
         sp_info = parallel_context["sp"]
