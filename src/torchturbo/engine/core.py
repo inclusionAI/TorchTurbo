@@ -364,9 +364,8 @@ class TorchTurboEngine:
             self.checkpoint.load_pretrained(model, model_name_or_path)
         else:
             self.backend.materialize(model)
-        self.backend.finalize_model_load(model)
-
         model.on_materialized()
+        self.backend.finalize_model_load(model)
         meta_tensor_names = has_meta_tensor(model)
         if meta_tensor_names:
             raise RuntimeError(

@@ -86,6 +86,7 @@ class FSDPPlanSpec:
     no_shard: bool = False
     standalone_world_shard: bool = False
     activation_checkpoint: bool = False
+    cast_forward_inputs: bool | None = None
     replace_module: Any | None = None
     module_kwargs: dict[str, Any] = field(default_factory=dict)
     vision_balance: VisionBalanceSpec | None = None
