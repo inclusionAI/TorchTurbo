@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
@@ -11,6 +12,7 @@ from torch.optim import Optimizer
 
 from ...base import BaseCheckpointManager
 from ....checkpoint.format import ComponentStatus
+from ....checkpoint.distributed import collective_check
 from .layout import MODEL_DCP_DIR, OPTIMIZER_DCP_DIR, dcp_status
 from .dcp import DcpCheckpoint
 from .weight_loader import DistParamLoader
@@ -21,6 +23,7 @@ if TYPE_CHECKING:
 
     from torchturbo.models.weight_converter import BaseWeightConverter
     from torchturbo.runtime import DeviceRuntime
+    from ..optimizers.engram import EngramOptimizer
 
 
 class FSDP2CheckpointManager(BaseCheckpointManager):
@@ -41,6 +44,7 @@ class FSDP2CheckpointManager(BaseCheckpointManager):
         device_runtime: DeviceRuntime,
         cpu_offload: bool,
         require_optimizer_not_suspended: Callable[[], None],
+        get_engram_optimizer: Callable[[], EngramOptimizer | None] = lambda: None,
     ) -> None:
         self._rank = rank
         self._mesh = mesh
@@ -48,6 +52,7 @@ class FSDP2CheckpointManager(BaseCheckpointManager):
         self._device_runtime = device_runtime
         self._cpu_offload = cpu_offload
         self._require_optimizer_not_suspended = require_optimizer_not_suspended
+        self._get_engram_optimizer = get_engram_optimizer
         self._dcp = DcpCheckpoint(
             ep_rank=parallel_context["ep"]["ep_rank"],
             ep_size=parallel_context["ep"]["ep_size"],
@@ -109,7 +114,10 @@ class FSDP2CheckpointManager(BaseCheckpointManager):
         optimizer: Optimizer,
         output_dir: str,
     ) -> None:
+        engram = self._get_engram_optimizer()
         self._dcp.save_optimizer(optimizer, model, output_dir)
+        if engram is not None:
+            engram.save(str(Path(output_dir).parent))
 
     def load_optimizer(
         self,
@@ -117,7 +125,10 @@ class FSDP2CheckpointManager(BaseCheckpointManager):
         optimizer: Optimizer,
         checkpoint_dir: str,
     ) -> None:
+        engram = self._get_engram_optimizer()
         self._dcp.load_optimizer(optimizer, model, checkpoint_dir)
+        if engram is not None:
+            engram.load(str(Path(checkpoint_dir).parent))
 
     def _hf_loader(
         self,

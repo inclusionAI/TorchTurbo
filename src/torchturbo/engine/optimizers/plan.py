@@ -159,7 +159,7 @@ class OptimizerPlan(ABC):
         named_parameters = tuple(
             (name, param)
             for name, param in model.named_parameters()
-            if param.requires_grad
+            if param.requires_grad and not getattr(param, "_engram_host_offload", False)
         )
         model_params_by_fqn = dict(named_parameters)
         claimed_param_ids: dict[int, tuple[str, str]] = {}
@@ -267,7 +267,7 @@ class OptimizerClassPlan(OptimizerPlan):
         # Megatron Core default: biases and 1-D parameters do not decay.
         # Reference: megatron.core.optimizer._get_param_groups
         for name, param in model.named_parameters():
-            if not param.requires_grad:
+            if not param.requires_grad or getattr(param, "_engram_host_offload", False):
                 continue
             if name.endswith(".bias") or param.ndim == 1:
                 no_decay.append(name)

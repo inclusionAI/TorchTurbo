@@ -4,7 +4,7 @@ import functools
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from types import MappingProxyType, MethodType
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 import torch.distributed as dist
@@ -60,6 +60,9 @@ from .optimizers.memory import OptimizerMemoryController
 from .prefetch import FSDPPrefetchManager
 
 logger = get_logger(__name__)
+
+if TYPE_CHECKING:
+    from .optimizers.engram import EngramOptimizer
 
 if torch_version() >= (2, 6, 0):
     from torch.distributed.fsdp._fully_shard import (
@@ -129,6 +132,8 @@ class FSDP2Backend(BaseBackend):
     """
 
     name = "fsdp2"
+    engram_optimizer: "EngramOptimizer | None" = None
+    _engram_tables: tuple = ()
 
     def __init__(self, config: EngineConfig, device_runtime: DeviceRuntime) -> None:
         super().__init__(config, device_runtime)
@@ -172,6 +177,8 @@ class FSDP2Backend(BaseBackend):
         self.gradient_scaling_factor = 1.0
         self.parallel_plan: FSDPParallelPlan = None
         self._resolved_parallel_plan: _ResolvedFSDPPlan | None = None
+        self.engram_optimizer = None
+        self._engram_tables = ()
 
     def _create_sp_group(self, sp_size: int) -> dist.ProcessGroup | None:
         """Create sequence parallel process group.
@@ -428,7 +435,7 @@ class FSDP2Backend(BaseBackend):
 
         world_group = dist.group.WORLD
         for param in no_shard_params:
-            if not param.requires_grad:
+            if not param.requires_grad or getattr(param, "_engram_host_offload", False):
                 continue
 
             def _grad_hook(p):
@@ -459,6 +466,12 @@ class FSDP2Backend(BaseBackend):
 
         # Phase 1: Module replacement (e.g., MoE layers).
         model = self._replace_modules(model, plan)
+        from torchturbo.models.deepseek_v41.host_offload_embedding import TorchHostOffloadEmbedding
+
+        self._engram_tables = tuple(
+            module for module in model.modules()
+            if isinstance(module, TorchHostOffloadEmbedding)
+        )
 
         # Phase 2: Apply LoRA (after module replacement, before sharding).
         if peft_config is not None:
@@ -539,6 +552,7 @@ class FSDP2Backend(BaseBackend):
             parallel_context=self.get_parallel_context(),
             device_runtime=self.device_runtime,
             cpu_offload=offload.enabled and offload.mode is CPUOffloadMode.FULL,
+            get_engram_optimizer=lambda: self.engram_optimizer,
             # The manager is created before prepare_optimizer().
             require_optimizer_not_suspended=(
                 lambda: self._optimizer_memory.require_not_suspended()
@@ -1417,6 +1431,14 @@ class FSDP2Backend(BaseBackend):
         if not isinstance(plan, OptimizerPlan):
             raise TypeError("plan must be an OptimizerPlan")
 
+        self._engram_tables = tuple(table for table in self._engram_tables if table.weight.requires_grad)
+        if self._engram_tables:
+            if not isinstance(plan, OptimizerClassPlan) or plan.optimizer_cls is not torch.optim.AdamW:
+                raise ValueError("Engram training requires dense AdamW.")
+            offload = self.fsdp_config.cpu_offload
+            if offload.enabled and offload.mode is CPUOffloadMode.FULL:
+                raise ValueError("Engram training does not support full CPU offload.")
+
         if isinstance(plan, OptimizerClassPlan):
             groups_by_optimizer_name = plan.get_param_groups_by_optimizer_name()
             expected_names = (plan.optimizer_name,)
@@ -1492,6 +1514,16 @@ class FSDP2Backend(BaseBackend):
             self.device_runtime,
             qk_clip_controller,
         )
+        if self._engram_tables:
+            from .optimizers.engram import EngramOptimizer
+
+            self.engram_optimizer = EngramOptimizer(
+                self._engram_tables, self._mesh["edp"].get_group(), self.device_runtime.device,
+            )
+            optimizer.register_step_pre_hook(
+                lambda _optimizer, _args, _kwargs: self.engram_optimizer.prepare_gradients()
+            )
+            optimizer.register_step_post_hook(self.engram_optimizer.after_step)
         return optimizer
 
     def offload_optimizer(self) -> None:
@@ -1521,7 +1553,7 @@ class FSDP2Backend(BaseBackend):
                 "ignored": [],
             }
             for param in param_group["params"]:
-                if not param.requires_grad:
+                if not param.requires_grad or getattr(param, "_engram_host_offload", False):
                     continue
                 if isinstance(param, DTensor):
                     if param.device_mesh == edp:
@@ -1647,6 +1679,11 @@ class FSDP2Backend(BaseBackend):
 
     @torch.no_grad()
     def clip_grad_norm_(self, parameters, max_norm=1.0, norm_type=2.0):
+        engram = self.engram_optimizer
+        if engram is not None:
+            if norm_type != 2.0:
+                raise ValueError("Engram training supports global L2 gradient clipping.")
+            engram.prepare_gradients()
         offload = self.fsdp_config.cpu_offload
         params = []
         grads = []
@@ -1689,6 +1726,8 @@ class FSDP2Backend(BaseBackend):
             edp_total_norm_list.append(edp_total_norm)
 
         all_norms = edp_total_norm_list
+        if engram is not None:
+            all_norms.append(engram.norm().to(self.device).unsqueeze(0))
         if grads:
             dp_total_norm = get_total_norm(grads, norm_type=norm_type)
             dp_total_norm = dp_total_norm.full_tensor().unsqueeze(0)
@@ -1723,6 +1762,9 @@ class FSDP2Backend(BaseBackend):
             clip_grads_with_norm_(params, max_norm, total_norm)
         if ignored_params:
             clip_grads_with_norm_(ignored_params, max_norm, total_norm)
+
+        if engram is not None:
+            engram.scale(float((max_norm / (total_norm + 1e-6)).clamp(max=1)))
 
         return total_norm
 

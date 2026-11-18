@@ -171,6 +171,7 @@ class TorchTurboArgs:
     ac_use_reentrant: bool = False
     ac_offload_input_to_cpu: bool = False
     ac_offload_large_inputs_to_cpu: bool = False
+    train_engram: bool = False
     indexer_kl_loss_coeff: float | None = None
     npu_memory_fraction: float | None = None
     cpu_offload: CPUOffloadConfig = field(default_factory=CPUOffloadConfig)
@@ -387,6 +388,14 @@ _TURBO_ARG_SPECS: tuple[TurboArgSpec, ...] = (
         metavar="BOOL",
         help="Offload activation checkpoint inputs of at least 64 MiB to CPU. "
         "Requires reentrant checkpointing.",
+    ),
+    TurboArgSpec(
+        name="train_engram",
+        args_name="train_engram",
+        cli_name="--tt_train_engram",
+        type=string_to_bool,
+        metavar="BOOL",
+        help="Train V4.1 Engram tables with sparse host Adam and dense projections.",
     ),
     TurboArgSpec(
         name="indexer_kl_loss_coeff",

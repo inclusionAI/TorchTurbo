@@ -24,7 +24,7 @@ logger = get_logger(__name__)
 _TABLE_ROW_ALIGNMENT = 2048
 
 
-def _torch_host_fetch(weight, row_ids, table):
+def _torch_host_fetch(weight, row_ids, table, ctx=None):
     """EP-routed CPU lookup using only PyTorch collectives and copies."""
     flat_ids = row_ids.reshape(-1)
     if flat_ids.numel() and (
@@ -76,9 +76,33 @@ def _torch_host_fetch(weight, row_ids, table):
         group=group,
     )
     selected = selected_ordered[torch.argsort(order)]
+    if ctx is not None:
+        ctx.table = table
+        ctx.send_sizes = send_sizes
+        ctx.recv_sizes = recv_sizes
+        ctx.save_for_backward(inverse, order, local_ids)
     return selected[inverse]
 
 
+class _TrainableHostFetch(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, weight, row_ids, table):
+        return _torch_host_fetch(weight, row_ids, table, ctx)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        inverse, order, local_ids = ctx.saved_tensors
+        table = ctx.table
+        unique_grads = grad_output.new_zeros((order.numel(), table.embedding_dim), dtype=torch.float32)
+        unique_grads.index_add_(0, inverse, grad_output.reshape(-1, table.embedding_dim).float())
+        owner_grads = unique_grads.new_empty((sum(ctx.recv_sizes), table.embedding_dim))
+        dist.all_to_all_single(
+            owner_grads, unique_grads[order],
+            output_split_sizes=ctx.recv_sizes, input_split_sizes=ctx.send_sizes,
+            group=table.ep_group,
+        )
+        table.pending_gradients.append((local_ids, owner_grads.cpu()))
+        return None, None, None
 
 
 class TorchHostOffloadEmbedding(nn.Module):
@@ -123,6 +147,7 @@ class TorchHostOffloadEmbedding(nn.Module):
         self.ep_rank = 0
         self.row_start = 0
         self.local_rows = physical_num_embeddings
+        self.pending_gradients: list[tuple[torch.Tensor, torch.Tensor]] = []
 
     def shard_(self, ep_group):
         """Materialize the owner-local CPU slice on the EP group."""
@@ -208,7 +233,10 @@ class TorchHostOffloadEmbedding(nn.Module):
                 f"Engram lookup has {indices.numel()} rows but capacity is "
                 f"{self.num_max_tokens_per_rank}."
             )
-        fetched = _torch_host_fetch(self.weight, indices.reshape(-1), self)
+        if self.weight.requires_grad and torch.is_grad_enabled():
+            fetched = _TrainableHostFetch.apply(self.weight, indices.reshape(-1), self)
+        else:
+            fetched = _torch_host_fetch(self.weight, indices.reshape(-1), self)
         return fetched.reshape(*indices.shape, self.embedding_dim)
 
 

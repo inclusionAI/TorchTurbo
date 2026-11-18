@@ -72,6 +72,17 @@ def test_checkpoint_input_offload_yaml_and_cli(tmp_path):
     assert not build_from_args(args).activation_checkpointing.offload_input_to_cpu
 
 
+def test_internal_runtime_training_flags():
+    args, remaining = parse_torchturbo_args([
+        "--tt_train_engram", "true", "--tt_indexer_kl_loss_coeff", "0.1",
+        "--tt_npu_memory_fraction", "0.9",
+    ])
+    assert not remaining
+    assert args.train_engram and args.indexer_kl_loss_coeff == 0.1
+    assert args.npu_memory_fraction == 0.9
+    assert "tt_train_engram" not in args.config_overrides
+
+
 def test_internal_megamoe_yaml(tmp_path):
     config_path = tmp_path / "mega.yaml"
     config_path.write_text(

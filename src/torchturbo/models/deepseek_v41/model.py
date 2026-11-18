@@ -271,7 +271,8 @@ class TurboDeepseekV41ForCausalLM(TurboVLMModel, DeepseekV41ForCausalLM):
         from torchturbo.runtime import get_device_runtime
 
         device = get_device_runtime().device
-        train_engram = False
+        args = get_torchturbo_args()
+        train_engram = args is not None and args.train_engram
         if self.engram_hash is not None:
             self.engram_hash.build(device, self._model_path)
         for module in self.modules():
@@ -283,7 +284,11 @@ class TurboDeepseekV41ForCausalLM(TurboVLMModel, DeepseekV41ForCausalLM):
                 else:
                     module.embed.init_rows_random()
                     module.init_params_random(device)
-                module.embed.weight.requires_grad_(train_engram)
+                # PEFT or an explicit freeze may precede host materialization.
+                # The training flag must not unfreeze an existing parameter.
+                module.embed.weight.requires_grad_(
+                    train_engram and module.embed.weight.requires_grad
+                )
                 if self.engram_hash is not None:
                     module.embed.hash_fingerprint = self.engram_hash.hash_fingerprint
         # Checkpoint assign can replace parameters and restore requires_grad.

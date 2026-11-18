@@ -15,11 +15,14 @@ model load hooks and extra state participate in restoration.
 from __future__ import annotations
 
 import time
+import json
+from pathlib import Path
 
 import torch
 import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
 import torch.nn as nn
+from torch.distributed.fsdp import FSDPModule
 from torch.distributed._shard.metadata import ShardMetadata
 from torch.distributed._shard.sharded_tensor import (
     Shard,
@@ -82,8 +85,14 @@ class DcpCheckpoint:
         return frozenset(
             fqn
             for fqn, param in model.named_parameters()
-            if isinstance(param, DTensor) and param.device_mesh == self.edp_mesh
+            if (isinstance(param, DTensor) and param.device_mesh == self.edp_mesh)
+            or (param.requires_grad and getattr(param, "_engram_host_offload", False))
         )
+
+    @staticmethod
+    def _engram_weight_names(model: nn.Module) -> set[str]:
+        return {name for name, param in model.named_parameters()
+                if param.requires_grad and getattr(param, "_engram_host_offload", False)}
 
     def _stamp_fqn(self, fqn: str, ep_fqns: frozenset[str]) -> str:
         if fqn not in ep_fqns:
@@ -263,6 +272,12 @@ class DcpCheckpoint:
             )
         start = time.perf_counter()
         dcp.save(state, checkpoint_id=dcp_dir)
+        engram_names = self._engram_weight_names(model)
+        if engram_names:
+            if dist.get_rank() == 0:
+                with (Path(dcp_dir) / "engram_layout.json").open("w") as handle:
+                    json.dump({"ep_size": self.ep_size, "tables": sorted(engram_names)}, handle)
+            dist.barrier()
         logger.info_rank0(
             "[save] model DCP saved to %s in %.2fs (%d entries)",
             dcp_dir, time.perf_counter() - start, len(state_dict),
@@ -270,6 +285,13 @@ class DcpCheckpoint:
 
     def load_model(self, model: nn.Module, dcp_dir: str) -> None:
         """Restore required model state, silently ignoring saved-only entries."""
+        engram_names = self._engram_weight_names(model)
+        layout_path = Path(dcp_dir) / "engram_layout.json"
+        if engram_names or layout_path.is_file():
+            with layout_path.open() as handle:
+                layout = json.load(handle)
+            if layout != {"ep_size": self.ep_size, "tables": sorted(engram_names)}:
+                raise ValueError("Engram model checkpoint requires the original EP layout and training mode.")
         ep_fqns = self._ep_partitioned_fqns(model)
         state_keys = {
             self._stamp_fqn(fqn, ep_fqns) for fqn in model.state_dict()
@@ -367,6 +389,14 @@ class DcpCheckpoint:
             return tuple(optimizer)
         return optimizer
 
+    @staticmethod
+    def _reshard_model(model: nn.Module) -> None:
+        # A no-grad forward can leave root FSDP parameters unsharded. Restore
+        # the parameter objects held by the optimizer before mapping to FQNs.
+        for module in model.modules():
+            if isinstance(module, FSDPModule):
+                module.reshard()
+
     def save_optimizer(
         self,
         optimizer: torch.optim.Optimizer,
@@ -374,6 +404,7 @@ class DcpCheckpoint:
         dcp_dir: str,
     ) -> None:
         """Save the optimizer state of ``model`` to ``dcp_dir``."""
+        self._reshard_model(model)
         options = StateDictOptions(full_state_dict=False)
         optimizers = self._unwrap_optimizer(optimizer)
         optim_state = get_optimizer_state_dict(model, optimizers, options=options)
@@ -394,6 +425,7 @@ class DcpCheckpoint:
         dcp_dir: str,
     ) -> None:
         """Restore optimizer state saved by :meth:`save_optimizer`."""
+        self._reshard_model(model)
         metadata = collective_check(lambda: FileSystemReader(dcp_dir).read_metadata())
         options = StateDictOptions(full_state_dict=False)
         optimizers = self._unwrap_optimizer(optimizer)
