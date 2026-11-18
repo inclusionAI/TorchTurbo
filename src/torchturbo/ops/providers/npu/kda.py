@@ -187,9 +187,11 @@ class ChunkKDAFunction(torch.autograd.Function):
             use_beta_sigmoid_in_kernel=ctx.use_beta_sigmoid_in_kernel,
         )
         dbias = None if dt_bias is None else dbias.reshape_as(dt_bias)
-        # Finalize already returns token-major gate/beta gradients.
+        # Finalize follows output_layout for all five input gradients.
+        # Gate/beta inputs to this autograd function are token-major.
         if packed:
             dg, dbeta = dg.unsqueeze(0), dbeta.unsqueeze(0)
+        dg, dbeta = dg.transpose(1, 2), dbeta.transpose(1, 2)
         return (
             dq,
             dk,
