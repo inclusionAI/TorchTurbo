@@ -242,8 +242,6 @@ def ascendc_chunk_kda(
         if cu_seqlens is not None:
             tensor = tensor.squeeze(0)
         inputs.append(tensor.contiguous())
-    # FP32 gate inputs avoid Prepare's BF16 path. Keep the cast in autograd.
-    g = g.float()
     output, final_state = ChunkKDAFunction.apply(
         *inputs,
         g,
