@@ -301,3 +301,44 @@ DATASET=/datasets/AM-Thinking-v1-Distilled/science.jsonl \
     MODEL=/models/Ling-3.0-flash OUTPUT_DIR=/torchturbo/output \
     bash scripts/runs/bailing_v3/swift_sft.sh
 ```
+
+### HyperMulticore MegaMoE on Ascend A3
+
+**CANN.** Use CANN 9.1.0 or later. Install CANN Toolkit and Ops, including
+`bisheng` and `asc_opc`.
+[HMC build guide](https://github.com/mindspore-ai/hyper-multicore/blob/1065f23ed66929b45baa8c2de3168cd825862b35/docs/build.md)
+
+**Clone and build.** Use Linux AArch64 with matching PyTorch and torch_npu installed.
+
+```bash
+git clone https://github.com/mindspore-ai/hyper-multicore.git
+cd hyper-multicore
+git checkout --detach 1065f23ed66929b45baa8c2de3168cd825862b35
+source /path/to/cann/set_env.sh
+python -m pip install -r requirements.txt -r requirements-build.txt
+bash build.sh --soc-list ascend910_93 --jobs 24
+```
+
+**Install.** Install the built wheel in the training environment and source the
+runtime environment before launching training.
+
+```bash
+python -m pip install dist/hyper_multicore-*.whl
+source /path/to/cann/set_env.sh
+source "$(command -v hyper_multicore_set_env.bash)"
+```
+
+**Use.** For BF16 full-parameter training with SwiGLU experts and EP size greater
+than one, add the following to the YAML passed to `--tt_config`.
+
+```yaml
+engine_config:
+  moe:
+    mega_moe:
+      enable: true
+      expert_balance: null
+```
+
+Set `expert_balance: hot_replica` to let less-loaded EP ranks temporarily
+copy hot experts and process some of their tokens. Omit the field or set it
+to `null` to use MegaMoE alone.

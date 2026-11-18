@@ -185,6 +185,21 @@ class GroupedMLP(torch.nn.Module):
         hidden_states = self.activation_func(hidden_states)
         return (hidden_states * probs).to(hidden_states.dtype)
 
+    def mega_moe_forward(
+        self,
+        hidden_states: torch.Tensor,
+        probs: torch.Tensor,
+        routing_map: torch.Tensor,
+        *,
+        ep_group: torch.distributed.ProcessGroup,
+        expert_indices: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, None]:
+        """Dispatch routed experts inside the registered FSDP forward boundary."""
+        return ops.mega_moe(
+            self, hidden_states, probs, routing_map,
+            ep_group=ep_group, expert_indices=expert_indices,
+        ), None
+
     def forward(
         self,
         permuted_local_hidden_states: torch.Tensor,

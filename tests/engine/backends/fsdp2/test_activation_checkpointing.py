@@ -104,6 +104,7 @@ def test_fsdp_checkpoint_preserves_expert_probability_dtype(
         moe_router_topk=1 if on_input else 2,
         moe_router_score_function="sigmoid", moe_apply_probs_on_input=on_input,
         moe_aux_loss_coeff=0.2, moe_z_loss_coeff=0.3,
+        moe_router_enable_expert_bias=True,
     )
     submodules = MoESubmodules(experts=ModuleSpec(module=GroupedMLP))
     candidate = MoELayer(config, dist.group.WORLD, submodules=submodules)
@@ -180,6 +181,9 @@ def test_fsdp_checkpoint_preserves_expert_probability_dtype(
         ):
             torch.testing.assert_close(parameter, ref_parameter)
         assert candidate._runtime_inputs is runtime_inputs
+        torch.testing.assert_close(
+            candidate.router.local_tokens_per_expert, reference.router.local_tokens_per_expert,
+        )
     assert expert_dtypes
     assert set(expert_dtypes) == {(torch.bfloat16, torch.float32)}
 

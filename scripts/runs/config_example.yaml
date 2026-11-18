@@ -117,6 +117,9 @@ engine_config:
     aux_loss_coeff: 0.0
     z_loss_coeff: 0.0
     token_dispatcher: alltoall
+    mega_moe:
+      enable: false               # Ascend A3, BF16, ep_size > 1
+      expert_balance: null        # null or hot_replica (NPU only)
 
   mtp:
     enabled: false

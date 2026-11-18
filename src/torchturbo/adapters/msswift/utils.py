@@ -58,7 +58,17 @@ def build_config_from_swift_args(args: Any) -> EngineConfig:
     if vars(args).get("rlhf_type") == "dpo" and tt.moe_aux_loss_coeff == 0.0:
         tt.moe_aux_loss_coeff = args.router_aux_loss_coef
 
-    return build_from_args(tt)
+    config = build_from_args(tt)
+    mega_moe = config.moe.mega_moe
+    if mega_moe.enable:
+        length = getattr(args, "max_length", None)
+        if getattr(args, "packing", False):
+            length = args.packing_length or length
+        if length is not None:
+            tokens = length * args.per_device_train_batch_size
+            sp = config.parallel_plan.sp_size
+            mega_moe.source_token_bound = (tokens + sp - 1) // sp
+    return config
 
 
 def build_lora_config_from_swift_args(args: Any) -> Any | None:

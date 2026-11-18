@@ -238,3 +238,12 @@ def test_parse_torchturbo_args_mtp_log_loss():
 
     assert args.mtp_log_loss is True
     assert remaining == ["--other"]
+
+
+def test_mega_moe_options_are_not_registered_as_cli_flags():
+    from torchturbo.engine.args import parse_torchturbo_args
+
+    flags = ["--tt_enable_mega_moe", "true", "--tt_moe_local_token_capacity", "256"]
+    args, remaining = parse_torchturbo_args(flags)
+    assert remaining == flags
+    assert not args.config_overrides

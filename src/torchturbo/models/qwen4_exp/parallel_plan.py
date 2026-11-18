@@ -36,6 +36,7 @@ def _replace_qwen4_moe(
         moe_router_pre_softmax=not text_config.norm_topk_prob,
         moe_aux_loss_coeff=engine_config.moe.aux_loss_coeff,
         moe_z_loss_coeff=engine_config.moe.z_loss_coeff,
+        mega_moe=engine_config.moe.mega_moe,
         moe_token_dispatcher_type=engine_config.moe.token_dispatcher,
     )
     moe_layer = MoELayer(
