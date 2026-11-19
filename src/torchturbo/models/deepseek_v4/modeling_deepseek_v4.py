@@ -20,6 +20,8 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import logging
 
+from torchturbo.engine.peft.weights import get_effective_weight
+
 from .configuration_deepseek_v4 import DeepseekV4Config
 
 logger = logging.get_logger(__name__)
@@ -691,7 +693,7 @@ class PostAttentionOps(nn.Module):
         o = torch.cat([o_nope, o_rope], dim=-1)
 
         o = o.view(bsz, seqlen, n_local_groups, -1)
-        wo_a_weight = wo_a.weight.view(n_local_groups, self.o_lora_rank, -1)
+        wo_a_weight = get_effective_weight(wo_a).view(n_local_groups, self.o_lora_rank, -1)
         o = torch.einsum("bsgd,grd->bsgr", o, wo_a_weight)
         return wo_b(o.reshape(bsz, seqlen, -1))
 

@@ -3,6 +3,7 @@
 This module collects all tensor-level operations on LoRA weights:
 
 - **Initialization**: :func:`init_lora_tensor`, :func:`get_peft_init_config`
+- **Forward weight view**: :func:`get_effective_weight`
 - **Delta computation**: :func:`compute_lora_delta_linear`,
   :func:`compute_lora_delta_grouped_mlp_w1`,
   :func:`compute_lora_delta_grouped_mlp_w2`, :func:`compute_dora_magnitude`
@@ -236,6 +237,29 @@ def compute_lora_delta_linear(lora_module: Any, weight_key: str) -> torch.Tensor
         delta = adapter_delta if delta is None else delta + adapter_delta
 
     return delta
+
+
+def get_effective_weight(module: nn.Module) -> torch.Tensor:
+    """Return a module's effective weight: base weight plus active LoRA deltas.
+
+    Serves forward paths that consume ``.weight`` directly (e.g. DeepSeek V4's
+    grouped o-projection absorption) instead of calling the module.  Unlike
+    :func:`compute_lora_delta_linear` this keeps autograd attached, so adapter
+    parameters receive gradients through the returned tensor.
+
+    Delegates to :func:`merge_lora_linear` so the forward-time effective
+    weight matches the save-time merge exactly, including DoRA magnitude
+    rescaling.  LoRA dropout cannot be expressed in a merged-weight view and
+    is skipped.
+    """
+    if isinstance(module, nn.Linear):
+        return module.weight
+    # Anything else is a PEFT-wrapped Linear (nn.Linear subclasses never get
+    # wrapped in place, peft.tuners.lora.Linear is a plain nn.Module).
+    weight = merge_lora_linear(module.base_layer.weight, module, "weight")
+    # merge_lora_linear accumulates in the adapter dtype; restore the base
+    # dtype that the absorption forward expects.
+    return weight.to(module.base_layer.weight.dtype)
 
 
 def merge_lora_linear(
