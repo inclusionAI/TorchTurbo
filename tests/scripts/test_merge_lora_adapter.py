@@ -81,39 +81,6 @@ def test_merges_standard_linear_lora(tmp_path):
     assert (output_dir / "config.json").is_file()
 
 
-def test_merges_fused_grouped_moe_lora(tmp_path):
-    base_gate_up = torch.randn(2, 4, 3, dtype=torch.bfloat16)
-    base_down = torch.randn(2, 3, 2, dtype=torch.bfloat16)
-    a = torch.randn(2, 3, 2)
-    b = torch.randn(2, 2, 4)
-    a2 = torch.randn(2, 2, 2)
-    b2 = torch.randn(2, 2, 3)
-    prefix = "model.mlp.experts"
-    merged, _ = _merge_and_load(
-        tmp_path,
-        {
-            f"{prefix}.gate_up_proj.weight": base_gate_up,
-            f"{prefix}.down_proj.weight": base_down,
-        },
-        {
-            f"base_model.model.{prefix}.lora_A.weight": a,
-            f"base_model.model.{prefix}.lora_B.weight": b,
-            f"base_model.model.{prefix}.lora_A2.weight": a2,
-            f"base_model.model.{prefix}.lora_B2.weight": b2,
-        },
-    )
-    w1 = (2.0 * (a @ b)).transpose(1, 2)
-    w2 = (2.0 * (a2 @ b2)).transpose(1, 2)
-    assert torch.equal(
-        merged[f"{prefix}.gate_up_proj.weight"],
-        (base_gate_up.float() + w1).to(torch.bfloat16),
-    )
-    assert torch.equal(
-        merged[f"{prefix}.down_proj.weight"],
-        (base_down.float() + w2).to(torch.bfloat16),
-    )
-
-
 @pytest.mark.parametrize("weight_suffix", ["", ".weight"])
 def test_merges_standard_per_expert_lora_into_fused_base(tmp_path, weight_suffix):
     base_gate_up = torch.randn(2, 4, 3, dtype=torch.bfloat16)
@@ -162,43 +129,57 @@ def test_merges_standard_per_expert_lora_into_fused_base(tmp_path, weight_suffix
     )
 
 
-def test_merges_per_expert_grouped_moe_lora(tmp_path):
-    base_gate = torch.randn(2, 3, dtype=torch.bfloat16)
-    base_up = torch.randn(2, 3, dtype=torch.bfloat16)
-    base_down = torch.randn(3, 2, dtype=torch.bfloat16)
-    a = torch.randn(2, 3, 2)
-    b = torch.randn(2, 2, 4)
-    a2 = torch.randn(2, 2, 2)
-    b2 = torch.randn(2, 2, 3)
+def test_merges_standard_per_expert_lora_into_physical_base(tmp_path):
     prefix = "model.mlp.experts"
-    merged, _ = _merge_and_load(
-        tmp_path,
-        {
-            f"{prefix}.0.gate_proj.weight": base_gate,
-            f"{prefix}.1.up_proj.weight": base_up,
-            f"{prefix}.1.down_proj.weight": base_down,
-        },
-        {
-            f"base_model.model.{prefix}.lora_A.weight": a,
-            f"base_model.model.{prefix}.lora_B.weight": b,
-            f"base_model.model.{prefix}.lora_A2.weight": a2,
-            f"base_model.model.{prefix}.lora_B2.weight": b2,
-        },
-    )
-    w1 = (2.0 * (a @ b)).transpose(1, 2)
-    w2 = (2.0 * (a2 @ b2)).transpose(1, 2)
-    assert torch.equal(
-        merged[f"{prefix}.0.gate_proj.weight"],
-        (base_gate.float() + w1[0, :2]).to(torch.bfloat16),
-    )
-    assert torch.equal(
-        merged[f"{prefix}.1.up_proj.weight"],
-        (base_up.float() + w1[1, 2:]).to(torch.bfloat16),
-    )
-    assert torch.equal(
-        merged[f"{prefix}.1.down_proj.weight"],
-        (base_down.float() + w2[1]).to(torch.bfloat16),
-    )
+    base = {}
+    adapter = {}
+    expected = {}
+
+    for expert in range(2):
+        for projection, output_size, input_size in (
+            ("gate_proj", 2, 3),
+            ("up_proj", 2, 3),
+            ("down_proj", 3, 2),
+        ):
+            base_weight = torch.randn(output_size, input_size, dtype=torch.bfloat16)
+            a = torch.randn(2, input_size)
+            b = torch.randn(output_size, 2)
+            base_key = f"{prefix}.{expert}.{projection}.weight"
+            base[base_key] = base_weight
+            adapter[f"base_model.model.{base_key}.lora_A.weight"] = a
+            adapter[f"base_model.model.{base_key}.lora_B.weight"] = b
+            expected[base_key] = (base_weight.float() + 2.0 * (b @ a)).to(
+                torch.bfloat16
+            )
+
+    merged, _ = _merge_and_load(tmp_path, base, adapter)
+    assert merged.keys() == expected.keys()
+    for key, expected_weight in expected.items():
+        assert torch.equal(merged[key], expected_weight)
+
+
+def test_rejects_legacy_grouped_moe_lora(tmp_path):
+    prefix = "model.mlp.experts"
+    adapter = {
+        f"base_model.model.{prefix}.lora_A.weight": torch.randn(2, 3, 2),
+        f"base_model.model.{prefix}.lora_B.weight": torch.randn(2, 2, 4),
+        f"base_model.model.{prefix}.lora_A2.weight": torch.randn(2, 2, 2),
+        f"base_model.model.{prefix}.lora_B2.weight": torch.randn(2, 3, 2),
+    }
+    adapter_dir = tmp_path / "adapter"
+    _write_adapter(adapter_dir, adapter, str(tmp_path / "base"))
+
+    with pytest.raises(ValueError, match="Unsupported adapter tensors"):
+        merge_lora_adapter.main(
+            [
+                "--base-dir",
+                str(tmp_path / "base"),
+                "--adapter-dir",
+                str(adapter_dir),
+                "--output-dir",
+                str(tmp_path / "output"),
+            ]
+        )
 
 
 def test_rejects_dora_and_incomplete_pairs(tmp_path):
