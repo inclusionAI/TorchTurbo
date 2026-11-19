@@ -1318,6 +1318,8 @@ class TorchTurboEngine:
                         total_loss.item(),
                     )
                 self._backward_loss(total_loss)
+                # Release cached blocks so allocator fragmentation does not accumulate across micro-batches.
+                torch.npu.empty_cache()
 
     @torch.no_grad()
     def compute_logprobs(
