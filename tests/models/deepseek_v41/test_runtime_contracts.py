@@ -313,6 +313,15 @@ def test_turbo_logits_does_not_mutate_head():
     assert tuple(holder.state_dict()) == keys and holder._modules["head"] is original
 
 
+def test_text_config_forms_and_moe_replacement_scope():
+    from torchturbo.models.deepseek_v41.configuration_deepseek_v41 import DeepseekV41Config, text_config_of
+    from torchturbo.models.deepseek_v41.parallel_plan import _replace_moe_only
+    text = config()
+    nested = DeepseekV41Config(text_config=text.to_dict(), vision_config={"num_hidden_layers": 0})
+    assert text_config_of(text) is text
+    assert text_config_of(nested) is nested.text_config
+    unrelated = torch.nn.Linear(2, 2)
+    assert _replace_moe_only(unrelated, text, {}, {}, None) is unrelated
 
 
 @pytest.mark.parametrize("nested", [False, True])
@@ -367,3 +376,12 @@ def test_window_only_execution_accepts_unused_compression_state(monkeypatch, emp
         torch.testing.assert_close(a, e, rtol=0, atol=0)
     if empty_selection:
         assert torch.autograd.grad(actual.sum(), compressed)[0].shape == compressed.shape
+
+
+def test_unknown_dtype_is_not_silently_replaced_with_fp32():
+    from types import SimpleNamespace
+    from torchturbo.models.deepseek_v41.parallel_plan import _dtype_from_config
+    assert _dtype_from_config(SimpleNamespace(torch_dtype="bf16")) == torch.bfloat16
+    assert _dtype_from_config(SimpleNamespace(torch_dtype=None)) == torch.float32
+    with pytest.raises(KeyError):
+        _dtype_from_config(SimpleNamespace(torch_dtype="bfloatl6"))

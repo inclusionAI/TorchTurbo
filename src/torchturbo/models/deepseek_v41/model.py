@@ -163,8 +163,6 @@ class TurboDeepseekV41ForCausalLM(TurboVLMModel, DeepseekV41ForCausalLM):
             patch_deepseek_v41_npu_hc_post(self)
 
     def on_parallelized(self, parallel_context):
-        if parallel_context["ep"]["ep_size"] != 1:
-            raise NotImplementedError("DeepSeek V4.1 EP is introduced in stage 4.")
         sp_info = parallel_context["sp"]
         self._sp_group = sp_info["sp_group"]
         self._sp_size = sp_info["sp_size"]

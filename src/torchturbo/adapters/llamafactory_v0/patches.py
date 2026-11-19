@@ -206,6 +206,12 @@ class RunExpPatch(BasePatch):
                 raw_args=raw_args,
             )
 
+            if config.mega_moe:
+                from ...optimizations.mega_moe.integration import configure_token_capacity
+
+                configure_token_capacity(
+                    config, data_args.cutoff_len, training_args.per_device_train_batch_size,
+                )
             engine = TorchTurboEngine(config)
 
             adapter.engine = engine

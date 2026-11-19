@@ -453,7 +453,7 @@ def test_parallelized_hook_always_installs_fused(monkeypatch, legacy_backend) ->
         monkeypatch.delenv("SPARSE_MLA_BACKEND", raising=False)
     else:
         monkeypatch.setenv("SPARSE_MLA_BACKEND", legacy_backend)
-    TurboDeepseekV41ForCausalLM.on_parallelized(model, {"ep": {"ep_size": 1}, "sp": {"sp_size": 1, "sp_rank": 0, "sp_group": None}})
+    TurboDeepseekV41ForCausalLM.on_parallelized(model, {"sp": {"sp_size": 1, "sp_rank": 0, "sp_group": None}})
     assert registered == [True]
     assert model.attention.forward.__func__ is _npu_sfa
 
@@ -507,9 +507,9 @@ def test_indexer_bundle_preserves_mla_and_reference(monkeypatch, missing) -> Non
     raises = missing in ("li", "kl")
     if raises:
         with pytest.raises(RuntimeError, match="NPU training requires"):
-            TurboDeepseekV41ForCausalLM.on_parallelized(model, {"ep": {"ep_size": 1}, "sp": {"sp_size": 1, "sp_rank": 0, "sp_group": None}})
+            TurboDeepseekV41ForCausalLM.on_parallelized(model, {"sp": {"sp_size": 1, "sp_rank": 0, "sp_group": None}})
     else:
-        TurboDeepseekV41ForCausalLM.on_parallelized(model, {"ep": {"ep_size": 1}, "sp": {"sp_size": 1, "sp_rank": 0, "sp_group": None}})
+        TurboDeepseekV41ForCausalLM.on_parallelized(model, {"sp": {"sp_size": 1, "sp_rank": 0, "sp_group": None}})
     assert model.attention.inner_attention_ops.forward.__func__ is npu._npu_sfa
     if not raises:
         assert model._npu_sfa_li_patched is True

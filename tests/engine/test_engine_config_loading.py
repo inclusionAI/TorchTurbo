@@ -57,6 +57,20 @@ def _isolate_env(monkeypatch):
     monkeypatch.delenv("TT_OUTPUT_DIR", raising=False)
 
 
+def test_internal_megamoe_yaml(tmp_path):
+    config_path = tmp_path / "mega.yaml"
+    config_path.write_text(
+        "engine_config:\n  mega_moe: true\n"
+    )
+    args, remaining = parse_torchturbo_args([
+        "--tt_config", str(config_path),
+    ])
+    config = build_from_args(args)
+    assert remaining == []
+    assert config.mega_moe
+    assert EngineConfig.from_dict(config.to_dict()).mega_moe
+
+
 def _write(tmp_path, name: str, content: str) -> str:
     path = tmp_path / name
     path.write_text(content, encoding="utf-8")

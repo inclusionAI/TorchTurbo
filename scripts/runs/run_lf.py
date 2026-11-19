@@ -22,6 +22,7 @@ Usage:
 from __future__ import annotations
 
 import os
+import runpy
 import sys
 
 
@@ -49,6 +50,10 @@ def auto_detect_dataset_dir() -> str | None:
 
 
 def main():
+    bootstrap = os.path.join(
+        _REPO_SRC, "torchturbo", "optimizations", "mega_moe", "bootstrap.py",
+    )
+    runpy.run_path(bootstrap)["activate"](sys.argv[1:])
     import torchturbo
     from torchturbo.engine.args import parse_torchturbo_args, set_torchturbo_args
 
