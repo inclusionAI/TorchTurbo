@@ -45,7 +45,7 @@ def routing():
         ],
         requires_grad=True,
     )
-    return tokens, probs, probs.detach().bool()
+    return tokens, probs, probs.detach().bool(), torch.tensor([[0, 2], [1, 2], [0, 1]])
 
 
 @pytest.fixture
@@ -104,10 +104,10 @@ def test_missing_custom_backend_obeys_policy(monkeypatch, runtime_cls, policy, r
     monkeypatch.setitem(sys.modules, "torch_npu", None)
     monkeypatch.setitem(sys.modules, "transformer_engine.pytorch.permutation", None)
     _configure_ops(monkeypatch, runtime_cls(), default_policy=policy)
-    tokens, probs, mask = routing
+    tokens, probs, mask, indices = routing
     if policy == OpPolicy.CUSTOM:
         with pytest.raises(RuntimeError, match="policy=custom"):
-            ops.moe_permutation(tokens, mask, probs=probs)
+            ops.moe_permutation(tokens, indices, probs=probs.gather(1, indices))
         mapping = MoEPermutation(
             tokens,
             None,
@@ -119,7 +119,7 @@ def test_missing_custom_backend_obeys_policy(monkeypatch, runtime_cls, policy, r
         with pytest.raises(RuntimeError, match="policy=custom"):
             ops.moe_sort_chunks(tokens, torch.tensor([1, 2]), torch.tensor([1, 0]))
         return
-    mapping = ops.moe_permutation(tokens, mask, probs=probs)
+    mapping = ops.moe_permutation(tokens, indices, probs=probs.gather(1, indices))
     output = ops.moe_unpermutation(mapping, tokens.shape, probs=probs)
     torch.testing.assert_close(output, torch.tensor([[7.5], [17.5], [11.25]]))
     output.sum().backward()
@@ -151,6 +151,29 @@ def test_npu_chunk_sort_obeys_policy_and_restores_gradients(
     assert bool(npu_boundary.calls) == (policy == OpPolicy.AUTO and num_tokens > 0)
 
 
+@pytest.mark.parametrize("columns", [1, 3])
+@pytest.mark.parametrize("empty", [False, True])
+def test_chunk_probability_rows_preserve_shape_and_independent_gradients(
+    npu_boundary, columns, empty,
+):
+    length = 0 if empty else 5
+    tokens = torch.arange(length).float()[:, None].requires_grad_()
+    storage = torch.arange(length * 4 * columns).float().view(length * 2, columns * 2)
+    probs = storage[::2, ::2].detach().requires_grad_()
+    sizes = torch.tensor([0, 0, 0]) if empty else torch.tensor([2, 0, 3])
+    order = torch.tensor([2, 1, 0])
+    output, weights = ops.moe_sort_chunks(
+        tokens, sizes, order, probs, impl="npu_moe_sort_chunks",
+    )
+    source_rows = torch.empty(0, dtype=torch.long) if empty else torch.tensor([2, 3, 4, 0, 1])
+    assert weights.shape == probs.shape
+    torch.testing.assert_close(weights, probs[source_rows])
+    torch.testing.assert_close(output, tokens[source_rows])
+    (output * weights).sum().backward()
+    torch.testing.assert_close(tokens.grad, probs.detach().sum(1, keepdim=True))
+    torch.testing.assert_close(probs.grad, tokens.detach().expand_as(probs))
+
+
 @pytest.mark.parametrize("policy", list(OpPolicy))
 @pytest.mark.parametrize("use_override", [False, True])
 def test_native_policy_and_explicit_override_select_the_requested_provider(
@@ -173,8 +196,8 @@ def test_native_policy_and_explicit_override_select_the_requested_provider(
     _configure_ops(
         monkeypatch, NpuRuntime(), default_policy=policy, overrides=overrides
     )
-    tokens, probs, mask = routing
-    mapping = ops.moe_permutation(tokens, mask)
+    tokens, probs, mask, indices = routing
+    mapping = ops.moe_permutation(tokens, indices)
     output = ops.moe_unpermutation(mapping, tokens.shape, probs=probs)
     torch.testing.assert_close(output, torch.tensor([[7.5], [17.5], [11.25]]))
     chunks, _ = ops.moe_sort_chunks(tokens, torch.tensor([1, 2]), torch.tensor([1, 0]))
@@ -193,7 +216,7 @@ def test_cuda_empty_permutation_preserves_probability_dtype_and_gradients(
     # An available TE provider must bypass kernels on empty source ranks.
     tokens = torch.empty(0, 4, dtype=torch.bfloat16)
     probs = torch.empty(0, 2, dtype=dtype, requires_grad=True)
-    mapping = ops.moe_permutation(tokens, torch.empty(0, 2, dtype=torch.bool), probs=probs)
+    mapping = ops.moe_permutation(tokens, torch.empty(0, 2, dtype=torch.long), probs=probs)
     packed = mapping.tokens
     packed_probs = mapping.probs
     assert packed.dtype == tokens.dtype
@@ -249,12 +272,12 @@ def test_missing_cuda_shared_libraries_obeys_policy(
 
     monkeypatch.setattr(builtins, "__import__", import_without_nvrtc)
     _configure_ops(monkeypatch, CudaRuntime(), default_policy=policy)
-    tokens, probs, mask = routing
+    tokens, probs, mask, indices = routing
     if policy == OpPolicy.CUSTOM:
         with pytest.raises(RuntimeError, match="No implementation.*te_moe_"):
-            ops.moe_permutation(tokens, mask, probs=probs)
+            ops.moe_permutation(tokens, indices, probs=probs.gather(1, indices))
     else:
-        mapping = ops.moe_permutation(tokens, mask, probs=probs)
+        mapping = ops.moe_permutation(tokens, indices, probs=probs.gather(1, indices))
         output = ops.moe_unpermutation(mapping, tokens.shape, probs=probs)
         torch.testing.assert_close(output, torch.tensor([[7.5], [17.5], [11.25]]))
 
@@ -334,14 +357,16 @@ def test_cuda_roundtrip_matches_native_tokens_and_probability_gradients(
         [[0.25, 0.0, 0.5], [0.0, 0.75, 0.125], [0.125, 0.25, 0.0]],
         device=runtime.device,
     )[:num_tokens].requires_grad_()
-    mask = probs.detach().bool()
-    weights = probs if dispatch_probs else None
+    indices = torch.tensor([[0, 2], [1, 2], [0, 1]], device=runtime.device)[:num_tokens]
+    weights = probs.gather(1, indices) if dispatch_probs else None
     native_mapping = dispatcher.moe_permutation(
-        tokens, mask, probs=weights, impl="torch_moe_mask_permutation"
+        tokens, indices, probs=weights, impl="torch_moe_mask_permutation"
     )
     native_packed = native_mapping.tokens
     native_probs = native_mapping.probs
-    mapping = ops.moe_permutation(tokens, mask, probs=weights)
+    mapping = ops.moe_permutation(
+        tokens, indices, probs=weights, impl="te_moe_mask_permutation",
+    )
     packed = mapping.tokens
     packed_probs = mapping.probs
     torch.testing.assert_close(packed, native_packed)
@@ -385,3 +410,19 @@ def test_cuda_roundtrip_matches_native_tokens_and_probability_gradients(
     actual_grads = torch.autograd.grad(output.sum(), (tokens, probs))
     for actual, expected in zip(actual_grads, expected_grads):
         torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.skipif(not is_cuda_available(), reason="CUDA is unavailable")
+@pytest.mark.parametrize("dtype,large", [(torch.bfloat16, 256), (torch.float16, 2048)])
+def test_cuda_compact_permutation_backward_keeps_small_contributions(monkeypatch, dtype, large):
+    pytest.importorskip("transformer_engine.pytorch.permutation")
+    runtime = CudaRuntime()
+    dispatcher = _configure_ops(monkeypatch, runtime)
+    tokens = torch.ones(1, 128, device=runtime.device, dtype=dtype, requires_grad=True)
+    mapping = dispatcher.moe_permutation(
+        tokens, torch.tensor([[0, 1, 2]], device=runtime.device),
+        impl="te_moe_mask_permutation",
+    )
+    gradient = torch.tensor([[large], [1], [-large]], device=runtime.device, dtype=dtype)
+    mapping.tokens.backward(gradient.expand_as(mapping.tokens))
+    torch.testing.assert_close(tokens.grad, torch.ones_like(tokens), rtol=0, atol=0)

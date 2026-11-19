@@ -89,6 +89,12 @@ def _check_moe(
     ref_inputs = [x.detach().clone().requires_grad_(not freeze_inputs) for x in inputs]
     # Finish both forwards before backward to expose overwritten routing metadata.
     outputs = [candidate(x)[0] for x in inputs]
+    dispatcher = candidate.token_dispatcher
+    assert (
+        dispatcher.permutation_row_indices is None
+        and dispatcher.permutation_expert_indices is None
+        and dispatcher.num_global_tokens_per_local_expert is None
+    )
     expected = [reference(x)[0] for x in ref_inputs]
     context = (
         f"rank={rank}, EP={ep_size}, empty_source={empty_source}, "
@@ -102,6 +108,11 @@ def _check_moe(
     for actual, ref in zip(outputs, expected, strict=True):
         torch.testing.assert_close(actual, ref, msg=failure_message)
     sum(y.square().sum() for y in outputs).backward()
+    assert (
+        dispatcher.permutation_row_indices is None
+        and dispatcher.permutation_expert_indices is None
+        and dispatcher.num_global_tokens_per_local_expert is None
+    )
     sum(y.square().sum() for y in expected).backward()
     if use_reentrant:
         assert forward_modes == [False, False, True, True], context

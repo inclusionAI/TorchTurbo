@@ -16,7 +16,9 @@ class _TokenPermutation(torch.autograd.Function):
     def forward(ctx, tokens, expert_indices):
         from torch_npu import npu_moe_token_permute
 
-        output, inverse = npu_moe_token_permute(tokens, expert_indices)
+        output, inverse = npu_moe_token_permute(
+            tokens.contiguous(), expert_indices.contiguous(),
+        )
         ctx.save_for_backward(inverse)
         ctx.assignment_shape = expert_indices.shape
         return output, inverse
@@ -70,12 +72,11 @@ class NpuMoEMaskPermutation(OpImpl):
     def __call__(
         self,
         tokens: torch.Tensor,
-        routing_map: torch.Tensor,
+        expert_indices: torch.Tensor,
         probs: torch.Tensor | None = None,
         num_out_tokens: int | None = None,
-        expert_indices: torch.Tensor | None = None,
     ) -> MoEPermutation:
-        """Group fixed-top-k tokens and retain expert indices for probability gather."""
+        """Group compact assignments and pack their corresponding probabilities."""
         if num_out_tokens == 0:
             inverse = torch.empty_like(expert_indices, dtype=torch.int32)
             permuted_probs = None if probs is None else probs.reshape(-1)[:0]
@@ -83,7 +84,7 @@ class NpuMoEMaskPermutation(OpImpl):
         output, inverse = _TokenPermutation.apply(tokens, expert_indices)
         permuted_probs = None
         if probs is not None:
-            selected_probs = probs.gather(1, expert_indices).flatten()
+            selected_probs = probs.flatten()
             # Each token/top-k slot maps to its row in the packed tensor.
             permuted_probs = torch.empty_like(selected_probs).index_put(
                 (inverse.long(),), selected_probs,

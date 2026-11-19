@@ -35,6 +35,9 @@ def _replace_qwen3_5_moe_only(
         moe_aux_loss_coeff=engine_config.moe.aux_loss_coeff,
         moe_z_loss_coeff=engine_config.moe.z_loss_coeff,
         moe_token_dispatcher_type=engine_config.moe.token_dispatcher,
+        moe_virtual_expert_load_balance=(
+            engine_config.moe.virtual_expert_load_balance
+        ),
     )
     moe_config = MoEConfig(**moe_config_kwargs)
 

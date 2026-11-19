@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import logging
+import sys
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -122,6 +123,141 @@ def test_provider_modules_are_discovered_from_provider_packages():
         "torchturbo.ops.providers.native.matmul_add"
         in cpu_modules
     )
+
+
+@pytest.mark.parametrize("explicit_native_weight", [False, True])
+def test_npu_triton_planner_can_select_native_weights(monkeypatch, explicit_native_weight):
+    from torchturbo.ops.providers.native.virtual_expert_weight_exchange import (
+        TorchVirtualExpertWeightExchange,
+    )
+    from torchturbo.ops.providers.npu.plan_virtual_expert_routes import NpuPlanVirtualExpertRoutes
+
+    # Check provider selection without claiming to execute an NPU kernel.
+    monkeypatch.setattr(NpuPlanVirtualExpertRoutes, "available", lambda self: True)
+    overrides = {"plan_virtual_expert_routes": "npu_triton_plan_virtual_expert_routes"}
+    if explicit_native_weight:
+        overrides["virtual_expert_weight_exchange"] = "torch_virtual_expert_weight_exchange"
+    dispatcher = OpDispatcher(
+        device_runtime=NpuRuntime(), registry=ops_registry,
+        default_policy=OpPolicy.NATIVE, overrides=overrides,
+    )
+    planner = dispatcher._candidate_impl(
+        "plan_virtual_expert_routes", TurboDevice.NPU,
+        impl=overrides["plan_virtual_expert_routes"],
+    )
+    weight = dispatcher._candidate_impl(
+        "virtual_expert_weight_exchange", TurboDevice.NPU,
+        impl=overrides.get("virtual_expert_weight_exchange"),
+    )
+    assert isinstance(planner, NpuPlanVirtualExpertRoutes)
+    assert isinstance(weight, TorchVirtualExpertWeightExchange)
+    weight_specs = ops_registry.list(lambda spec: spec.op_name == "virtual_expert_weight_exchange")
+    assert {spec.impl_name for spec in weight_specs} == {
+        "torch_virtual_expert_weight_exchange", "npu_shmem_virtual_expert_weight_exchange",
+    }
+
+
+@pytest.mark.parametrize("policy", [OpPolicy.AUTO, OpPolicy.CUSTOM, OpPolicy.NATIVE])
+def test_npu_shmem_weight_selection_preserves_native_policy(monkeypatch, policy):
+    from torchturbo.ops.providers.npu.virtual_expert_weight_exchange import (
+        NpuShmemVirtualExpertWeightExchange,
+    )
+    monkeypatch.setattr(NpuShmemVirtualExpertWeightExchange, "available", lambda self: True)
+    dispatcher = OpDispatcher(
+        device_runtime=NpuRuntime(), registry=ops_registry, default_policy=policy,
+    )
+    selected = dispatcher._candidate_impl("virtual_expert_weight_exchange", TurboDevice.NPU)
+    assert isinstance(selected, NpuShmemVirtualExpertWeightExchange) == (policy != OpPolicy.NATIVE)
+
+
+@pytest.mark.parametrize("policy", [OpPolicy.AUTO, OpPolicy.CUSTOM, OpPolicy.NATIVE])
+def test_npu_shmem_gradient_selection_preserves_native_policy(monkeypatch, policy):
+    from torchturbo.ops.providers.npu.virtual_expert_grad_reduce import (
+        NpuShmemVirtualExpertGradReduce,
+    )
+    monkeypatch.setattr(NpuShmemVirtualExpertGradReduce, "available", lambda self: True)
+    dispatcher = OpDispatcher(
+        device_runtime=NpuRuntime(), registry=ops_registry, default_policy=policy,
+    )
+    selected = dispatcher._candidate_impl("virtual_expert_grad_reduce", TurboDevice.NPU)
+    assert isinstance(selected, NpuShmemVirtualExpertGradReduce) == (policy != OpPolicy.NATIVE)
+
+
+def test_npu_shmem_rejects_mixed_fc_dtypes_before_allocating(monkeypatch):
+    from torchturbo.ops.providers.npu.virtual_expert_weight_exchange import (
+        NpuShmemVirtualExpertWeightExchange,
+    )
+    from torchturbo.ops.providers.native.virtual_expert_weight_exchange import build_weight_exchange_context
+
+    def unsafe_allocation(*args, **kwargs):
+        raise AssertionError("Mixed FC dtypes reached SHMEM allocation")
+
+    monkeypatch.setattr(NpuRuntime, "allocate_communication_buffer", unsafe_allocation)
+    context = build_weight_exchange_context(torch.full((1, 2), -1), None)
+    with pytest.raises(ValueError, match="same dtype"):
+        NpuShmemVirtualExpertWeightExchange()(
+            torch.ones(2, 3, 4, dtype=torch.bfloat16),
+            torch.ones(2, 4, 3, dtype=torch.float32), None, None, context,
+        )
+
+
+def test_npu_shmem_empty_standalone_calls_reuse_allocations(monkeypatch):
+    from torchturbo.ops.providers.npu.virtual_expert_weight_exchange import (
+        NpuShmemVirtualExpertWeightExchange,
+    )
+    from torchturbo.ops.providers.native.virtual_expert_weight_exchange import build_weight_exchange_context
+
+    allocations = []
+
+    def allocate(self, numel, *, dtype, device, group):
+        tensor = torch.empty(numel, dtype=dtype, device=device)
+        allocations.append(tensor)
+        return tensor, None
+
+    monkeypatch.setattr(NpuRuntime, "allocate_communication_buffer", allocate)
+    provider = NpuShmemVirtualExpertWeightExchange()
+    context = build_weight_exchange_context(torch.full((1, 2), -1), None)
+    weights = (torch.ones(2, 3, 7), torch.ones(2, 7, 5))
+    for _ in range(4):
+        result = provider(*weights, None, None, context)
+        assert result[0].shape[0] == result[1].shape[0] == 0
+    assert len(allocations) == 2
+
+
+@pytest.mark.parametrize("default_group", [False, True])
+def test_npu_planner_workspace_rejects_another_group_before_stream_use(monkeypatch, default_group):
+    from torchturbo.ops.moe import VirtualExpertPlannerWorkspace
+    from torchturbo.ops.providers.npu.plan_virtual_expert_routes import _prepare_workspace
+
+    allocations = []
+    waited = []
+
+    def allocate(self, numel, *, dtype, device, group):
+        allocations.append(group)
+        return torch.empty(numel, dtype=dtype, device=device), object()
+
+    monkeypatch.setitem(sys.modules, "torch_npu", SimpleNamespace())
+    monkeypatch.setattr(NpuRuntime, "allocate_communication_buffer", allocate)
+    stream = SimpleNamespace(wait_event=waited.append)
+    monkeypatch.setattr(torch, "npu", SimpleNamespace(current_stream=lambda: stream), raising=False)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: 2)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda group: 0)
+    group = None if default_group else object()
+    workspace = VirtualExpertPlannerWorkspace(
+        num_experts=4, device=torch.device("cpu"), group=group, runtime=NpuRuntime(),
+    )
+    handle = workspace.histogram_handle
+    assert handle is not None
+    assert allocations == [group]
+    workspace.last_use = object()
+    _prepare_workspace(workspace, group)
+    assert allocations == [group]
+    assert workspace.histogram_handle is handle
+    assert waited == [workspace.last_use]
+    with pytest.raises(ValueError, match="different EP group"):
+        _prepare_workspace(workspace, object())
+    assert allocations == [group]
+    assert waited == [workspace.last_use]
 
 
 def test_custom_policy_errors_when_no_cpu_custom_impl_exists():
@@ -732,7 +868,9 @@ def test_dispatcher_logs_selected_ops(caplog):
         key[0] for key in dispatcher._candidate_impl_cache
     } >= {
         "attention_with_max_logits", "cross_entropy_loss",
-        "grouped_matmul", "rms_norm", "swiglu",
+        "grouped_matmul", "hybrid_ep_combine", "hybrid_ep_dispatch",
+        "plan_virtual_expert_routes", "rms_norm", "swiglu",
+        "virtual_expert_weight_exchange",
     }
     dispatcher.log_ops_selection()
 

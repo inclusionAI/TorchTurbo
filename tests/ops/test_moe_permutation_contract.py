@@ -73,8 +73,8 @@ def test_permutation_returns_a_complete_result():
     dispatcher = OpDispatcher(device_runtime=CpuRuntime(), registry=registry)
     result = dispatcher.moe_permutation(
         torch.tensor([[2.0], [3.0]]),
-        torch.tensor([[False, True], [True, False]]),
-        probs=torch.tensor([[0.0, 0.5], [0.25, 0.0]]),
+        torch.tensor([[1], [0]]),
+        probs=torch.tensor([[0.5], [0.25]]),
     )
     assert isinstance(result, MoEPermutation)
     torch.testing.assert_close(result.tokens, torch.tensor([[3.0], [2.0]]))
@@ -84,12 +84,14 @@ def test_permutation_returns_a_complete_result():
     )
 
 
-def test_native_empty_permutation_without_cached_experts_keeps_gradients():
+def test_native_empty_permutation_keeps_topk_and_gradients():
     dispatcher = OpDispatcher(device_runtime=CpuRuntime(), registry=registry)
     tokens = torch.empty(0, 4, requires_grad=True)
     probs = torch.empty(0, 3, requires_grad=True)
-    mapping = dispatcher.moe_permutation(tokens, probs.detach().bool(), probs=probs)
-    assert mapping.row_indices.shape == (0, 0)
+    mapping = dispatcher.moe_permutation(
+        tokens, torch.empty(0, 3, dtype=torch.int64), probs=probs,
+    )
+    assert mapping.row_indices.shape == (0, 3)
     output = dispatcher.moe_unpermutation(mapping, tokens.shape, probs)
     output.sum().backward()
     torch.testing.assert_close(output, tokens)
@@ -177,30 +179,34 @@ def test_empty_unpermutation_recomputes_before_returning_input_gradients(
 def cuda_ops(monkeypatch):
     backend = ModuleType("transformer_engine.pytorch.permutation")
 
-    def permute(tokens, mask, num_out_tokens):
-        # TE's documented mask map packs row IDs and expert IDs per token.
-        # Reverse the per-token slots to exercise their paired semantics.
-        experts, rows = mask.T.nonzero(as_tuple=True)
-        num_tokens, num_experts = mask.shape
-        mapping = torch.full((num_tokens, num_experts * 2 + 1), -1, dtype=torch.int32)
-        counts = mask.sum(1)
-        mapping[:, -1] = counts
-        used = [0] * num_tokens
-        for packed_row, (expert, token) in enumerate(
-            zip(experts.tolist(), rows.tolist())
-        ):
-            slot = int(counts[token]) - used[token] - 1
-            mapping[token, slot] = packed_row
-            mapping[token, num_experts + slot] = expert
-            used[token] += 1
-        return tokens[rows], mapping
+    class IndexPermutation(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, tokens, indices):
+            order = indices.flatten().argsort(stable=True)
+            rows = order.argsort().to(torch.int32).view_as(indices)
+            ctx.save_for_backward(rows)
+            # TE's index map stores inverse rows in [topk, num_tokens] order.
+            mapping = rows.T.contiguous().flatten()
+            return tokens[order // indices.shape[1]], mapping
 
-    def with_probs(tokens, probs, mask, num_out_tokens):
-        packed, mapping = permute(tokens, mask, num_out_tokens)
-        packed_probs = probs.T.masked_select(mask.T)
-        # TE's fused path treats zero probabilities as padding.
-        packed = packed.masked_fill(packed_probs[:, None] == 0, 0)
-        return packed, packed_probs, mapping
+        @staticmethod
+        def backward(ctx, grad, _):
+            (rows,) = ctx.saved_tensors
+            output = grad.new_zeros((rows.shape[0], grad.shape[1]))
+            # TE's index backward rounds each addition to the activation dtype.
+            for slot in range(rows.shape[1]):
+                output += grad[rows[:, slot].long()]
+            return output, None
+
+    def permute(tokens, indices, num_out_tokens, *, map_type):
+        assert map_type == "index"
+        assert indices.dtype == torch.int32
+        assert tokens.is_contiguous() and indices.is_contiguous()
+        assert tokens.shape[1] * tokens.element_size() % 16 == 0
+        return IndexPermutation.apply(tokens, indices)
+
+    def with_probs(*args, **kwargs):
+        pytest.fail("Selected zero probabilities must not be treated as padding.")
 
     def unpermute(tokens, mapping, merging_probs, restore_shape):
         num_experts = (mapping.shape[1] - 1) // 2
@@ -236,7 +242,7 @@ def test_selected_zero_probability_keeps_tokens_and_router_gradients(
     probs = torch.tensor([[0.0, 1.0]], requires_grad=True)
     result = dispatcher.moe_permutation(
         tokens,
-        torch.tensor([[True, True]]),
+        torch.tensor([[0, 1]]),
         probs=probs,
         impl=f"{prefix}_moe_mask_permutation",
     )
@@ -254,7 +260,7 @@ def test_te_permutation_does_not_require_fused_probability_kernel(
     monkeypatch.delattr(backend, "moe_permute_with_probs")
     result = cuda_ops.moe_permutation(
         torch.tensor([[2.0]]),
-        torch.tensor([[True]]),
+        torch.tensor([[0]]),
         probs=torch.tensor([[0.5]]),
         impl="te_moe_mask_permutation",
     )
@@ -287,7 +293,7 @@ def test_old_te_mapping_uses_native_or_fails_strict_selection(
     def run():
         if operation == "permutation":
             return dispatcher.moe_permutation(
-                tokens, torch.tensor([[True]]), **kwargs
+                tokens, torch.tensor([[0]]), **kwargs
             ).tokens
         result = MoEPermutation(
             tokens,
@@ -335,9 +341,8 @@ def test_mixed_providers_restore_tokens_and_probability_gradients(
     indices = torch.tensor([[0, 2], [1, 2], [0, 1]])[:num_tokens]
     mapping = dispatcher.moe_permutation(
         tokens,
-        mask,
-        probs=probs,
-        expert_indices=indices,
+        indices,
+        probs=probs.gather(1, indices),
         impl=permutation,
     )
     packed = mapping.tokens
@@ -379,7 +384,7 @@ def test_missing_custom_permutation_falls_back_without_a_fused_flag(
         device_runtime=NpuRuntime(), registry=registry, default_policy=policy
     )
     tokens = torch.tensor([[2.0], [3.0]])
-    mapping = dispatcher.moe_permutation(tokens, torch.ones(2, 1, dtype=torch.bool))
+    mapping = dispatcher.moe_permutation(tokens, torch.zeros(2, 1, dtype=torch.long))
     torch.testing.assert_close(
         dispatcher.moe_unpermutation(mapping, tokens.shape), tokens
     )
@@ -392,7 +397,7 @@ def test_native_policy_overrides_available_custom_provider(npu_ops):
         default_policy=OpPolicy.NATIVE,
     )
     tokens = torch.tensor([[2.0], [3.0]])
-    mapping = dispatcher.moe_permutation(tokens, torch.ones(2, 1, dtype=torch.bool))
+    mapping = dispatcher.moe_permutation(tokens, torch.zeros(2, 1, dtype=torch.long))
     torch.testing.assert_close(
         dispatcher.moe_unpermutation(mapping, tokens.shape), tokens
     )
@@ -404,7 +409,7 @@ def test_explicit_custom_implementation_does_not_fall_back(monkeypatch):
     with pytest.raises(RuntimeError, match="npu_moe_mask_permutation"):
         dispatcher.moe_permutation(
             torch.ones(1, 1),
-            torch.ones(1, 1, dtype=torch.bool),
+            torch.zeros(1, 1, dtype=torch.long),
             impl="npu_moe_mask_permutation",
         )
 
@@ -434,12 +439,76 @@ def test_unpermutation_keeps_probability_precision(
     torch.testing.assert_close(probs.grad, torch.tensor([[1.0, -1.0]]))
 
 
-def test_permutation_rejects_nonuniform_routing_and_token_dropping():
+@pytest.mark.parametrize(
+    "indices,probs,message",
+    [
+        (torch.ones(2, 2, dtype=torch.bool), None, "int32 or int64"),
+        (torch.ones(2, 2), None, "int32 or int64"),
+        (torch.tensor([0, 1]), None, "shape"),
+        (torch.tensor([[0, 1]]), None, "shape"),
+        (torch.tensor([[0], [1]]), torch.ones(2, 3), "same shape"),
+    ],
+)
+def test_permutation_rejects_invalid_compact_inputs(indices, probs, message):
     dispatcher = OpDispatcher(device_runtime=CpuRuntime(), registry=registry)
-    tokens = torch.ones(2, 1)
-    with pytest.raises(ValueError, match="same top-k"):
-        dispatcher.moe_permutation(tokens, torch.tensor([[True, True], [False, False]]))
+    with pytest.raises(ValueError, match=message):
+        dispatcher.moe_permutation(torch.ones(2, 1), indices, probs)
+
+
+def test_permutation_rejects_token_dropping():
+    dispatcher = OpDispatcher(device_runtime=CpuRuntime(), registry=registry)
     with pytest.raises(ValueError, match="token dropping"):
         dispatcher.moe_permutation(
-            tokens, torch.ones(2, 2, dtype=torch.bool), num_out_tokens=3
+            torch.ones(2, 1), torch.tensor([[0, 1], [0, 1]]), num_out_tokens=3,
+        )
+
+
+@pytest.mark.parametrize("implementation", ["torch", "npu", "te"])
+@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("num_tokens", [0, 3])
+def test_compact_permutation_preserves_unsorted_strided_routes_and_gradients(
+    npu_ops, cuda_ops, implementation, index_dtype, num_tokens,
+):
+    dispatcher = cuda_ops if implementation == "te" else npu_ops
+    tokens = torch.tensor([[2., 99., 3.], [5., 99., 7.], [11., 99., 13.]])[
+        :num_tokens, ::2
+    ].requires_grad_()
+    # Large, unused expert IDs must not require a dense token-by-expert map.
+    indices = torch.tensor([[100000, -1, 0], [2, -1, 100000], [2, -1, 0]], dtype=index_dtype)[
+        :num_tokens, ::2
+    ]
+    probs = torch.tensor([[0., 99., .5], [.25, 99., .75], [1., 99., .5]])[
+        :num_tokens, ::2
+    ].requires_grad_()
+    result = dispatcher.moe_permutation(
+        tokens, indices, probs, impl=f"{implementation}_moe_mask_permutation",
+    )
+    expected_tokens = torch.tensor([[2., 3.], [11., 13.], [5., 7.], [11., 13.], [2., 3.], [5., 7.]])
+    expected_probs = torch.tensor([.5, .5, .25, 1., 0., .75])
+    expected_rows = torch.tensor([[4, 0], [2, 5], [3, 1]], dtype=torch.int32)
+    torch.testing.assert_close(result.tokens, expected_tokens[:num_tokens * 2])
+    torch.testing.assert_close(result.probs, expected_probs[:num_tokens * 2])
+    torch.testing.assert_close(result.row_indices, expected_rows[:num_tokens])
+    torch.testing.assert_close(result.expert_indices, indices.long())
+    (result.tokens * result.probs[:, None]).sum().backward()
+    torch.testing.assert_close(tokens.grad, torch.tensor([[.5, .5], [1., 1.], [1.5, 1.5]])[:num_tokens])
+    torch.testing.assert_close(probs.grad, torch.tensor([[5., 5.], [12., 12.], [24., 24.]])[:num_tokens])
+
+
+@pytest.mark.parametrize("dtype,large", [(torch.bfloat16, 256), (torch.float16, 2048)])
+def test_te_compact_permutation_backward_preserves_small_contributions(cuda_ops, dtype, large):
+    tokens = torch.ones(1, 128, dtype=dtype, requires_grad=True)
+    result = cuda_ops.moe_permutation(
+        tokens, torch.tensor([[0, 1, 2]]), impl="te_moe_mask_permutation",
+    )
+    gradient = torch.tensor([[large], [1], [-large]], dtype=dtype).expand(3, 128)
+    result.tokens.backward(gradient)
+    torch.testing.assert_close(tokens.grad, torch.ones_like(tokens), rtol=0, atol=0)
+
+
+def test_te_compact_permutation_rejects_routes_beyond_kernel_slot_limit(cuda_ops):
+    with pytest.raises(ValueError, match="topk <= 128"):
+        cuda_ops.moe_permutation(
+            torch.ones(1, 128), torch.arange(129).view(1, 129),
+            impl="te_moe_mask_permutation",
         )

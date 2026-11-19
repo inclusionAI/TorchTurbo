@@ -31,6 +31,21 @@ RUN pip install triton-ascend==3.2.2 \
         --index-url=https://repo.huaweicloud.com/ascend/repos/pypi \
         --extra-index-url=https://repo.huaweicloud.com/repository/pypi/simple
 RUN pip install torch_npu==2.10.0.post2
+# Build Ascend SHMEM v1.3.5 for MoonEP's NPU symmetric-memory communication.
+ARG MAX_JOBS=8
+ENV SHMEM_HOME_PATH=/usr/local/Ascend/shmem
+ENV LD_LIBRARY_PATH=${SHMEM_HOME_PATH}/shmem/lib:${LD_LIBRARY_PATH}
+RUN bash -c "source /usr/local/Ascend/ascend-toolkit/set_env.sh \
+    && git clone --branch v1.3.5 --depth 1 https://gitcode.com/cann/shmem.git /tmp/shmem \
+    && git -C /tmp/shmem checkout 306f56b98e36ca9fe5da9efb161ededdf3ebba4a \
+    && cmake -S /tmp/shmem -B /tmp/shmem/build \
+        -DCMAKE_BUILD_TYPE=Release -DSOC_TYPE=Ascend910B \
+        -DUSE_CXX11_ABI=ON -DCMAKE_DISABLE_FIND_PACKAGE_MPI=TRUE \
+    && cmake --build /tmp/shmem/build --parallel ${MAX_JOBS} \
+    && cmake --install /tmp/shmem/build --prefix ${SHMEM_HOME_PATH}/shmem \
+    && install -m 644 /tmp/shmem/scripts/set_env.sh ${SHMEM_HOME_PATH}/set_env.sh \
+    && test -s ${SHMEM_HOME_PATH}/shmem/lib/libshmem.so \
+    && rm -rf /tmp/shmem"
 # Build fla-npu from upstream main at commit d77c37382aa8cf53e25005615c8c3f761fc137d2
 # for Ascend A3 (ships the fused KDA kernels npu_chunk_kda_bwd_{prepare,dhu,finalize}
 # plus the in-kernel l2norm / beta-sigmoid fusion that the ascendc_kda provider needs).
@@ -51,7 +66,6 @@ RUN git clone https://github.com/fla-org/flash-linear-attention.git /tmp/flash-l
     && rm -rf /tmp/flash-linear-attention
 # Disable mimalloc to avoid MADV_FREE reclaiming DMA-written pages.
 # Patch PyTorch's AArch64 default so USE_MIMALLOC=OFF takes effect.
-ARG MAX_JOBS=8
 RUN git clone --branch v2.10.0 --depth 1 --recurse-submodules --shallow-submodules \
         https://github.com/pytorch/pytorch.git /tmp/pytorch \
     && cd /tmp/pytorch \

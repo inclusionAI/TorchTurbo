@@ -6,6 +6,19 @@ import torch
 pytest.importorskip("torch_npu")
 
 from torchturbo.ops.providers.npu.grouped_matmul import TorchNpuGroupedMatmul
+from torchturbo.ops.providers.npu.matmul_add import TorchNpuMatmulAdd
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_low_precision_wgrad_preserves_fp32_accumulation(dtype):
+    generator = torch.Generator().manual_seed(73)
+    x = torch.randn(128, 32, generator=generator).to(dtype)
+    dy = torch.randn(128, 48, generator=generator).to(dtype)
+    accumulator = torch.zeros(32, 48, dtype=torch.float32, device="npu")
+    TorchNpuMatmulAdd()(accumulator, x.to("npu"), dy.to("npu"), transpose_lhs=True)
+    expected = (x.double().T @ dy.double()).float()
+    torch.testing.assert_close(accumulator.cpu(), expected, atol=2e-4, rtol=1e-5)
+    assert (accumulator.cpu() - expected.to(dtype).float()).abs().max() > 1e-3
 
 
 def _reference_forward(
@@ -88,3 +101,23 @@ def test_grouped_matmul_forward_and_backward(
     assert torch.allclose(
         weight.grad.float().cpu(), expected_grad_weight, atol=1e-4, rtol=1e-4
     )
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("trans_b", [False, True])
+def test_grouped_matmul_autocast_matches_matmul_outputs_and_gradients(dtype, trans_b):
+    counts = [0, 3, 5]
+    generator = torch.Generator().manual_seed(127)
+    inputs = torch.randn(8, 16, generator=generator).to("npu").requires_grad_()
+    weight_shape = (3, 12, 16) if trans_b else (3, 16, 12)
+    weights = torch.randn(weight_shape, generator=generator).to("npu").requires_grad_()
+    ref_inputs = inputs.detach().clone().requires_grad_()
+    ref_weights = weights.detach().clone().requires_grad_()
+    with torch.autocast("npu", dtype=dtype):
+        output = TorchNpuGroupedMatmul()(inputs, weights, torch.tensor(counts), trans_b=trans_b)
+        expected = _reference_forward(ref_inputs, ref_weights, counts, trans_b)
+    torch.testing.assert_close(output, expected)
+    output.sum().backward()
+    expected.sum().backward()
+    torch.testing.assert_close(inputs.grad, ref_inputs.grad, atol=2e-2, rtol=1e-2)
+    torch.testing.assert_close(weights.grad, ref_weights.grad, atol=2e-2, rtol=1e-2)
