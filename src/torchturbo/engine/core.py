@@ -1100,6 +1100,10 @@ class TorchTurboEngine:
         self._prepare_moe_runtime(
             model, inputs, gradient_accumulation_steps
         )
+        from ..models.deepseek_v41 import TurboDeepseekV41ForCausalLM
+
+        if isinstance(model, TurboDeepseekV41ForCausalLM):
+            model.set_aux_loss_scale(1.0 / gradient_accumulation_steps if model.training else 1.0)
         result = self.backend.compute_loss(
             model,
             inputs,

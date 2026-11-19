@@ -169,6 +169,7 @@ class TorchTurboArgs:
     gbs: int | None = None
     gradient_checkpointing: bool = True
     ac_use_reentrant: bool = False
+    indexer_kl_loss_coeff: float | None = None
     cpu_offload: CPUOffloadConfig = field(default_factory=CPUOffloadConfig)
     cpu_offload_enabled: bool | None = None
     enable_mtp: bool = False
@@ -365,6 +366,14 @@ _TURBO_ARG_SPECS: tuple[TurboArgSpec, ...] = (
         "checkpointing tears down recomputed intermediates synchronously "
         "within a step, reducing cross-step allocation peak for MoE/linear-"
         "attention workloads. Replaces TORCH_TURBO_AC_USE_REENTRANT.",
+    ),
+    TurboArgSpec(
+        name="indexer_kl_loss_coeff",
+        args_name="indexer_kl_loss_coeff",
+        cli_name="--tt_indexer_kl_loss_coeff",
+        type=float,
+        metavar="COEFF",
+        help="DeepSeek V4.1 indexer KL loss coefficient; overrides the checkpoint value.",
     ),
     TurboArgSpec(
         name="cpu_offload",

@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from functools import cache
+from importlib.metadata import entry_points
+
 import torch
 
 from torchturbo.runtime import TurboDevice
@@ -11,12 +14,51 @@ from ...registry import register_op
 
 _ORI_KV_TAIL_GUARD = 128
 
+# The DSV4.1 vendor build ships as per-op wheels that override the bundled
+# implementations through the "cann_ops_transformer.ops" entry-point group
+# when the master module is imported. Probing the group (instead of the
+# master attributes) tells the bundled and vendor builds apart, because the
+# bundled master wheel also registers both ops. The vendor op_api libs must
+# be on LD_LIBRARY_PATH; see the ops-transformer build doc.
+_SFA_EP_GROUP = "cann_ops_transformer.ops"
+_SFA_EP_REQUIREMENTS = (
+    ("sparse_flash_mla", "cann_ops_transformer_dsv41_smla"),
+    ("sparse_flash_mla_grad", "cann_ops_transformer_dsv41_smlag"),
+)
 
-def _load_ops():
-    """Load CANN ops lazily."""
-    import cann_ops_transformer
 
-    return cann_ops_transformer
+def _vendor_registered() -> bool:
+    """True when both per-op wheels override the ops through entry points."""
+    for ep_name, dist in _SFA_EP_REQUIREMENTS:
+        matches = entry_points(group=_SFA_EP_GROUP, name=ep_name)
+        if not any(ep.value.startswith(dist) for ep in matches):
+            return False
+    return True
+
+
+@cache
+def _load_ops(custom_package: bool = False):
+    """Load CANN ops once per mode; failed loads remain retriable.
+
+    Default returns the CANN-bundled master module. With
+    ``custom_package=True`` (DSV4.1 path), both per-op wheels must be
+    installed: their entry points override the bundled implementations on
+    import of the master module, so the master attributes then resolve to
+    the vendor build (the same convention as the lightning_indexer_v2
+    provider; no hardcoded deep package paths).
+    """
+    import cann_ops_transformer as master
+
+    if not custom_package:
+        return master
+    if _vendor_registered() and callable(getattr(master, "sparse_flash_mla", None)):
+        return master
+    raise ImportError(
+        "DSV4.1 vendor sparse_flash_mla ops not found: install the "
+        f"{_SFA_EP_REQUIREMENTS[0][1]} and {_SFA_EP_REQUIREMENTS[1][1]} "
+        "wheels (entry-point registration onto the master module) and make "
+        "sure their op_api libs are on LD_LIBRARY_PATH."
+    )
 
 
 def _has_required_cann_ops() -> bool:
@@ -57,8 +99,11 @@ class SparseFlashMla(torch.autograd.Function):
         cmp_residual_kv,
         ori_win_left,
         ori_win_right,
+        custom_package,
+        max_seqlens=None,
     ):
-        ops = _load_ops()
+        ctx.custom_package = custom_package
+        ops = _load_ops(custom_package)
         has_cmp = cmp_kv is not None
         runtime = {
             "cu_seqlens_q": cu_seq_lens_q,
@@ -74,14 +119,22 @@ class SparseFlashMla(torch.autograd.Function):
             "layout_q": "TND",
             "layout_kv": "TND",
         }
+        if max_seqlens is None:
+            max_q = _max_seqlen(cu_seq_lens_q)
+            max_ori = _max_seqlen(cu_seq_lens_ori_kv)
+            max_cmp = _max_seqlen(cu_seq_lens_cmp_kv) if has_cmp else 0
+        else:
+            max_q, max_ori, max_cmp = max_seqlens
+            if not has_cmp:
+                max_cmp = 0
         meta_only = {
-            "max_seqlen_q": _max_seqlen(cu_seq_lens_q),
-            "max_seqlen_ori_kv": _max_seqlen(cu_seq_lens_ori_kv),
-            "max_seqlen_cmp_kv": _max_seqlen(cu_seq_lens_cmp_kv) if has_cmp else 0,
+            "max_seqlen_q": max_q,
+            "max_seqlen_ori_kv": max_ori,
+            "max_seqlen_cmp_kv": max_cmp,
             "ori_topk": 0,
-            "cmp_topk": cmp_sparse_indices.size(-1)
-            if cmp_sparse_indices is not None
-            else 0,
+            "cmp_topk": (
+                cmp_sparse_indices.size(-1) if cmp_sparse_indices is not None else 0
+            ),
             "has_ori_kv": True,
             "has_cmp_kv": has_cmp,
         }
@@ -120,7 +173,7 @@ class SparseFlashMla(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
-        ops = _load_ops()
+        ops = _load_ops(ctx.custom_package)
         (
             query,
             ori_kv,
@@ -148,7 +201,7 @@ class SparseFlashMla(torch.autograd.Function):
         )
         dq, dori_kv, dcmp_kv, dsinks, _, _ = ops.sparse_flash_mla_grad(
             query,
-            grad_output,
+            grad_output.contiguous(),
             out,
             lse,
             ori_kv=ori_kv_for_grad,
@@ -177,6 +230,8 @@ class SparseFlashMla(torch.autograd.Function):
             None,
             None,
             None,
+            None,
+            None,
         )
 
 
@@ -195,6 +250,8 @@ def _run_sparse_flash_mla(
     cu_seq_lens_q: torch.Tensor | None = None,
     cu_seq_lens_ori_kv: torch.Tensor | None = None,
     cu_seq_lens_cmp_kv: torch.Tensor | None = None,
+    custom_package: bool = False,
+    max_seqlens: tuple[int, int, int] | None = None,
 ) -> torch.Tensor:
     """Run the CANN TND sparse_flash_mla op with autograd."""
     query = query.contiguous()
@@ -218,6 +275,8 @@ def _run_sparse_flash_mla(
         cmp_residual_kv,
         ori_win_left,
         ori_win_right,
+        custom_package,
+        max_seqlens,
     )
 
 
@@ -248,6 +307,8 @@ class NpuSparseFlashMla(OpImpl):
         cu_seq_lens_q: torch.Tensor | None = None,
         cu_seq_lens_ori_kv: torch.Tensor | None = None,
         cu_seq_lens_cmp_kv: torch.Tensor | None = None,
+        custom_package: bool = False,
+        max_seqlens: tuple[int, int, int] | None = None,
     ) -> torch.Tensor:
         return _run_sparse_flash_mla(
             query,
@@ -263,4 +324,6 @@ class NpuSparseFlashMla(OpImpl):
             cu_seq_lens_q=cu_seq_lens_q,
             cu_seq_lens_ori_kv=cu_seq_lens_ori_kv,
             cu_seq_lens_cmp_kv=cu_seq_lens_cmp_kv,
+            custom_package=custom_package,
+            max_seqlens=max_seqlens,
         )

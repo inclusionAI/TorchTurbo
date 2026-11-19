@@ -121,6 +121,12 @@ class TurboDeepseekV41ForCausalLM(TurboVLMModel, DeepseekV41ForCausalLM):
     @staticmethod
     def _pre_init_patches(config):
         config._attn_implementation = "eager"
+        # --tt_indexer_kl_loss_coeff overrides the checkpoint's
+        # indexer_kl_loss_coeff (smoke runs against configs that lack or
+        # zero the field); every KL decision reads the merged field.
+        args = get_torchturbo_args()
+        if args is not None and args.indexer_kl_loss_coeff is not None:
+            config.text_config.indexer_kl_loss_coeff = args.indexer_kl_loss_coeff
 
     def _post_init_patches(self):
         self._use_flash_attention_2 = True
@@ -157,15 +163,51 @@ class TurboDeepseekV41ForCausalLM(TurboVLMModel, DeepseekV41ForCausalLM):
             patch_deepseek_v41_npu_hc_post(self)
 
     def on_parallelized(self, parallel_context):
+        if parallel_context["ep"]["ep_size"] != 1:
+            raise NotImplementedError("DeepSeek V4.1 EP is introduced in stage 4.")
         sp_info = parallel_context["sp"]
         self._sp_group = sp_info["sp_group"]
         self._sp_size = sp_info["sp_size"]
         self._sp_rank = sp_info["sp_rank"]
-        if self._sp_size != 1:
-            raise NotImplementedError("DeepSeek V4.1 SP is introduced in stage 3.")
-        if parallel_context["ep"]["ep_size"] != 1:
-            raise NotImplementedError("DeepSeek V4.1 EP is introduced in stage 4.")
+        from torchturbo.runtime import is_npu_available
+
+        if self._sp_size > 1 and not is_npu_available():
+            raise NotImplementedError(
+                "DeepSeek V4.1 sequence parallelism requires the NPU patches "
+                f"(got sp_size={self._sp_size})."
+            )
+        # publish_shared runs outside decoder_layer.forward, so FSDP2's
+        # forward pre-hook never all-gathers that layer. Register it as a
+        # forward method or the first RMSNorm sees a DTensor weight.
         self._register_publish_shared_for_fsdp()
+
+        if is_npu_available():
+            from .npu import patch_deepseek_v41_npu_sfa
+
+            count = patch_deepseek_v41_npu_sfa(
+                self,
+                sp_group=self._sp_group,
+                sp_size=self._sp_size,
+                sp_rank=self._sp_rank,
+            )
+            logger.info_rank0(
+                "DeepSeek V4.1 NPU fused MLA enabled, patched_layers=%d", count
+            )
+
+            from .npu import patch_deepseek_v41_npu_engram
+
+            patch_deepseek_v41_npu_engram(
+                self,
+                sp_group=self._sp_group,
+                sp_size=self._sp_size,
+                sp_rank=self._sp_rank,
+            )
+
+            from .npu import patch_deepseek_v41_npu_sfa_li
+
+            patch_deepseek_v41_npu_sfa_li(self)
+            self._npu_sfa_li_patched = True
+            self._freeze_indexers()
 
     def _register_publish_shared_for_fsdp(self):
         try:
@@ -187,10 +229,31 @@ class TurboDeepseekV41ForCausalLM(TurboVLMModel, DeepseekV41ForCausalLM):
             layer._tt_publish_shared_fsdp_registered = True
 
     def _freeze_indexers(self):
+        """Freeze the indexer parameters unless the KL loss is active.
+
+        Top-k indices do not carry grad into the indexer, so they are
+        frozen before sharding (kept out of the optimizer);
+        on_materialized repeats this after assign-style checkpoint loading.
+        The indexer trains only when the fused SFA/LI bundle is installed
+        AND a positive KL coefficient is configured
+        (config.text_config.indexer_kl_loss_coeff, overridable at build
+        time via --tt_indexer_kl_loss_coeff) — with coeff 0 the bundle is
+        the pure forward path and the indexer stays frozen.
+
+        Loud by contract: ``_npu_sfa_li_patched`` is initialized in
+        _post_init_patches and ``indexer_kl_loss_coeff`` is defined on
+        DeepseekV41TextConfig; missing either raises instead of silently
+        falling back to a default.
+        """
+        from .npu import _kl_loss_coeff
+
+        kl_active = self._npu_sfa_li_patched and (
+            _kl_loss_coeff(self.config.text_config) > 0
+        )
         for module in self.modules():
             if isinstance(module, DeepseekV41Indexer):
                 for param in module.parameters():
-                    param.requires_grad_(False)
+                    param.requires_grad_(kl_active)
 
     def on_materialized(self):
         from torchturbo.runtime import get_device_runtime
@@ -202,6 +265,11 @@ class TurboDeepseekV41ForCausalLM(TurboVLMModel, DeepseekV41ForCausalLM):
                 layer.engram.embed.weight.requires_grad_(False)
         self._freeze_indexers()
 
+    def set_aux_loss_scale(self, scale: float) -> None:
+        """Set the backward scale for the V4.1 indexer auxiliary loss."""
+        from .npu import V41IndexerLossAutoScaler
+
+        V41IndexerLossAutoScaler.set_loss_scale(scale)
 
     @classmethod
     @contextmanager
@@ -224,7 +292,6 @@ class TurboDeepseekV41ForCausalLM(TurboVLMModel, DeepseekV41ForCausalLM):
         prepared = dict(inputs)
         cu = prepared.get("cu_seq_lens_q")
         if cu is not None:
-            raise NotImplementedError("DeepSeek V4.1 packing is introduced in stage 3.")
             length = prepared["input_ids"].shape[-1]
             segments = cu_seqlens_to_segment_ids(cu, length)
             prepared["attention_mask"] = segments

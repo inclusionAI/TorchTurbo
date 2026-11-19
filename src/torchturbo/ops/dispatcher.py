@@ -497,8 +497,15 @@ class OpDispatcher:
         cu_seq_lens_q=None,
         cu_seq_lens_ori_kv=None,
         cu_seq_lens_cmp_kv=None,
+        custom_package: bool = False,
+        max_seqlens: tuple[int, int, int] | None = None,
         impl: str | None = None,
     ):
+        options = {}
+        if custom_package:
+            options["custom_package"] = True
+        if max_seqlens is not None:
+            options["max_seqlens"] = max_seqlens
         return self._dispatch(
             "sparse_flash_mla",
             query,
@@ -515,6 +522,7 @@ class OpDispatcher:
             cu_seq_lens_ori_kv=cu_seq_lens_ori_kv,
             cu_seq_lens_cmp_kv=cu_seq_lens_cmp_kv,
             impl=impl,
+            **options,
         )
 
     def lightning_indexer(self, *args, impl: str | None = None, **kwargs):
