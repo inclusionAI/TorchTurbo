@@ -33,11 +33,11 @@ def _gather_int64(values, indices):
     return (low.to(tl.int64) & 4294967295) | (high.to(tl.int64) << 32)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["NUM_ROUTES", "ROUTES_PER_PROGRAM"])
 def _histogram_kernel(
     routes, histograms,
-    NUM_ROUTES: tl.constexpr, NUM_EXPERTS: tl.constexpr,
-    ROUTES_PER_PROGRAM: tl.constexpr, BLOCK_EXPERTS: tl.constexpr,
+    NUM_ROUTES, NUM_EXPERTS: tl.constexpr,
+    ROUTES_PER_PROGRAM, BLOCK_EXPERTS: tl.constexpr,
     ROUTE_TILE: tl.constexpr,
 ):
     program = tl.program_id(0)
@@ -129,15 +129,21 @@ def _allocation_kernel(
         transfer = tl.where(
             cell_ranks == destination, moved, tl.where(cell_ranks == owner, -moved, 0),
         )
-        allocation += tl.where(cell_experts == expert, transfer, 0)
+        # Compare before broadcasting: Ascend can miscompile the comparison
+        # against flattened, divided expert indices inside this loop.
+        expert_cells = tl.broadcast_to(
+            local[:, None] == expert, (BLOCK_LOCAL, BLOCK_EP),
+        ).reshape(BLOCK_LOCAL * BLOCK_EP)
+        allocation += tl.where(expert_cells, transfer, 0)
         prefix_transfer = tl.where(cell_ranks >= destination, moved, 0) - tl.where(cell_ranks >= owner, moved, 0)
-        cumulative += tl.where(cell_experts == expert, prefix_transfer, 0)
+        cumulative += tl.where(expert_cells, prefix_transfer, 0)
         remaining = tl.where(local == expert, remaining - moved, remaining)
         quotas = tl.where(ranks == destination, quotas - moved, quotas)
-    offsets = (owner * NUM_LOCAL_EXPERTS + cell_experts) * EP_SIZE + cell_ranks
-    valid = (cell_experts < NUM_LOCAL_EXPERTS) & (cell_ranks < EP_SIZE)
-    tl.store(allocations + offsets, allocation, valid)
-    tl.store(boundaries + offsets, cumulative, valid)
+    # Affine addresses avoid scalarized stores and their cross-launch locks.
+    offsets = (owner * NUM_LOCAL_EXPERTS + local[:, None]) * EP_SIZE + ranks[None, :]
+    valid = valid_local[:, None] & valid_ranks[None, :]
+    tl.store(allocations + offsets, allocation.reshape(BLOCK_LOCAL, BLOCK_EP), valid)
+    tl.store(boundaries + offsets, cumulative.reshape(BLOCK_LOCAL, BLOCK_EP), valid)
 
 
 @triton.jit
@@ -164,10 +170,11 @@ def _copies_kernel(
     tl.store(slots + experts * EP_SIZE + destination, expert_slots, experts < NUM_EXPERTS)
 
 
-@triton.jit
+# Keep rank dynamic so EP ranks share the same compiled planner kernels.
+@triton.jit(do_not_specialize=["EP_RANK"])
 def _statistics_kernel(
     counts, prefixes, boundaries, copies, statistics,
-    EP_RANK: tl.constexpr, EP_SIZE: tl.constexpr, NUM_EXPERTS: tl.constexpr,
+    EP_RANK, EP_SIZE: tl.constexpr, NUM_EXPERTS: tl.constexpr,
     NUM_LOCAL_EXPERTS: tl.constexpr, BLOCK_EXPERTS: tl.constexpr,
     BLOCK_SLOTS: tl.constexpr,
 ):
@@ -208,13 +215,13 @@ def _statistics_kernel(
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["NUM_ROUTES", "EP_RANK", "ROUTES_PER_PROGRAM"])
 def _remap_kernel(
     routes, histograms, prefixes, boundaries, slots, mapped,
-    NUM_ROUTES: tl.constexpr, NUM_EXPERTS: tl.constexpr,
-    EP_RANK: tl.constexpr, EP_SIZE: tl.constexpr,
+    NUM_ROUTES, NUM_EXPERTS: tl.constexpr,
+    EP_RANK, EP_SIZE: tl.constexpr,
     NUM_LOCAL_EXPERTS: tl.constexpr, LOG_EP: tl.constexpr,
-    ROUTES_PER_PROGRAM: tl.constexpr, BLOCK_EXPERTS: tl.constexpr,
+    ROUTES_PER_PROGRAM, BLOCK_EXPERTS: tl.constexpr,
     BLOCK_PROGRAMS: tl.constexpr, ROUTE_TILE: tl.constexpr,
 ):
     program = tl.program_id(0)
@@ -264,10 +271,10 @@ def _remap_kernel(
         running += tl.histogram(ids, BLOCK_EXPERTS).to(tl.int64) - tl.where(experts == 0, padding, 0)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["NUM_ROUTES"])
 def _order_kernel(
     mapped, sorted_ids, route_order,
-    NUM_ROUTES: tl.constexpr, TOPK: tl.constexpr, BLOCK: tl.constexpr,
+    NUM_ROUTES, TOPK: tl.constexpr, BLOCK: tl.constexpr,
 ):
     positions = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     valid = positions < NUM_ROUTES
@@ -355,11 +362,11 @@ def launch_virtual_expert_planner(
     routes = top_indices.contiguous()
     num_routes = routes.numel()
     route_tile = 512
-    num_programs = min(32, max(1, triton.cdiv(num_routes, route_tile)))
+    # Keep reduction shapes fixed so changing token counts reuses the kernels.
+    histograms = workspace.field("program_histogram")
+    num_programs = histograms.shape[0]
     routes_per_program = triton.cdiv(num_routes, num_programs * route_tile) * route_tile
     block_experts = triton.next_power_of_2(num_experts)
-    # Fixed program rows bound scratch independently of local token count.
-    histograms = workspace.field("program_histogram")[:num_programs]
     _histogram_kernel[(num_programs,)](
         routes, histograms, num_routes, num_experts, routes_per_program,
         block_experts, route_tile,

@@ -314,6 +314,71 @@ def test_reference_placement_edge_cases(planner_env, case):
         dist.destroy_process_group(group)
 
 
+@pytest.mark.parametrize("num_local_experts", [3, 5, 7])
+@pytest.mark.parametrize("scale", [1, 2**32 + 1])
+@pytest.mark.parametrize("ep_size", [3, 4, 5])
+def test_allocation_with_padded_local_experts(planner_env, num_local_experts, scale, ep_size):
+    import triton
+
+    from torchturbo.ops.providers.native.plan_virtual_expert_routes import plan_placement
+    from torchturbo.ops.providers.npu._kernels.virtual_expert_planner import _allocation_kernel
+
+    dispatcher, _ = planner_env
+    device = dispatcher.device_runtime.device
+    num_experts = ep_size * num_local_experts
+    counts = torch.zeros((ep_size, num_experts), dtype=torch.int64)
+    counts[:, [0, 1, num_experts - 1]] = torch.arange(193, 193 + ep_size)[:, None] * scale
+    expected, _ = plan_placement(counts)
+    totals = counts.sum(0)
+    loads = totals.reshape(ep_size, num_local_experts).sum(1).to(device)
+    totals = totals.to(device)
+    allocations = torch.empty((num_experts, ep_size), dtype=torch.int64, device=device)
+    boundaries = torch.empty_like(allocations)
+    for _ in range(3):
+        allocations.fill_(-1)
+        boundaries.fill_(-1)
+        for _ in range(10):
+            _allocation_kernel[(ep_size,)](
+                totals, loads, allocations, boundaries,
+                ep_size, num_local_experts,
+                triton.next_power_of_2(ep_size), triton.next_power_of_2(num_local_experts),
+            )
+        torch.testing.assert_close(allocations.cpu(), expected)
+        torch.testing.assert_close(boundaries.cpu(), expected.cumsum(1))
+
+
+@pytest.mark.parametrize("ep_size", [2, 4, 8])
+def test_allocation_repeated_launches_with_many_experts(planner_env, ep_size):
+    import triton
+
+    from torchturbo.ops.providers.native.plan_virtual_expert_routes import plan_placement
+    from torchturbo.ops.providers.npu._kernels.virtual_expert_planner import _allocation_kernel
+
+    dispatcher, _ = planner_env
+    device = dispatcher.device_runtime.device
+    num_experts = 256
+    num_local_experts = num_experts // ep_size
+    counts = torch.randint(
+        0, 1024, (ep_size, num_experts), dtype=torch.int64,
+        generator=torch.Generator().manual_seed(823 + ep_size),
+    )
+    expected, _ = plan_placement(counts)
+    totals = counts.sum(0)
+    loads = totals.reshape(ep_size, num_local_experts).sum(1).to(device)
+    totals = totals.to(device)
+    allocations = torch.empty((num_experts, ep_size), dtype=torch.int64, device=device)
+    boundaries = torch.empty_like(allocations)
+    for _ in range(3):
+        # Queue launches before reading results to cover Ascend store-lock reuse.
+        for _ in range(10):
+            _allocation_kernel[(ep_size,)](
+                totals, loads, allocations, boundaries, ep_size, num_local_experts,
+                triton.next_power_of_2(ep_size), triton.next_power_of_2(num_local_experts),
+            )
+        torch.testing.assert_close(allocations.cpu(), expected)
+        torch.testing.assert_close(boundaries.cpu(), expected.cumsum(1))
+
+
 @pytest.mark.parametrize("num_local_experts", [2, 3])
 def test_device_placement_keeps_int64_boundaries(planner_env, num_local_experts):
     from torchturbo.ops.providers.native.plan_virtual_expert_routes import (
@@ -417,6 +482,60 @@ def test_stable_occurrences_across_multiple_tiles_per_program(planner_env):
     _check_plan(dispatcher, routes.to("npu"), num_experts, group)
 
 
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("num_local_experts", [2, 3])
+def test_varying_lengths_reuse_compiled_planner(
+    planner_env, monkeypatch, dtype, num_local_experts,
+):
+    from triton.runtime.jit import JITFunction
+
+    from torchturbo.ops.providers.npu._kernels import virtual_expert_planner
+
+    dispatcher, group = planner_env
+    ep_size, rank = dist.get_world_size(group), dist.get_rank(group)
+    if ep_size == 1:
+        pytest.skip("Run with torchrun EP2 to exercise the planner kernels")
+    runtime = dispatcher.device_runtime
+    num_experts = num_local_experts * ep_size
+    workspace = VirtualExpertPlannerWorkspace(
+        num_experts=num_experts, device=runtime.device, group=group, runtime=runtime,
+    )
+    generator = torch.Generator().manual_seed(1907 + rank)
+
+    def run(num_tokens):
+        routes = torch.randint(
+            num_experts, (num_tokens, 3), generator=generator, dtype=dtype,
+        ).to(runtime.device)
+        actual = dispatcher.plan_virtual_expert_routes(
+            routes, num_experts, group, workspace=workspace, async_finish=True,
+            impl="npu_triton_plan_virtual_expert_routes",
+        )
+        expected = dispatcher.plan_virtual_expert_routes(
+            routes, num_experts, group, impl="torch_plan_virtual_expert_routes",
+        )
+        _assert_plan_equal(actual.wait(), expected)
+
+    misses = []
+
+    def cache_miss(**kwargs):
+        if kwargs["fn"].module == virtual_expert_planner.__name__:
+            misses.append(kwargs["fn"].name)
+        return False
+
+    try:
+        run(32)
+        with monkeypatch.context() as guarded:
+            guarded.setattr(JITFunction, "cache_hook", cache_miss)
+            # Cross tile and program boundaries, then reuse after an empty plan.
+            for num_tokens in (1, 17, 511, 512, 513, 5461, 5462, 9001, 0, 32):
+                run(num_tokens)
+            run(0 if rank == 0 else 173 + rank)
+            run(8192 + 37 * rank)
+        assert misses == [], f"Token lengths created planner specializations: {misses}"
+    finally:
+        workspace.destroy()
+
+
 @pytest.mark.parametrize("source_prefix", [2**32 - 1, 2**48 + 2**31 + 1])
 def test_remap_preserves_large_source_occurrence_ordinals(planner_env, source_prefix):
     from torchturbo.ops.providers.npu._kernels.virtual_expert_planner import _remap_kernel
@@ -436,6 +555,69 @@ def test_remap_preserves_large_source_occurrence_ordinals(planner_env, source_pr
         BLOCK_EXPERTS=4, BLOCK_PROGRAMS=1, ROUTE_TILE=128,
     )
     torch.testing.assert_close(mapped.cpu(), torch.tensor([[6, 6]]))
+
+
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("ep_size", [3, 4])
+def test_rank_values_reuse_compiled_planner_kernels(planner_env, dtype, ep_size):
+    import triton
+
+    from torchturbo.ops.providers.native.plan_virtual_expert_routes import (
+        _remap_routes, _route_metadata, build_remap_table, count_routes, plan_placement,
+    )
+    from torchturbo.ops.providers.npu._kernels.virtual_expert_planner import (
+        _remap_kernel, _statistics_kernel,
+    )
+
+    dispatcher, _ = planner_env
+    device = dispatcher.device_runtime.device
+    num_local_experts = 3
+    num_experts = ep_size * num_local_experts
+    routes = torch.randint(
+        3, (ep_size, 193, 3), dtype=dtype, generator=torch.Generator().manual_seed(2017),
+    )
+    routes[routes == 2] = num_experts - 1
+    counts = torch.stack([torch.bincount(row.flatten(), minlength=num_experts) for row in routes])
+    allocations, copies = plan_placement(counts)
+    counts_device = counts.to(device)
+    prefixes = (counts.cumsum(0) - counts).to(device)
+    boundaries = allocations.cumsum(1).to(device)
+    copies_device = copies.contiguous().to(device)
+    table = build_remap_table(counts, allocations, copies, 0)
+    slots = (table[:, 1 + ep_size:] - num_local_experts).contiguous().to(device)
+    statistics = torch.empty(ep_size * (1 + 2 * num_local_experts), dtype=torch.int64, device=device)
+    statistics_hashes, remap_hashes = set(), set()
+    for rank in range(ep_size):
+        local_routes = routes[rank].to(device)
+        histograms = torch.stack([
+            torch.bincount(row, minlength=num_experts)
+            for row in routes[rank].flatten().split(512)
+        ])
+        program_histograms = torch.zeros((32, num_experts), dtype=torch.int64)
+        program_histograms[:histograms.shape[0]] = histograms
+        program_histograms = program_histograms.to(device)
+        mapped = torch.empty_like(local_routes, dtype=torch.int64)
+        statistics_kernel = _statistics_kernel[(ep_size,)](
+            counts_device, prefixes, boundaries, copies_device, statistics,
+            rank, ep_size, num_experts, num_local_experts,
+            triton.next_power_of_2(num_experts), triton.next_power_of_2(2 * num_local_experts),
+        )
+        remap_kernel = _remap_kernel[(32,)](
+            local_routes, program_histograms, prefixes, boundaries, slots, mapped,
+            local_routes.numel(), num_experts, rank, ep_size, num_local_experts,
+            (ep_size - 1).bit_length(), 512, triton.next_power_of_2(num_experts), 32, 128,
+        )
+        sent, received = count_routes(counts, allocations, copies, rank)
+        torch.testing.assert_close(statistics.cpu(), torch.cat((sent, received.flatten())))
+        positions, _ = _route_metadata(routes[rank], num_experts)
+        table = build_remap_table(counts, allocations, copies, rank)
+        expected, order = _remap_routes(routes[rank], positions, table)
+        expected = torch.empty_like(expected).scatter_(1, order, expected)
+        torch.testing.assert_close(mapped.cpu(), expected.to(torch.int64))
+        statistics_hashes.add(statistics_kernel.hash)
+        remap_hashes.add(remap_kernel.hash)
+    assert len(statistics_hashes) == 1, "EP_RANK created statistics specializations"
+    assert len(remap_hashes) == 1, "EP_RANK created remap specializations"
 
 
 @pytest.mark.parametrize("first", ["counts", "prefixes", "boundaries", "copies"])
