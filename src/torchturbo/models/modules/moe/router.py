@@ -7,7 +7,7 @@
   # Modified by the TorchTurbo contributors.
 
 from abc import ABC
-from typing import Literal, Optional
+from typing import Optional
 
 import torch
 import torch.distributed as dist
@@ -19,7 +19,7 @@ from .moe_utils import (
     mask_padding_tokens,
     z_loss_func,
 )
-from .utils import _assignment_mask, _dense_topk_route, _select_topk_experts
+from .utils import build_dense_topk_route, build_routing_map, select_topk_experts
 
 
 class RouterGatingLinearFunction(torch.autograd.Function):
@@ -280,17 +280,19 @@ class TopKRouter(Router):
         input_ids: Optional[torch.Tensor] = None,
         padding_mask: torch.Tensor | None = None,
         accumulate_tokens_per_expert: bool = True,
-        *, routing_layout: Literal["dense", "topk"] = "dense",
     ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
-        """Top-k routing function
+        """Return dense routing weights, the assignment mask, and the selected expert IDs."""
+        return self._route_topk(logits, input_ids, padding_mask, accumulate_tokens_per_expert, compact=False)
 
-        Args:
-            logits (torch.Tensor): Logits tensor after gating.
-
-        Returns:
-            Dense or selected routing weights, optional assignment mask, and the selected
-            expert IDs in their native top-k order.
-        """
+    def _route_topk(
+        self,
+        logits: torch.Tensor,
+        input_ids: torch.Tensor | None,
+        padding_mask: torch.Tensor | None,
+        accumulate_tokens_per_expert: bool,
+        *,
+        compact: bool = True,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
         seq_length, bsz = logits.shape[:2]
         logits = logits.view(-1, self.config.num_moe_experts)
         input_ids = input_ids.view(-1) if input_ids is not None else None
@@ -301,7 +303,7 @@ class TopKRouter(Router):
 
         if self.routing_type == "none":
             # A naive top-k routing without load balancing
-            probs, expert_indices = _select_topk_experts(
+            probs, expert_indices = select_topk_experts(
                 logits,
                 self.topk,
                 use_pre_softmax=self.config.moe_router_pre_softmax,
@@ -318,12 +320,9 @@ class TopKRouter(Router):
             raise ValueError(f"Unsupported MoE routing type: {self.routing_type}")
 
         count_expert_load = self.enable_expert_bias and accumulate_tokens_per_expert and torch.is_grad_enabled()
-        if routing_layout == "dense":
-            probs, routing_map, expert_indices = _dense_topk_route(logits, probs, expert_indices)
-        elif routing_layout == "topk":
-            routing_map = _assignment_mask(logits, expert_indices) if count_expert_load else None
-        else:
-            raise ValueError(f"Unknown MoE routing layout: {routing_layout}")
+        routing_map = None
+        if not compact:
+            probs, routing_map, expert_indices = build_dense_topk_route(logits, probs, expert_indices)
 
         # Hash assignments are fixed, so learned-routing AUX does not apply.
         if (
@@ -346,6 +345,8 @@ class TopKRouter(Router):
         # pass run without grad; non-reentrant recomputation disables counting.
         if count_expert_load:
             with torch.no_grad():
+                if routing_map is None:
+                    routing_map = build_routing_map(logits, expert_indices)
                 bias_routing_map = mask_padding_tokens(
                     routing_map, padding_mask
                 )
@@ -366,7 +367,8 @@ class TopKRouter(Router):
         input_ids: Optional[torch.Tensor] = None,
         padding_mask: torch.Tensor | None = None,
         accumulate_tokens_per_expert: bool = True,
-        *, routing_layout: Literal["dense", "topk"] = "dense",
+        *,
+        compact: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor]:
         """
         Forward pass of the router.
@@ -379,8 +381,6 @@ class TopKRouter(Router):
 
         logits = self.gating(input)
 
-        probs, routing_map, expert_indices = self.routing(
-            logits, input_ids, padding_mask, accumulate_tokens_per_expert, routing_layout=routing_layout
-        )
-
+        route = self._route_topk if compact else self.routing
+        probs, routing_map, expert_indices = route(logits, input_ids, padding_mask, accumulate_tokens_per_expert)
         return probs, routing_map, expert_indices, logits

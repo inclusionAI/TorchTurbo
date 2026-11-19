@@ -10,12 +10,12 @@ from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import fully_shard, MixedPrecisionPolicy
 from torch.distributed.tensor import DTensor
 
+from torchturbo.engine.backends.fsdp2.backend import FSDP2Backend
 from torchturbo.models.modules.moe.experts import GroupedMLP
-from torchturbo.models.modules.moe.mega_moe import MegaKernelExperts
 from torchturbo.models.modules.moe.module import ModuleSpec
 from torchturbo.models.modules.moe.moe_config import MoEConfig
 from torchturbo.models.modules.moe.moe_layer import MoELayer, MoESubmodules
-from torchturbo.ops import get_or_create_ops, OpPolicy
+from torchturbo.ops import get_or_create_ops, OpPolicy, ops
 from torchturbo.runtime import get_device_runtime
 
 
@@ -50,7 +50,7 @@ def test_mega_moe_matches_native_expert_parallel(expert_mesh, hot_route):
     submodules = MoESubmodules(experts=ModuleSpec(module=GroupedMLP))
     native = MoELayer(cfg, ep_group, submodules, layer_number=0).npu()
     candidate = MoELayer(cfg, ep_group, submodules, layer_number=0).npu()
-    MegaKernelExperts(ep_group).attach(candidate)
+    FSDP2Backend._bind_megakernel(candidate, ops.mega_moe())
     torch.manual_seed(124 + dist.get_rank(ep_group))
     with torch.no_grad():
         for parameter in native.parameters():
@@ -66,6 +66,7 @@ def test_mega_moe_matches_native_expert_parallel(expert_mesh, hot_route):
         ))
     assert list(native.state_dict()) == list(candidate.state_dict())
 
+    torch.manual_seed(2026 + dist.get_rank())
     for rows, recompute in ((128, False), (256, True)):
         x = torch.randn(rows, 1, 512, device="npu", dtype=torch.bfloat16, requires_grad=True)
         if hot_route:
@@ -80,8 +81,15 @@ def test_mega_moe_matches_native_expert_parallel(expert_mesh, hot_route):
         actual.backward(upstream)
         pairs = [(actual, expected), (other.grad, x.grad)]
         for name, param in candidate.named_parameters():
-            gradient = param.grad.full_tensor() if isinstance(param.grad, DTensor) else param.grad
-            pairs.append((gradient, native.get_parameter(name).grad))
+            reference = native.get_parameter(name).grad
+            gradient = param.grad
+            if isinstance(gradient, DTensor):
+                gradient = gradient.full_tensor()
+                # FSDP averages expert gradients over replicas of the same EP rank.
+                reference = reference.float()
+                dist.all_reduce(reference, group=mesh["edp"].get_group())
+                reference = (reference / mesh["edp"].size()).to(gradient.dtype)
+            pairs.append((gradient, reference))
         for result, reference in pairs:
             assert result is not None and reference is not None
             torch.testing.assert_close(result, reference, atol=0.012, rtol=0.04)

@@ -124,7 +124,7 @@ def maybe_move_tensor_to_cpu(
     return tensor
 
 
-def _select_topk_experts(
+def select_topk_experts(
     logits: torch.Tensor,
     topk: int,
     use_pre_softmax: bool = False,
@@ -208,13 +208,15 @@ def _select_topk_experts(
     return probs.type_as(logits), top_indices
 
 
-def _assignment_mask(logits, indices):
+def build_routing_map(logits: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
     return torch.zeros_like(logits).int().scatter(1, indices, 1).bool()
 
 
-def _dense_topk_route(logits, probs, indices):
+def build_dense_topk_route(
+    logits: torch.Tensor, probs: torch.Tensor, indices: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     weights = torch.zeros_like(logits).scatter(1, indices, probs)
-    return weights, _assignment_mask(logits, indices), indices
+    return weights, build_routing_map(logits, indices), indices
 
 
 def topk_softmax_with_capacity(
@@ -247,11 +249,11 @@ def topk_softmax_with_capacity(
         native order; the packed layout only needs a consistent pairing
         between expert IDs, row indices, and gathered probabilities.
     """
-    probs, indices = _select_topk_experts(
+    probs, indices = select_topk_experts(
         logits, topk, use_pre_softmax, num_groups, group_topk, scaling_factor,
         score_function, expert_bias, use_hash_routing, hash_table, input_ids,
     )
-    return _dense_topk_route(logits, probs, indices)
+    return build_dense_topk_route(logits, probs, indices)
 
 
 def ensure_divisibility(numerator, denominator):

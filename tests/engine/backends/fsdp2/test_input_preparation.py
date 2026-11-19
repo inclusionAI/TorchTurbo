@@ -171,7 +171,7 @@ def test_backend_installs_slicing_with_checkpoint_recomputation(
     )
     backend.get_ep_info = lambda: {"ep_size": 1}
     backend._init_mesh = lambda plan: None
-    backend._replace_modules = lambda model, plan, **kwargs: model
+    backend._replace_modules = lambda model, plan: model
     backend._shard_model = lambda model, plan: model
     target = "" if model_cls is _PreEmbeddingModel else "language_model"
     plan = FSDPParallelPlan(

@@ -14,6 +14,8 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
+from torchturbo.ops.moe import MoEMegakernel, RouteFormat
+
 from .moe_config import MoEConfig
 from .router import TopKRouter
 from .token_dispatcher import MoETokenDispatcher, MoEAlltoAllTokenDispatcher
@@ -50,6 +52,7 @@ class BaseMoELayer(torch.nn.Module, ABC):
         ep_rank = dist.get_rank(ep_group)
 
         self.config = config
+        self.ep_group = ep_group
         self.expert_parallel_size = ep_size
         assert (
             self.expert_parallel_size > 0
@@ -105,7 +108,6 @@ class MoELayer(BaseMoELayer):
         layer_number: Optional[int] = None,
         sp_group: dist.ProcessGroup | None = None,
     ) -> None:
-        self.megakernel_experts = None
         self.use_te = use_te
         self.submodules = submodules
         super(MoELayer, self).__init__(
@@ -118,6 +120,8 @@ class MoELayer(BaseMoELayer):
             layer_number=self.layer_number,
             sp_group=sp_group,
         )
+
+        self._megakernel: MoEMegakernel | None = None
 
         # Initialize token dispatcher
         if config.moe_token_dispatcher_type == "alltoall":
@@ -147,38 +151,51 @@ class MoELayer(BaseMoELayer):
                 self.submodules.shared_experts, config=self.config
             )
 
-    def forward(
-        self, hidden_states: torch.Tensor, input_ids: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Route tokens, compute local experts, and combine their outputs."""
-        probs, routing_map, expert_indices, logits = self.router(
-            hidden_states, input_ids, self._runtime_inputs.padding_mask,
-            self._runtime_inputs.accumulate_tokens_per_expert,
-            **({"routing_layout": "topk"} if self.megakernel_experts is not None else {}),
+    def route(
+        self, hidden_states: torch.Tensor, input_ids: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor]:
+        runtime = self._runtime_inputs
+        router = self.router
+        compact = getattr(self._megakernel, "route_format", None) is RouteFormat.TOPK
+        # Instance-level router wrappers may still use the original four-argument signature.
+        if compact and type(router) is TopKRouter and vars(router).keys().isdisjoint(("forward", "routing")):
+            return router(hidden_states, input_ids, runtime.padding_mask,
+                          runtime.accumulate_tokens_per_expert, compact=True)
+        weights, mask, ids, logits = router(
+            hidden_states, input_ids, runtime.padding_mask, runtime.accumulate_tokens_per_expert,
         )
-        logits = logits.view(-1, logits.shape[-1])
+        if not compact:
+            return weights, mask, ids, logits
+        if ids is None or ids.dtype not in (torch.int32, torch.int64):
+            raise ValueError("Top-k routing requires the custom router's original integer expert IDs.")
+        rows = hidden_states.numel() // hidden_states.size(-1)
+        if weights.shape != (rows, self.config.num_moe_experts) or ids.shape != (rows, self.config.moe_router_topk):
+            raise ValueError("Expected custom router weights [tokens, experts] and expert IDs [tokens, topk].")
+        return weights.gather(1, ids.long()), None, ids, logits
 
-        if self.megakernel_experts is not None:
-            output, _ = self.experts(
-                hidden_states, None, probs, megakernel_context=self.megakernel_experts.context_for(self.experts), expert_indices=expert_indices,
-            )
-        else:
-            dispatcher = self.token_dispatcher
-            # Reuse stage variables so completed layouts are not kept alive here.
-            expert_tokens, expert_probs = dispatcher.dispatch_preprocess(
-                hidden_states, routing_map, probs, expert_indices=expert_indices,
-            )
-            expert_tokens, expert_probs = dispatcher.token_dispatch(expert_tokens, expert_probs)
-            expert_tokens, tokens_per_expert, expert_probs = dispatcher.dispatch_postprocess(
-                expert_tokens, expert_probs,
-            )
-            expert_tokens, bias = self.experts(expert_tokens, tokens_per_expert, expert_probs)
-            assert bias is None, "Bias is not supported in MoEAlltoAllTokenDispatcher"
-            expert_tokens = dispatcher.combine_preprocess(expert_tokens)
-            expert_tokens = dispatcher.token_combine(expert_tokens)
-            expert_tokens = dispatcher.combine_postprocess(expert_tokens)
-            output = expert_tokens.to(hidden_states.dtype)
+    def _forward_native_routed(
+        self, hidden_states: torch.Tensor, input_ids: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        probs, routing_map, expert_indices, logits = self.route(hidden_states, input_ids)
+        dispatcher = self.token_dispatcher
+        # Reuse stage variables so completed layouts are not kept alive here.
+        expert_tokens, expert_probs = dispatcher.dispatch_preprocess(
+            hidden_states, routing_map, probs, expert_indices=expert_indices,
+        )
+        expert_tokens, expert_probs = dispatcher.token_dispatch(expert_tokens, expert_probs)
+        expert_tokens, tokens_per_expert, expert_probs = dispatcher.dispatch_postprocess(
+            expert_tokens, expert_probs,
+        )
+        expert_tokens, bias = self.experts(expert_tokens, tokens_per_expert, expert_probs)
+        assert bias is None, "Bias is not supported in MoEAlltoAllTokenDispatcher"
+        expert_tokens = dispatcher.combine_preprocess(expert_tokens)
+        expert_tokens = dispatcher.token_combine(expert_tokens)
+        expert_tokens = dispatcher.combine_postprocess(expert_tokens)
+        output = expert_tokens.to(hidden_states.dtype)
+        return output, logits
 
+    def add_shared_experts(self, hidden_states: torch.Tensor, output: torch.Tensor) -> torch.Tensor:
+        """Add this layer's shared expert contributions to the routed output."""
         if self.shared_expert is not None:
             shared_expert_output = self.shared_expert(hidden_states)
             shared_expert_output = (
@@ -187,4 +204,14 @@ class MoELayer(BaseMoELayer):
             output = output + shared_expert_output
         if self.shared_experts is not None:
             output = output + self.shared_experts(hidden_states)
-        return output, logits
+        return output
+
+    def forward(
+        self, hidden_states: torch.Tensor, input_ids: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self._megakernel is None:
+            output, logits = self._forward_native_routed(hidden_states, input_ids)
+            output = self.add_shared_experts(hidden_states, output)
+        else:
+            output, logits = self._megakernel.forward_experts(self, hidden_states, input_ids)
+        return output, logits.view(-1, logits.shape[-1])

@@ -304,18 +304,58 @@ DATASET=/datasets/AM-Thinking-v1-Distilled/science.jsonl \
 
 ### HyperMulticore MegaMoE on Ascend A3
 
-For BF16 full-parameter training with TorchTurbo SwiGLU experts and expert parallelism,
-install a [HyperMulticore A3 wheel](https://github.com/mindspore-ai/hyper-multicore/blob/master/docs/build.md)
-built for the Torch and torch_npu versions in the training container on every node.
-After activating CANN and installing the wheel, run the following in each launcher shell
-before importing Torch:
+For BF16 full-parameter training with TorchTurbo SwiGLU experts, use HMC commit
+`917ed776a2a3f181c36e3ffe5e7d4eaff66852ba`. It provides `MegaMoeExperts` with the `numerics_options`
+constructor argument used by the provider.
+
+**CANN compatibility.** This HMC revision does not specify a minimum CANN
+release for A3 MegaMoE. Its full-build matrix lists CANN 9.2.0 as a reference
+version. The runtime requires a CANN installation compatible with torch_npu,
+the NPU driver, and the wheel's native libraries. Build-time and runtime CANN
+versions may differ. The TorchTurbo A3 Dockerfile uses CANN 9.0.0, Python 3.11,
+Torch `2.10.0+cpu.nomimalloc`, and torch_npu `2.10.0.post2`. Build with the
+target image's stack when possible. An earlier A3 wheel was built with CANN
+9.1.0; compatibility of that wheel with the 9.0.0 image has not been verified.
+See the [HMC build and compatibility guide](https://github.com/mindspore-ai/hyper-multicore/blob/917ed776a2a3f181c36e3ffe5e7d4eaff66852ba/docs/build.md).
+
+**Build the A3 wheel.** Use a Linux AArch64 build environment with the target
+Torch and torch_npu already installed, the CANN toolkit and ops package
+(including `bisheng` and `asc_opc`), GCC/G++, Make, and CMake/CTest 3.20 or
+later. Use the `set_env.sh` path from your CANN installation.
 
 ```bash
+git clone https://github.com/mindspore-ai/hyper-multicore.git
+cd hyper-multicore
+git checkout --detach 917ed776a2a3f181c36e3ffe5e7d4eaff66852ba
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+python -m pip install -r requirements.txt -r requirements-build.txt
+bash build.sh --soc-list ascend910_93 --jobs 24
+ls dist/hyper_multicore-*.whl
+```
+
+**Install in the training environment.** Copy the wheel from `dist/` into the
+training image or onto each node. In the destination Python environment, use
+the path to the copied wheel. Its Python ABI, CPU architecture, Torch/torch_npu
+adapter, and Torch C++ ABI must match the runtime.
+
+```bash
+python -m pip install 'numpy>=1.26,<2'
+python -m pip install --no-deps /path/to/wheels/hyper_multicore-*.whl
+```
+
+In each training launcher shell, activate CANN and the HMC vendor libraries
+before starting Python. Run the installation check outside the HMC checkout
+so it imports the installed wheel.
+
+```bash
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source "$(command -v hyper_multicore_set_env.bash)"
+hyper_multicore_build_info
+python -c 'from hyper_multicore import MegaMoeExperts, MegaMoeNumericsOptions'
 ```
 
 Set the following in the YAML passed to `--tt_config` and configure an EP size
-greater than one. MegaMoE defaults to disabled. LoRA uses the standard TorchTurbo experts.
+greater than one. MegaMoE defaults to disabled. For PEFT/LoRA training, leave MegaMoE disabled.
 
 ```yaml
 engine_config:
@@ -325,5 +365,9 @@ engine_config:
 
 HyperMulticore determines communication workspace capacity from the current routing counts.
 
-On NPU, `ops.mega_moe` selects `hmc_mega_moe`. On CUDA, the default
-provider `cuda_mega_moe` raises `NotImplementedError` when called.
+When enabled, FSDP2 calls `ops.mega_moe()` once per model and binds the selected
+provider to all TorchTurbo MoE layers. Compatible layers share an executor.
+When disabled, the layers use native MoE. Enabling both MegaMoE and PEFT/LoRA
+raises an error before FSDP2 initializes the mesh.
+
+CUDA currently has no registered MegaMoE provider.

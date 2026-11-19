@@ -4,6 +4,7 @@ import os
 import sys
 import types
 from contextlib import nullcontext
+from unittest.mock import Mock
 
 os.environ.setdefault("TORCH_TURBO_DISABLE", "1")
 
@@ -75,7 +76,7 @@ def make_preparing_backend(order, sp_info):
     backend.get_ep_info = lambda: {"ep_size": 1}
     backend.get_sp_info = lambda: sp_info
     backend._init_mesh = lambda plan: order.append("init_mesh")
-    backend._replace_modules = lambda model, plan, **kwargs: order.append("replace") or model
+    backend._replace_modules = lambda model, plan: order.append("replace") or model
     backend._apply_activation_checkpointing = (
         lambda model, plan: order.append("activation_checkpointing") or model
     )
@@ -1339,36 +1340,29 @@ def test_activation_checkpointing_disabled_warns_and_skips_plan_targets(monkeypa
     assert not hasattr(model.layers[0], "_tt_original_forward")
 
 
-def test_peft_disables_megakernel_before_replacement(monkeypatch):
-    model = TaggedModule("root")
-    backend = make_preparing_backend([], {"sp_size": 1, "sp_group": None, "sp_rank": 0})
+def test_megakernel_with_peft_fails_before_mesh_setup():
+    backend = make_backend()
     backend.config.moe.enable_mega_moe = True
-    selected = []
-    def replace_modules(value, plan, *, megakernel_experts):
-        selected.append(megakernel_experts)
-        return value
-
-    backend._replace_modules = replace_modules
-    monkeypatch.setattr("torchturbo.engine.peft.apply_peft", lambda value, config: value)
-    assert backend.prepare_model(model, FSDPParallelPlan(), peft_config=object()) is model
-    assert selected == [None]
-    assert backend.config.moe.enable_mega_moe
+    backend._init_mesh = lambda plan: pytest.fail("mesh setup should not run")
+    with pytest.raises(AssertionError, match="does not support PEFT/LoRA"):
+        backend.prepare_model(TaggedModule("root"), FSDPParallelPlan(), peft_config=object())
 
 
 @pytest.mark.parametrize("enabled", [False, True])
-def test_qwen_parallel_plan_uses_common_megakernel_binding(monkeypatch, enabled):
+@pytest.mark.parametrize("share_router", [False, True])
+def test_qwen_parallel_plan_uses_common_megakernel_binding(monkeypatch, enabled, share_router):
     from torchturbo.engine.config import EngineConfig
-    from torchturbo.models.modules.moe.mega_moe import MegaKernelExperts
     from torchturbo.models.modules.moe.moe_layer import MoELayer
     from torchturbo.models.qwen3_5_moe.parallel_plan import get_parallel_plan
+    from torchturbo.ops.providers.npu.mega_moe import HmcRoutedExperts
 
     group = object()
     monkeypatch.setattr(torch.distributed, "get_world_size", lambda group=None: 2)
     monkeypatch.setattr(torch.distributed, "get_rank", lambda group=None: 0)
-    backend = make_backend()
+    backend = make_preparing_backend([], {"sp_group": None, "sp_size": 1, "sp_rank": 0})
+    del backend._replace_modules
     backend.config = EngineConfig()
     backend.get_ep_info = lambda: {"ep_group": group, "ep_size": 2}
-    backend.get_sp_info = lambda: {"sp_group": None}
     model = nn.Module()
     model.config = types.SimpleNamespace(hidden_size=8, moe_intermediate_size=4,
                                          num_experts=4, num_experts_per_tok=2)
@@ -1376,11 +1370,46 @@ def test_qwen_parallel_plan_uses_common_megakernel_binding(monkeypatch, enabled)
     model.mlp.gate = model.mlp.experts = nn.Identity()
     model.dense = nn.Identity()
     spec = get_parallel_plan().plan["model.language_model.layers.*.mlp"]
-    plan = FSDPParallelPlan(plan={"mlp": spec, "dense": spec})
-    kernels = MegaKernelExperts(group) if enabled else None
-    backend._replace_modules(model, plan, megakernel_experts=kernels)
+    model.second_mlp = nn.Module()
+    model.second_mlp.gate = model.second_mlp.experts = nn.Identity()
+    plan = FSDPParallelPlan(plan={"mlp": spec, "second_mlp": spec, "dense": spec})
+    model.prebuilt = spec.replace_module(
+        model.mlp, hf_config=model.config, ep_info=backend.get_ep_info(), sp_info=backend.get_sp_info(),
+        engine_config=backend.config, **spec.module_kwargs,
+    )
+    if share_router:
+        def replace_with_shared_router(module, **kwargs):
+            layer = spec.replace_module(module, **kwargs)
+            layer.router = model.mlp.router
+            return layer
+
+        plan.plan["second_mlp"] = FSDPPlanSpec(
+            replace_module=replace_with_shared_router, module_kwargs=spec.module_kwargs,
+        )
+    kernels = HmcRoutedExperts() if enabled else None
+    factory = Mock(return_value=kernels)
+    monkeypatch.setattr("torchturbo.ops.ops", types.SimpleNamespace(mega_moe=factory))
+    backend.config.moe.enable_mega_moe = enabled
+    backend.prepare_model(model, plan)
+    assert factory.call_count == int(enabled)
+    assert model.second_mlp._megakernel is kernels
+    assert not hasattr(spec.module_kwargs["moe_submodules"], "megakernel")
     assert isinstance(model.mlp, MoELayer)
-    assert model.mlp.megakernel_experts is kernels
-    assert not hasattr(model.dense, "megakernel_experts")
-    if enabled:
-        assert kernels.layers[model.mlp.experts] is None
+    assert model.mlp._megakernel is kernels
+    assert not hasattr(model.dense, "_megakernel")
+    assert model.prebuilt._megakernel is kernels
+    hidden = torch.randn(3, 1, 8)
+    assert model.prebuilt.router(hidden)[0].shape == (3, 4)
+    if share_router:
+        assert model.mlp.router is model.second_mlp.router
+        torch.nn.init.normal_(model.mlp.router.weight)
+        dense, mask, ids, _ = model.mlp.router(hidden)
+        assert dense.shape == mask.shape == (3, 4)
+        for layer in (model.mlp, model.second_mlp):
+            weights, _, selected, _ = layer.route(hidden, None)
+            torch.testing.assert_close(selected, ids)
+            torch.testing.assert_close(weights, dense.gather(1, ids) if enabled else dense)
+    else:
+        assert model.mlp.router(hidden)[0].shape == (3, 4)
+    for layer in (model.prebuilt, model.mlp, model.second_mlp):
+        assert layer.route(hidden, None)[0].shape == (3, 2 if enabled else 4)

@@ -44,6 +44,7 @@ from torchturbo.parallel import (
     FSDPParallelPlan,
     FSDPPlanSpec,
 )
+from torchturbo.ops.moe import MoEMegakernel
 from torchturbo.runtime import DeviceRuntime
 from torchturbo.utils.torch_utils import torch_version
 
@@ -307,7 +308,7 @@ class FSDP2Backend(BaseBackend):
         self._create_sp_group(sp_size)
         self._create_dp_group()
 
-    def _replace_modules(self, model: nn.Module, plan: FSDPParallelPlan, *, megakernel_experts=None) -> nn.Module:
+    def _replace_modules(self, model: nn.Module, plan: FSDPParallelPlan) -> nn.Module:
         """Replace modules according to the parallel plan (e.g., MoE layers).
 
         This is separated from :meth:`prepare_model` so that LoRA can be
@@ -326,7 +327,6 @@ class FSDP2Backend(BaseBackend):
             The model with replaced modules.
         """
         config = model.config
-
         if plan.plan and isinstance(plan.plan, dict):
             for fqn, submodule in list(model.named_modules()):
                 if fqn == "":
@@ -335,14 +335,11 @@ class FSDP2Backend(BaseBackend):
                 spec = plan.match(fqn)
                 if isinstance(spec, FSDPPlanSpec) and spec.replace_module:
                     kwargs = dict(spec.module_kwargs)
-
                     kwargs["hf_config"] = config
                     kwargs["ep_info"] = self.get_ep_info()
                     kwargs["sp_info"] = self.get_sp_info()
                     kwargs["engine_config"] = self.config
                     new_module = spec.replace_module(submodule, **kwargs)
-                    if megakernel_experts is not None:
-                        megakernel_experts.attach(submodule if new_module is None else new_module)
 
                     if new_module is not None and new_module is not submodule:
                         parent_fqn, _, name = fqn.rpartition(".")
@@ -360,6 +357,21 @@ class FSDP2Backend(BaseBackend):
                         logger.debug_rank0("FSDP2Backend patched module %s in-place", fqn)
 
         return model
+
+    @staticmethod
+    def _bind_megakernel(model: nn.Module, kernel: MoEMegakernel) -> None:
+        """Bind one dispatched provider to every TorchTurbo MoE layer in the model."""
+        from torchturbo.models.modules.moe.moe_layer import MoELayer
+        from torchturbo.ops.moe import RouteFormat
+
+        layers = [layer for layer in model.modules() if isinstance(layer, MoELayer)]
+        if not layers:
+            raise ValueError("MegaMoE requires a model using TorchTurbo MoELayer.")
+        route_format = getattr(kernel, "route_format", None)
+        if route_format not in (None, RouteFormat.DENSE, RouteFormat.TOPK):
+            raise ValueError(f"Unsupported megakernel route_format: {route_format!r}")
+        for layer in layers:
+            layer._megakernel = kernel
 
     @staticmethod
     def _compile_parallel_plan(
@@ -443,6 +455,10 @@ class FSDP2Backend(BaseBackend):
         parallel_plan: Any = None,
         peft_config: Any = None,
     ) -> nn.Module:
+        enable_mega_moe = self.config.moe.enable_mega_moe
+        if enable_mega_moe and peft_config is not None:
+            raise AssertionError("MegaMoE does not support PEFT/LoRA training.")
+
         if parallel_plan is None:
             plan = FSDPParallelPlan()
         elif not isinstance(parallel_plan, FSDPParallelPlan):
@@ -457,19 +473,12 @@ class FSDP2Backend(BaseBackend):
         # Initialize DeviceMesh and SP groups
         self._init_mesh(plan)
 
-        # Resolve PEFT before constructing any expert layers for this model.
-        megakernel_experts = None
-        if self.config.moe.enable_mega_moe:
-            if peft_config is not None:
-                logger.warning_rank0("Using native experts for PEFT training.")
-            else:
-                from ....models.modules.moe.mega_moe import MegaKernelExperts
+        # Phase 1: Module replacement (e.g., MoE layers).
+        model = self._replace_modules(model, plan)
+        if enable_mega_moe:
+            from torchturbo.ops import ops
 
-                megakernel_experts = MegaKernelExperts(self.get_ep_info()["ep_group"])
-
-        model = self._replace_modules(model, plan, megakernel_experts=megakernel_experts)
-        if megakernel_experts is not None and not megakernel_experts.layers:
-            raise ValueError("MegaMoE requires a model using TorchTurbo MoELayer.")
+            self._bind_megakernel(model, ops.mega_moe())
 
         # Phase 2: Apply LoRA (after module replacement, before sharding).
         if peft_config is not None:

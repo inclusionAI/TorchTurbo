@@ -1,11 +1,15 @@
-"""Shared tensor data and execution context for MoE operators."""
+"""Shared tensor data and routed expert interface for MoE operators."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import Enum
+from typing import TYPE_CHECKING, Protocol
 
 import torch
-import torch.distributed as dist
+
+if TYPE_CHECKING:
+    from torchturbo.models.modules.moe.moe_layer import MoELayer
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,18 +71,16 @@ def get_expert_indices(routing_map: torch.Tensor) -> torch.Tensor:
     return experts.view(num_tokens, topk)
 
 
-@dataclass(frozen=True, eq=False)
-class MegaMoeContext:
-    """One EP group's serial layers sharing geometry and HMC workspace.
+class RouteFormat(Enum):
+    DENSE = "dense"
+    TOPK = "topk"
 
-    Context identity scopes the provider cache to a model binding. Parameters
-    remain owned by the model and are supplied after FSDP unshards each layer.
-    """
 
-    ep_group: dist.ProcessGroup
-    hidden_size: int
-    intermediate_size: int
-    num_experts: int
-    top_k: int
-    swiglu_limit: float | None
-    clamp_after_silu: bool
+class MoEMegakernel(Protocol):
+    """Providers may declare route_format for layer.route()."""
+
+    def forward_experts(
+        self, layer: MoELayer, hidden_states: torch.Tensor, input_ids: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the complete expert output in token order (including shared experts) and router logits."""
+        ...

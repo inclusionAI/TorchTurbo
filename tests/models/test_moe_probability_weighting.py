@@ -35,9 +35,9 @@ def cpu_dispatch(monkeypatch):
     get_or_create_ops(device_runtime=runtime, default_policy=OpPolicy.NATIVE)
 
 
-def _layer(*, on_input, use_lora=False, dtype=torch.float32):
+def _layer(*, on_input, use_lora=False, dtype=torch.float32, num_experts=2):
     config = MoEConfig(
-        hidden_size=4, moe_ffn_hidden_size=3, num_moe_experts=2,
+        hidden_size=4, moe_ffn_hidden_size=3, num_moe_experts=num_experts,
         gated_linear_unit=True, activation_func=F.silu,
         moe_router_topk=1 if on_input else 2,
         moe_router_score_function="sigmoid", moe_router_dtype="fp32",
@@ -375,11 +375,10 @@ def test_frozen_experts_preserve_the_router_gradient_graph(freeze_router):
 
 
 def test_mega_moe_reads_fp32_master_weights_inside_expert_hooks(monkeypatch):
-    from torchturbo.ops.moe import MegaMoeContext
-    from torchturbo.ops.providers.npu.mega_moe import HmcMegaMoe
-    from torchturbo.ops import get_ops
+    from torchturbo.ops.providers.npu.mega_moe import HmcRoutedExperts, _HmcExpertCall
 
-    layer = _layer(on_input=False, dtype=torch.float32)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group=None: 2)
+    layer = _layer(on_input=False, dtype=torch.float32, num_experts=4)
     order = []
     layer.experts.register_forward_pre_hook(lambda module, args: order.append("unshard"))
 
@@ -394,12 +393,8 @@ def test_mega_moe_reads_fp32_master_weights_inside_expert_hooks(monkeypatch):
             coeff = probs[:, 0].reshape(3, 2, 1).to(inputs.dtype)
             return inputs * coeff * (w1.mean() + w2.mean())
 
-    context = MegaMoeContext(object(), 4, 3, 2, 2, None, False)
-    provider = HmcMegaMoe()
-    provider._executors[context] = Executor()
-    monkeypatch.setattr(get_ops(), "mega_moe", provider)
-    from types import SimpleNamespace
-    layer.megakernel_experts = SimpleNamespace(context_for=lambda experts: context)
+    monkeypatch.setattr(_HmcExpertCall, "_create_executor", lambda *args: Executor())
+    FSDP2Backend._bind_megakernel(layer, HmcRoutedExperts())
     x = torch.randn(3, 2, 4, dtype=torch.bfloat16, requires_grad=True)
     output, _ = layer(x)
     output.float().sum().backward()

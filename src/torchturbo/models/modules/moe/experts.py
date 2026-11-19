@@ -6,6 +6,7 @@
   #
   # Modified by the TorchTurbo contributors.
 
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 import torch
@@ -18,7 +19,6 @@ from torchturbo.logging import get_logger
 
 if TYPE_CHECKING:
     from torchturbo.engine.optimizers import MuonParameterSpec
-    from torchturbo.ops.moe import MegaMoeContext
 
 logger = get_logger(__name__)
 
@@ -192,16 +192,12 @@ class GroupedMLP(torch.nn.Module):
         tokens_per_expert: torch.Tensor | None,
         permuted_probs: torch.Tensor,
         *,
-        megakernel_context: "MegaMoeContext | None" = None,
+        routed_forward: Callable | None = None,
         expert_indices: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, None]:
-        """Apply routing probabilities inside each expert before its second linear."""
-        if megakernel_context is not None:
-            output = ops.mega_moe(
-                permuted_local_hidden_states, expert_indices, permuted_probs,
-                self, context=megakernel_context,
-            )
-            return output, None
+        """Read expert parameters inside the module call so FSDP can unshard them."""
+        if routed_forward is not None:
+            return routed_forward(self, permuted_local_hidden_states, expert_indices, permuted_probs), None
         if self.config.moe_apply_probs_on_input:
             assert (
                 self.config.moe_router_topk == 1
