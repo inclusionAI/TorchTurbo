@@ -57,6 +57,8 @@ class MoEConfig:
     moe_router_topk_scaling_factor: Optional[float] = None
     """Score function for MoE routing. Can be "softmax" or "sigmoid"."""
     moe_router_score_function: str = "softmax"
+    moe_router_temperature: float = 1.0
+    moe_router_norm_topk_prob: bool | None = None
     moe_router_dtype: Optional[str] = None
     moe_router_enable_expert_bias: bool = False
     """The type of token dispatcher to use."""
