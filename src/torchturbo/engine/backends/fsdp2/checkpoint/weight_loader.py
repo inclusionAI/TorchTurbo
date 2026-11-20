@@ -339,10 +339,18 @@ class DistParamLoader:
                                  if self.param_converter.is_virtual_key(p)}
                 physical_needed = needed_in_file - virtual_needed
 
-                # Physical keys: load directly (unchanged)
+                def read_tensor(key: str) -> torch.Tensor:
+                    if key in file_params:
+                        return file_params[key]
+                    filename = self.param_to_filename[key]
+                    with safe_open(self.path / filename, framework="pt", device="cpu") as shard:
+                        return shard.get_tensor(key)
+
                 for param_name, tensor in file_params.items():
                     if param_name in physical_needed:
-                        local_sd[param_name] = tensor.clone()
+                        local_sd[param_name] = self.param_converter.decode_checkpoint_tensor(
+                            param_name, tensor, read_tensor
+                        )
 
                 # Virtual keys: look up physical tensor, slice by ep_rank
                 # encoded in the virtual key name, store under virtual key.
