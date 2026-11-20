@@ -148,3 +148,24 @@ engine_config:
     bd_mask_low: 0.3
     bd_mask_high: 0.8
     bd_block_size: 32
+
+  # Attention-aware DP rebalance for packed datasets. Balances
+  # sequence-length imbalance across DP ranks within each optimizer step;
+  # requires an explicit gbs, more than one DP rank, and a packed dataset
+  # recognized by a capability detector. Unrecognized datasets keep the
+  # original sampler order.
+  dp_rebalance:
+    # Master switch (needs a cost model below as well).
+    enabled: false
+    # Pack cost model: none | ffd_tokens | ffd_squares | ffd_hybrid.
+    cost_model: none
+    # Re-pack recipe datasets per step window; rebalance atomic ones as whole packs.
+    # Extra tokens allowed beyond the packed dataset's capacity per repacked pack.
+    capacity_margin: 1024
+    # ffd_hybrid cost weights; null uses model-provided hints or defaults.
+    alpha: null
+    beta: null
+    gamma: null
+    # Example of an active configuration:
+    # enabled: true
+    # cost_model: ffd_squares

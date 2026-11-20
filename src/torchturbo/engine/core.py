@@ -6,7 +6,7 @@ import dataclasses
 import json
 import os
 import socket
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Sequence
 from typing import Any, Iterator, Optional
 
 import math
@@ -47,7 +47,9 @@ class DPBlockDistributedSampler(DistributedSampler):
     ``dp_rank`` (e.g. an SP group) yield the identical sequence. The
     sampler only knows the dp info and the block size; the engine picks
     ``rank_block`` as ``ga * batch_size`` with ``tt_gbs`` (whole optimizer
-    steps) or ``sp_size`` (legacy full-world sweep).
+    steps) or ``sp_size`` (legacy full-world sweep). An optional
+    ``step_planner`` may reassign whole microbatches across the per-step
+    DP blocks.
     """
 
     def __init__(
@@ -62,6 +64,7 @@ class DPBlockDistributedSampler(DistributedSampler):
         shuffle: bool = True,
         seed: int = 0,
         drop_last: bool = True,
+        step_planner: Callable[[list[list[int]]], list[list[int]]] | None = None,
     ) -> None:
         # Let DistributedSampler handle defaults for num_replicas / rank
         super().__init__(
@@ -76,6 +79,7 @@ class DPBlockDistributedSampler(DistributedSampler):
         self.dp_size = dp_size
         self.dp_rank = dp_rank
         self.rank_block = rank_block
+        self.step_planner = step_planner
 
         # Recompute sizing: the epoch covers whole blocks of dp_size * rank_block.
         total = len(self.dataset)  # type: ignore[arg-type]
@@ -103,8 +107,19 @@ class DPBlockDistributedSampler(DistributedSampler):
             self.num_samples,
         )
 
-    def __iter__(self) -> Iterator[int]:
-        # Build full index list (deterministic across all ranks)
+        self._prepared_epoch: int | None = None
+        self._prepared_rank_indices: list[int] | None = None
+        if self.step_planner is not None:
+            self._prepare_epoch()
+
+    def set_epoch(self, epoch: int) -> None:
+        """Set the epoch and precompute planned streams before dataloader fork."""
+        super().set_epoch(epoch)
+        if self._prepared_epoch != epoch:
+            self._prepare_epoch()
+
+    def _indices(self) -> list[int]:
+        """Full epoch index list, deterministic across all ranks."""
         if self.shuffle:
             g = torch.Generator()
             g.manual_seed(self.seed + self.epoch)
@@ -112,28 +127,64 @@ class DPBlockDistributedSampler(DistributedSampler):
         else:
             indices = list(range(len(self.dataset)))  # type: ignore[arg-type]
 
-        # Pad or truncate to total_size
         if len(indices) < self.total_size:
-            # Cycle the full list until we reach total_size.
             indices = (indices * math.ceil(self.total_size / len(indices)))[: self.total_size]
         else:
             indices = indices[: self.total_size]
+        return indices
 
-        # Each block is consecutive per-group slices; DP rank d takes
-        # [d*rank_block, (d+1)*rank_block). Ranks sharing a dp_rank yield
-        # the identical list.
-        rank_indices = []
+    def _prepare_epoch(self) -> None:
+        """Plan the whole epoch so dataset mutations are visible to workers."""
+        indices = self._indices()
+        if self.step_planner is None:
+            rank_indices = self._dp_stream(indices, self.dp_rank)
+        else:
+            streams = [self._dp_stream(indices, r) for r in range(self.dp_size)]
+            rank_indices = []
+            for offset in range(0, self.num_samples, self.rank_block):
+                blocks = [
+                    stream[offset : offset + self.rank_block] for stream in streams
+                ]
+                planned = None
+                try:
+                    planned = self.step_planner(blocks)
+                except Exception:  # noqa: BLE001 - planning must never break loading
+                    logger.warning_rank0(
+                        "Step planner failed; keeping the base dp blocks.",
+                        exc_info=True,
+                    )
+                if (
+                    planned is None
+                    or len(planned) != self.dp_size
+                    or any(len(items) != self.rank_block for items in planned)
+                ):
+                    planned = blocks
+                rank_indices.extend(planned[self.dp_rank])
+        self._prepared_rank_indices = rank_indices
+        self._prepared_epoch = self.epoch
+
+    def __iter__(self) -> Iterator[int]:
+        if (
+            self._prepared_rank_indices is None
+            or self._prepared_epoch != self.epoch
+        ):
+            self._prepare_epoch()
+        return iter(self._prepared_rank_indices)
+
+    def _dp_stream(self, indices: Sequence[int], dp_rank: int) -> list[int]:
+        """One DP rank's full epoch stream: per-step block slices, inter-mixed."""
+        stream = []
         for i in range(self.num_iterations):
-            base = i * self.dp_size * self.rank_block + self.dp_rank * self.rank_block
-            rank_indices.extend(indices[base : base + self.rank_block])
+            base = i * self.dp_size * self.rank_block + dp_rank * self.rank_block
+            stream.extend(indices[base : base + self.rank_block])
 
         if self.shuffle:
-            g2 = torch.Generator()
-            g2.manual_seed(self.seed + self.epoch + self.dp_rank)
-            perm = torch.randperm(len(rank_indices), generator=g2)
-            rank_indices = [rank_indices[i] for i in perm.tolist()]
+            g = torch.Generator()
+            g.manual_seed(self.seed + self.epoch + dp_rank)
+            perm = torch.randperm(len(stream), generator=g)
+            stream = [stream[i] for i in perm.tolist()]
 
-        return iter(rank_indices)
+        return stream
 
     def __len__(self) -> int:
         return self.num_samples
@@ -895,6 +946,48 @@ class TorchTurboEngine:
         """
         return self.backend.get_dp_info()
 
+    def _create_sampler(
+        self,
+        dataset: Any,
+        *,
+        batch_size: int,
+        gbs: int | None,
+        dp_size: int,
+        dp_rank: int,
+        rank_block: int,
+        shuffle: bool,
+        seed: int,
+        drop_last: bool,
+        allow_repack: bool,
+    ) -> tuple[Any, Any]:
+        """Create the SP-aware DP-block sampler, rebalanced when dp rebalance applies."""
+        from .dp_rebalance import resolve_dp_rebalance_plan
+
+        dataset, step_planner = resolve_dp_rebalance_plan(
+            dataset,
+            self.config.dp_rebalance,
+            model=getattr(self, "model", None),
+            gbs=gbs,
+            dp_size=dp_size,
+            batch_size=batch_size,
+            rank_block=rank_block,
+            drop_last=drop_last,
+            allow_repack=allow_repack,
+        )
+        sampler = DPBlockDistributedSampler(
+            dataset,
+            num_replicas=dist.get_world_size(),
+            rank=dist.get_rank(),
+            dp_size=dp_size,
+            dp_rank=dp_rank,
+            rank_block=rank_block,
+            shuffle=shuffle,
+            seed=seed,
+            drop_last=drop_last,
+            step_planner=step_planner,
+        )
+        return dataset, sampler
+
     def create_dataloader(
         self,
         dataset: Any,
@@ -940,16 +1033,19 @@ class TorchTurboEngine:
         else:
             rank_block = sp_info["sp_size"]
 
-        sampler = DPBlockDistributedSampler(
+        persistent_workers = bool(kwargs.get("persistent_workers", False))
+        allow_repack = not (num_workers > 0 and persistent_workers)
+        dataset, sampler = self._create_sampler(
             dataset,
-            num_replicas=dist.get_world_size(),
-            rank=dist.get_rank(),
+            batch_size=batch_size,
+            gbs=gbs,
             dp_size=dp_info["dp_size"],
             dp_rank=dp_info["dp_rank"],
             rank_block=rank_block,
             shuffle=shuffle,
             seed=seed,
             drop_last=drop_last,
+            allow_repack=allow_repack,
         )
 
         logger.info_rank0(
