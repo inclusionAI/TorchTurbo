@@ -26,6 +26,8 @@ from typing import Any, Literal, get_args, get_type_hints
 
 from omegaconf import OmegaConf
 
+from .dp_rebalance import DPRebalanceConfig
+
 from ..logging import get_logger
 from ..ops.base import OpPolicy
 from .args import TorchTurboArgs, get_arg_specs, string_to_bool
@@ -675,6 +677,9 @@ class EngineConfig:
     mfu: MfuConfig = field(default_factory=MfuConfig)
     """MFU/HFU reporting settings."""
 
+    dp_rebalance: DPRebalanceConfig = field(default_factory=DPRebalanceConfig)
+    """Attention-aware DP rebalance settings for packed datasets."""
+
     gbs: int | None = None
     """Global batch size in micro-batch units (``--tt_gbs``). When set, the
     engine derives ``gradient_accumulation_steps = gbs * sp_size / world_size``
@@ -711,6 +716,12 @@ class EngineConfig:
             self.optimizer = OptimizerConfig(**self.optimizer)
         elif not isinstance(self.optimizer, OptimizerConfig):
             raise TypeError("optimizer must be an OptimizerConfig or dict")
+        if self.dp_rebalance is None:
+            self.dp_rebalance = DPRebalanceConfig()
+        elif isinstance(self.dp_rebalance, dict):
+            self.dp_rebalance = DPRebalanceConfig(**self.dp_rebalance)
+        elif not isinstance(self.dp_rebalance, DPRebalanceConfig):
+            raise TypeError("dp_rebalance must be a DPRebalanceConfig or dict")
         if self.gbs is not None and self.gbs <= 0:
             raise ValueError(
                 f"gbs (--tt_gbs) must be a positive integer, got {self.gbs}."
@@ -834,6 +845,9 @@ class EngineConfig:
         # MFU/HFU reporting
         mfu_config = cls._parse_mfu_config(d.get("mfu", {}))
 
+        # Attention-aware DP rebalance for packed datasets
+        dp_rebalance_config = cls._parse_dp_rebalance_config(d.get("dp_rebalance", {}))
+
         # Extra
         known_keys = {
             "backend",
@@ -875,6 +889,7 @@ class EngineConfig:
             "freeze_policy",
             "diffusion",
             "mfu",
+            "dp_rebalance",
             "gbs",
             "plugin_paths",
             "extra",
@@ -900,6 +915,7 @@ class EngineConfig:
             freeze_policy=freeze_policy,
             diffusion=_build_diffusion_config(d),
             mfu=mfu_config,
+            dp_rebalance=dp_rebalance_config,
             gbs=d.get("gbs"),
             plugin_paths=list(d.get("plugin_paths") or []),
             extra=extra,
@@ -975,6 +991,19 @@ class EngineConfig:
         if kwargs.get("enabled") is not None:
             kwargs["enabled"] = string_to_bool(kwargs["enabled"])
         return MfuConfig(**kwargs)
+
+    @staticmethod
+    def _parse_dp_rebalance_config(value: Any) -> DPRebalanceConfig:
+        if isinstance(value, DPRebalanceConfig):
+            return value
+        if value is None:
+            value = {}
+        if not isinstance(value, dict):
+            raise TypeError("dp_rebalance must be a dict or DPRebalanceConfig.")
+        kwargs = dict(value)
+        if "enabled" in kwargs:
+            kwargs["enabled"] = string_to_bool(kwargs["enabled"])
+        return DPRebalanceConfig(**kwargs)
 
     @staticmethod
     def _parse_freeze_policy(value: Any) -> FreezePolicy:
@@ -1157,6 +1186,7 @@ def build_from_args(
         loss_chunk=_build_loss_chunk_config(fields),
         freeze_policy=_build_freeze_policy(fields),
         mfu=_build_mfu_config(fields),
+        dp_rebalance=_build_dp_rebalance_config(fields),
         diffusion=_build_diffusion_config(fields),
         gbs=fields.get("gbs"),
         plugin_paths=list(tt.plugins or []),
@@ -1191,6 +1221,14 @@ def _dataclass_config_paths(
     return paths
 
 
+def _build_dp_rebalance_config(fields: Mapping[str, Any]) -> DPRebalanceConfig:
+    """``DPRebalanceConfig`` from a merged config dict."""
+    dp_rebalance_d = dict(fields.get("dp_rebalance") or {})
+    if "enabled" in dp_rebalance_d:
+        dp_rebalance_d["enabled"] = string_to_bool(dp_rebalance_d["enabled"])
+    return DPRebalanceConfig(**dp_rebalance_d)
+
+
 def _validate_config_file(data: Mapping[str, Any], parents: tuple[str, ...] = ()) -> None:
     allowed = {
         spec.config_path
@@ -1207,6 +1245,7 @@ def _validate_config_file(data: Mapping[str, Any], parents: tuple[str, ...] = ()
         }
     )
     allowed.update(_dataclass_config_paths(OptimizerConfig, ("optimizer",)))
+    allowed.update(_dataclass_config_paths(DPRebalanceConfig, ("dp_rebalance",)))
 
     for key, value in data.items():
         parts = (*parents, key)
