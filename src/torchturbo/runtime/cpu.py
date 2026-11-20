@@ -5,7 +5,7 @@ from contextlib import nullcontext
 
 import torch
 
-from .base import BaseProfiler, DeviceRuntime, TurboDevice
+from .base import BaseProfiler, DeviceRuntime, ProfilingConfig, TurboDevice
 
 
 class CpuRuntime(DeviceRuntime):
@@ -72,6 +72,7 @@ class CpuRuntime(DeviceRuntime):
         output_dir: str,
         worker_name: str,
         profiling_enabled: bool,
+        profiling_config: ProfilingConfig,
         memory_snapshot_steps: int | None,
     ) -> BaseProfiler:
         raise NotImplementedError(

@@ -848,6 +848,7 @@ class TorchTurboEngine:
             output_dir=profiling_dir,
             worker_name=f"rank{rank}_{socket.gethostname()}",
             profiling_enabled=profiling_enabled,
+            profiling_config=self.config.profiling,
             memory_snapshot_steps=memory_snapshot_steps,
         )
         profiler.start()
