@@ -1,6 +1,7 @@
 """FSDP2 distributed backend — ``torch.distributed.fsdp.fully_shard``."""
 
 import functools
+import re
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from types import MappingProxyType, MethodType
@@ -43,6 +44,8 @@ from torchturbo.models.modules.vision import register_vision_balance
 from torchturbo.parallel import (
     FSDPParallelPlan,
     FSDPPlanSpec,
+    USER_PLAN_PATTERNS_ATTR,
+    resolve_plan_spec,
 )
 from torchturbo.runtime import DeviceRuntime
 from torchturbo.utils.torch_utils import torch_version
@@ -89,6 +92,107 @@ class _FSDPUnit:
 class _ResolvedFSDPPlan:
     modules: Mapping[str, FSDPPlanSpec]
     parameters: Mapping[str, FSDPPlanSpec]
+
+
+def _plan_spec_summary(spec: FSDPPlanSpec) -> dict[str, Any]:
+    """Return a JSON/log-friendly summary of the fields users configure."""
+    placement = spec.placement
+    replace_module = spec.replace_module
+    vision = spec.vision_balance
+    return {
+        "activation_checkpoint": spec.activation_checkpoint,
+        "no_shard": spec.no_shard,
+        "standalone_world_shard": spec.standalone_world_shard,
+        "mesh": None if placement is None else (placement.mesh_dim or "world"),
+        "replace_module": (
+            None
+            if replace_module is None
+            else getattr(replace_module, "__name__", repr(replace_module))
+        ),
+        "vision_balance": None if vision is None else vision.mode,
+    }
+
+
+def _fqn_trie(fqns: list[str]) -> dict[str, Any]:
+    """Build a segment trie, normalizing numeric segments for ordering."""
+    root: dict[str, Any] = {"children": {}}
+    for fqn in fqns:
+        children = root["children"]
+        for segment in fqn.split(".") if fqn else ():
+            children = children.setdefault(segment, {"children": {}})["children"]
+    return root
+
+
+def _serialize_fqn_trie(node: dict[str, Any]) -> list[str]:
+    """Serialize a trie, collapsing consecutive numeric runs at any depth."""
+    cached = node.get("serialized")
+    if cached is not None:
+        return cached
+    children = node["children"]
+    if not children:
+        node["serialized"] = [""]
+        return [""]
+    non_numeric = sorted(k for k in children if not k.isdigit())
+    numeric = sorted((k for k in children if k.isdigit()), key=int)
+
+    output: list[str] = []
+    for key in non_numeric:
+        for suffix in _serialize_fqn_trie(children[key]):
+            output.append(key if suffix == "" else f"{key}.{suffix}")
+
+    # Consecutive indices with identical subtrees collapse into one segment,
+    # e.g. layers/{0,1,2}.mlp -> layers.[0~2].mlp.
+    idx = 0
+    while idx < len(numeric):
+        suffixes = tuple(_serialize_fqn_trie(children[numeric[idx]]))
+        end = idx
+        while (
+            end + 1 < len(numeric)
+            and int(numeric[end + 1]) == int(numeric[end]) + 1
+            and tuple(_serialize_fqn_trie(children[numeric[end + 1]])) == suffixes
+        ):
+            end += 1
+        if end == idx:
+            label = numeric[idx]
+        else:
+            label = f"[{numeric[idx]}~{numeric[end]}]"
+        for suffix in suffixes:
+            output.append(label if suffix == "" else f"{label}.{suffix}")
+        idx = end + 1
+    node["serialized"] = output
+    return output
+
+
+def _compressed_fqn_sort_key(fqn: str) -> tuple[tuple[int, Any], ...]:
+    """Numeric-aware ordering for compressed labels (``[0~9]`` sorts by start)."""
+    first_index = re.sub(r"\[(\d+)~\d+\]", r"\1", fqn)
+    return tuple(
+        (1, int(segment)) if segment.isdigit() else (0, segment)
+        for segment in re.findall(r"\d+|\D+", first_index)
+    )
+
+
+def _compress_fqn_runs(entries: list[tuple[str, dict[str, Any]]]) -> list[str]:
+    """Group effective specs, then merge numeric FQN runs inside each group.
+
+    Model FQNs arrive in pre-order DFS (``layers.0``, ``layers.0.mlp``,
+    ``layers.1``...), so adjacent-only compression would never merge repeated
+    layer specs. Grouping by identical summaries first and compressing each
+    group as a segment trie collapses runs at any depth, including
+    ``model.layers.[0~23].mlp.experts``. Cost is linear in trie size after
+    grouping, negligible next to plan wrapping.
+    """
+    groups: dict[tuple[tuple[str, Any], ...], list[str]] = {}
+    for fqn, summary in entries:
+        groups.setdefault(tuple(summary.items()), []).append(fqn)
+
+    lines: list[str] = []
+    for summary_items, fqns in groups.items():
+        compressed = _serialize_fqn_trie(_fqn_trie(fqns))
+        compressed = ["<root>" if fqn == "" else fqn for fqn in compressed]
+        compressed.sort(key=_compressed_fqn_sort_key)
+        lines.append(f"{', '.join(compressed)} -> {dict(summary_items)}")
+    return lines
 
 
 def _confidence_entropy_sum(logits: torch.Tensor, labels: torch.Tensor,
@@ -332,7 +436,7 @@ class FSDP2Backend(BaseBackend):
                 if fqn == "":
                     continue
 
-                spec = plan.match(fqn)
+                spec = resolve_plan_spec(plan, fqn)
                 if isinstance(spec, FSDPPlanSpec) and spec.replace_module:
                     kwargs = spec.module_kwargs
 
@@ -364,16 +468,48 @@ class FSDP2Backend(BaseBackend):
         plan: FSDPParallelPlan,
         model_fqn_map: ModelFQNMap,
     ) -> _ResolvedFSDPPlan:
-        """Resolve model-authored patterns to exact prepared-tree FQNs."""
-        for pattern, spec in plan.plan.items():
+        """Resolve model defaults plus user overrides to prepared-tree FQNs.
+
+        Model defaults and user patterns stay separate (see
+        ``parallel.fsdp.resolve_plan_spec``). Each side keeps declared-order
+        first-match semantics; a user match overrides only explicitly set
+        fields.
+        """
+        user_patterns: Mapping[str, FSDPPlanSpec] = (
+            getattr(plan, USER_PLAN_PATTERNS_ATTR, None) or {}
+        )
+        matched_user_patterns: set[str] = set()
+
+        def validate_vision_pattern(
+            patterns: Mapping[str, FSDPPlanSpec], pattern: str, spec: FSDPPlanSpec
+        ) -> None:
+            """Validate a vision-balance pattern on one pattern side.
+
+            A vision spec that loses its side's first-match competition (or only
+            matches parameters) would silently never register, so require it to
+            be the winning pattern for at least one module FQN and to carry the
+            model-provided IO adapter. ``patterns`` is either the model default
+            plan or the user override list; each side is validated in isolation.
+            """
             vision_spec = spec.vision_balance
             if vision_spec is None or vision_spec.mode is None:
-                continue
-            matches_module = any(
-                match_fqn(pattern, fqn) and plan.match(fqn) is spec
-                for fqn in model_fqn_map.modules
-            )
-            if not matches_module:
+                return
+            winning = None
+            for candidate_fqn in model_fqn_map.modules:
+                winning_pattern = next(
+                    (
+                        candidate
+                    for candidate in patterns
+                    if match_fqn(candidate, candidate_fqn)
+                    ),
+                    None,
+                )
+                if winning_pattern is None:
+                    continue
+                if winning_pattern == pattern:
+                    winning = candidate_fqn
+                    break
+            if winning is None:
                 raise ValueError(
                     f"Vision balance pattern {pattern!r} does not resolve "
                     "to a module in the active parallel plan."
@@ -383,30 +519,59 @@ class FSDP2Backend(BaseBackend):
                     f"Vision balance pattern {pattern!r} requires a model-provided "
                     "input/output adapter."
                 )
-        model_fqns = tuple(model_fqn_map.modules) + tuple(model_fqn_map.parameters)
-        unmatched_patterns = [
-            pattern
-            for pattern in plan.plan
-            if not any(match_fqn(pattern, fqn) for fqn in model_fqns)
-        ]
-        if unmatched_patterns:
-            # TODO: Raise ValueError when unmatched plan patterns become errors.
-            logger.warning_rank0(
-                "FSDPParallelPlan patterns matched no model FQNs: %s",
-                unmatched_patterns,
-            )
+
+        for pattern, spec in plan.plan.items():
+            validate_vision_pattern(plan.plan, pattern, spec)
+        for pattern, spec in user_patterns.items():
+            validate_vision_pattern(user_patterns, pattern, spec)
+
+        def resolve(fqn: str) -> FSDPPlanSpec | None:
+            for pattern in user_patterns:
+                if match_fqn(pattern, fqn):
+                    matched_user_patterns.add(pattern)
+                    break
+            return resolve_plan_spec(plan, fqn)
 
         modules: dict[str, FSDPPlanSpec] = {}
         for model_fqn, prepared_fqn in model_fqn_map.modules.items():
-            spec = plan.match(model_fqn)
+            spec = resolve(model_fqn)
             if isinstance(spec, FSDPPlanSpec):
                 modules[prepared_fqn] = spec
 
         parameters: dict[str, FSDPPlanSpec] = {}
         for model_fqn, prepared_fqn in model_fqn_map.parameters.items():
-            spec = plan.match(model_fqn)
+            spec = resolve(model_fqn)
             if isinstance(spec, FSDPPlanSpec):
+                # A vision pattern naturally matches both a module and its
+                # parameters (e.g. "model.visual"). Pattern-level validation
+                # above only requires a winning module; the vision spec is
+                # simply inert on parameter entries, matching upstream behavior.
                 parameters[prepared_fqn] = spec
+
+        unmatched_user_patterns = [
+            pattern for pattern in user_patterns if pattern not in matched_user_patterns
+        ]
+        if unmatched_user_patterns:
+            logger.warning_rank0(
+                "User parallel plan patterns matched no model FQNs: %s",
+                unmatched_user_patterns,
+            )
+
+        summary_entries = [
+            (prepared_fqn, _plan_spec_summary(spec))
+            for prepared_fqn, spec in modules.items()
+        ]
+        compressed = _compress_fqn_runs(summary_entries)
+        if compressed:
+            # Keep lines bounded for very large models while still showing every
+            # distinct effective spec group.
+            chunk_size = 20
+            for start in range(0, len(compressed), chunk_size):
+                logger.info_rank0(
+                    "Effective parallel plan: %s",
+                    "; ".join(compressed[start : start + chunk_size]),
+                )
+
         return _ResolvedFSDPPlan(
             modules=MappingProxyType(modules),
             parameters=MappingProxyType(parameters),
@@ -855,6 +1020,22 @@ class FSDP2Backend(BaseBackend):
                 target_fqns,
             )
             return model
+
+        # Nested checkpoint regions double-recompute and are almost always an
+        # accidental container/submodule override conflict. Reject them early
+        # instead of silently wrapping both regions.
+        target_fqn_set = {fqn for fqn, _ in target_modules}
+        for fqn, _ in target_modules:
+            prefix = fqn
+            while "." in prefix:
+                prefix = prefix.rsplit(".", 1)[0]
+                if prefix in target_fqn_set:
+                    raise ValueError(
+                        "Nested activation checkpoint targets: "
+                        f"{prefix!r} and {fqn!r} are both enabled. Keep the "
+                        "outer module and remove the inner rule, or set the "
+                        "outer module's activation_checkpoint to false."
+                    )
 
         # TorchTurbo owns activation checkpointing here. Make sure HF's own
         # GradientCheckpointingLayer base class does not ALSO checkpoint its

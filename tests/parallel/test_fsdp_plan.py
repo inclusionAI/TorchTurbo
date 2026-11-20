@@ -13,14 +13,15 @@ if "grouped_gemm" not in sys.modules:  # pragma: no cover - env shim
 
 import pytest
 
+from torchturbo.engine.utils import match_fqn
 from torchturbo.parallel import (
     FSDPParallelPlan,
     FSDPPlacementSpec,
     FSDPPlanSpec,
     VisionBalanceMode,
     VisionBalanceSpec,
+    resolve_plan_spec,
 )
-from torchturbo.engine.utils import match_fqn
 
 
 def test_standalone_world_shard_spec_is_valid():
@@ -100,6 +101,63 @@ def test_parallel_plan_round_trip_preserves_partial_overrides():
     assert spec.standalone_world_shard is None
     assert spec.activation_checkpoint is None
     assert spec.module_kwargs is None
+
+
+def _plan_with_user_patterns(defaults, user):
+    plan = FSDPParallelPlan.from_dict({"plan": defaults})
+    user_plan = FSDPParallelPlan.from_dict({"plan": user})
+    setattr(plan, "_tt_user_plan_patterns", dict(user_plan.plan))
+    return plan
+
+
+def test_user_pattern_overrides_default_first_match_per_fqn():
+    plan = _plan_with_user_patterns(
+        {
+            "model.layers.*": {"activation_checkpoint": True},
+        },
+        {"model.layers.1": {"activation_checkpoint": False}},
+    )
+
+    spec = resolve_plan_spec(plan, "model.layers.1")
+    assert spec.activation_checkpoint is False
+    assert spec.replace_module is None
+
+    spec = plan.match("model.layers.1")
+    assert spec.activation_checkpoint is True
+
+
+def test_user_pattern_keeps_unspecified_default_fields():
+    plan = _plan_with_user_patterns(
+        {"model.layers.*.mlp": {"activation_checkpoint": True, "no_shard": True}},
+        {"model.layers.*.mlp": {"activation_checkpoint": False}},
+    )
+
+    spec = resolve_plan_spec(plan, "model.layers.0.mlp")
+    assert spec.activation_checkpoint is False
+    assert spec.no_shard is True
+
+
+def test_user_patterns_use_declared_order_first_match():
+    plan = _plan_with_user_patterns(
+        {"model.layers.*": {"activation_checkpoint": True}},
+        {
+            "model.layers.*": {"activation_checkpoint": False},
+            "model.layers.1": {"activation_checkpoint": True},
+        },
+    )
+
+    assert resolve_plan_spec(plan, "model.layers.1").activation_checkpoint is False
+    assert resolve_plan_spec(plan, "model.layers.2").activation_checkpoint is False
+
+
+def test_user_pattern_without_default_creates_entry():
+    plan = _plan_with_user_patterns(
+        {}, {"model.layers.*.attention": {"activation_checkpoint": True}}
+    )
+
+    spec = resolve_plan_spec(plan, "model.layers.3.attention")
+    assert spec.activation_checkpoint is True
+    assert resolve_plan_spec(plan, "model.layers.3.mlp") is None
 
 
 def test_match_fqn_star_stays_within_one_segment():

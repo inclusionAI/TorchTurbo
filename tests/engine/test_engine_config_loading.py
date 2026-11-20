@@ -42,8 +42,10 @@ from torchturbo.ops.base import OpPolicy
 from torchturbo.parallel import (
     FSDPParallelPlan,
     FSDPPlanSpec,
+    USER_PLAN_PATTERNS_ATTR,
     VisionBalanceMode,
     VisionBalanceSpec,
+    resolve_plan_spec,
 )
 
 
@@ -1050,7 +1052,12 @@ parallel_plan:
 
     plan = _resolve_engine_plan(_build_from_argv(["--tt_config", path]))
 
-    assert plan.plan["model.language_model.layers.*"].activation_checkpoint is False
+    # User patterns stay separate from model defaults and override per FQN.
+    assert plan.plan["model.language_model.layers.*"].activation_checkpoint is True
+    assert (
+        resolve_plan_spec(plan, "model.language_model.layers.7").activation_checkpoint
+        is False
+    )
     # Untouched FQNs must keep their model defaults (MoE replacement, kwargs).
     mlp = plan.plan["model.language_model.layers.*.mlp"]
     assert mlp.replace_module is not None
@@ -1073,7 +1080,8 @@ parallel_plan:
 
     plan = _resolve_engine_plan(_build_from_argv(["--tt_config", path]))
 
-    assert plan.plan["model.visual"].standalone_world_shard is False
+    assert plan.plan["model.visual"].standalone_world_shard is True
+    assert resolve_plan_spec(plan, "model.visual").standalone_world_shard is False
 
 
 @pytest.mark.parametrize("source", ["yaml", "python", "dict"])
@@ -1115,10 +1123,11 @@ def test_parallel_plan_vision_balance_keeps_bailing_sharding(
 
     plan = _resolve_engine_plan(cfg, _FakeBailingVL)
 
-    vision_spec = plan.plan["model.visual"].vision_balance
+    resolved = resolve_plan_spec(plan, "model.visual")
+    vision_spec = resolved.vision_balance
     assert vision_spec.mode is VisionBalanceMode(mode)
     assert isinstance(vision_spec.io, BailingVisionBalanceIO)
-    assert plan.plan["model.visual"].standalone_world_shard is True
+    assert resolved.standalone_world_shard is True
     assert plan.plan["model.visual.blocks.*"].activation_checkpoint is True
 
 
@@ -1154,7 +1163,7 @@ def test_parallel_plan_merges_vision_spec_without_mutating_default(
     )
 
     plan = _resolve_engine_plan(cfg, ModelWithVisionDefault)
-    vision_spec = plan.plan["visual"].vision_balance
+    vision_spec = resolve_plan_spec(plan, "visual").vision_balance
 
     assert vision_spec is not default_vision
     assert vision_spec.mode is (override_mode or VisionBalanceMode.PATCH_SQ)
@@ -1179,7 +1188,9 @@ parallel_plan:
 
     plan = _resolve_engine_plan(_build_from_argv(["--tt_config", path]))
 
-    assert plan.plan["model.new_module"].activation_checkpoint is True
+    assert "model.new_module" not in plan.plan
+    assert "model.new_module" in getattr(plan, USER_PLAN_PATTERNS_ATTR)
+    assert resolve_plan_spec(plan, "model.new_module").activation_checkpoint is True
 
 
 def test_config_no_shard_conflicts_with_model_placement(tmp_path):
@@ -1198,8 +1209,14 @@ parallel_plan:
         ),
     )
 
+    plan = _resolve_engine_plan(_build_from_argv(["--tt_config", path]))
+
+    # The conflict surfaces when the per-FQN override inherits the model's
+    # expert placement while adding no_shard.
     with pytest.raises(ValueError, match="mutually exclusive"):
-        _resolve_engine_plan(_build_from_argv(["--tt_config", path]))
+        resolve_plan_spec(
+            plan, "model.language_model.layers.0.mlp.experts"
+        )
 
 
 def test_sample_style_config_patches_model_default_without_losing_defaults(

@@ -754,7 +754,7 @@ class TorchTurboEngine:
     def _resolve_parallel_plan(self, model: nn.Module):
         """Resolve the parallel plan for a model."""
         from ..models.base import TurboModel
-        from ..parallel import VisionBalanceSpec
+        from ..parallel import USER_PLAN_PATTERNS_ATTR
 
         if not isinstance(model, TurboModel):
             raise TypeError(
@@ -773,36 +773,10 @@ class TorchTurboEngine:
                     setattr(plan, attr, val)
 
             if hasattr(engine_plan, "plan") and engine_plan.plan:
-                if not hasattr(plan, "plan") or plan.plan is None:
-                    plan.plan = {}
-                for fqn, engine_spec in engine_plan.plan.items():
-                    base = plan.plan.get(fqn)
-                    if base is not None and dataclasses.is_dataclass(base):
-                        overrides = {}
-                        for f in dataclasses.fields(engine_spec):
-                            value = getattr(engine_spec, f.name)
-                            if value is not None:
-                                if (
-                                    isinstance(value, VisionBalanceSpec)
-                                    and base.vision_balance is not None
-                                ):
-                                    base_vision = base.vision_balance
-                                    value = VisionBalanceSpec(
-                                        mode=(
-                                            value.mode
-                                            if value.mode is not None
-                                            else base_vision.mode
-                                        ),
-                                        io=(
-                                            value.io
-                                            if value.io is not None
-                                            else base_vision.io
-                                        ),
-                                    )
-                                overrides[f.name] = value
-                        plan.plan[fqn] = dataclasses.replace(base, **overrides)
-                    else:
-                        plan.plan[fqn] = engine_spec
+                # Keep user patterns separate from model defaults. Backend-side
+                # FQN resolution applies model defaults first, then user
+                # field-level overrides (see parallel.fsdp.resolve_plan_spec).
+                setattr(plan, USER_PLAN_PATTERNS_ATTR, dict(engine_plan.plan))
 
         return plan
 

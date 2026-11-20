@@ -24,6 +24,7 @@ from torchturbo.models.modules.cpu_resident import NodeSharedCPUResidentParamete
 from torchturbo.parallel import (
     FSDPParallelPlan,
     FSDPPlanSpec,
+    USER_PLAN_PATTERNS_ATTR,
     VisionBalanceMode,
     VisionBalanceSpec,
 )
@@ -106,7 +107,7 @@ def test_model_fqn_map_is_unavailable_before_prepare_model():
         backend.get_model_fqn_map()
 
 
-def test_compile_parallel_plan_warns_for_unmatched_patterns(monkeypatch):
+def test_compile_parallel_plan_does_not_warn_for_unmatched_default_patterns(monkeypatch):
     from torchturbo.engine.backends.fsdp2 import backend as backend_module
 
     warnings = []
@@ -126,8 +127,87 @@ def test_compile_parallel_plan_warns_for_unmatched_patterns(monkeypatch):
 
     assert dict(resolved.modules) == {}
     assert dict(resolved.parameters) == {}
+    assert warnings == []
+
+
+def test_compile_parallel_plan_warns_for_unmatched_user_patterns(monkeypatch):
+    from torchturbo.engine.backends.fsdp2 import backend as backend_module
+
+    warnings = []
+    monkeypatch.setattr(
+        backend_module,
+        "logger",
+        types.SimpleNamespace(
+            warning_rank0=lambda message, *args: warnings.append(message % args),
+            info_rank0=lambda *args, **kwargs: None,
+        ),
+    )
+    model = nn.Linear(2, 2)
+    plan = FSDPParallelPlan()
+    setattr(
+        plan,
+        USER_PLAN_PATTERNS_ATTR,
+        {
+            "missing.*": FSDPPlanSpec(no_shard=True),
+            "weight": FSDPPlanSpec(no_shard=True),
+        },
+    )
+
+    resolved = resolve_plan(model, plan)
+
+    assert dict(resolved.modules) == {}
+    assert dict(resolved.parameters)["weight"].no_shard is True
     assert warnings == [
-        "FSDPParallelPlan patterns matched no model FQNs: ['missing.*']"
+        "User parallel plan patterns matched no model FQNs: ['missing.*']"
+    ]
+
+
+def test_activation_checkpointing_rejects_nested_targets():
+    backend = make_backend()
+    backend.config = types.SimpleNamespace(
+        activation_checkpointing=types.SimpleNamespace(enabled=True)
+    )
+
+    class Layer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.attention = nn.Linear(2, 2)
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = nn.ModuleList([Layer()])
+
+    resolved = types.SimpleNamespace(
+        modules={
+            "layers.0": FSDPPlanSpec(activation_checkpoint=True),
+            "layers.0.attention": FSDPPlanSpec(activation_checkpoint=True),
+        }
+    )
+
+    with pytest.raises(ValueError, match="Nested activation checkpoint"):
+        FSDP2Backend._apply_activation_checkpointing(backend, Model(), resolved)
+
+
+def test_compress_fqn_runs_groups_specs_across_dfs_order():
+    from torchturbo.engine.backends.fsdp2.backend import _compress_fqn_runs
+
+    summary_ac = {"activation_checkpoint": True}
+    summary_mlp = {"activation_checkpoint": False}
+    entries = [
+        ("model.layers.0", summary_ac),
+        ("model.layers.0.mlp", summary_mlp),
+        ("model.layers.1", summary_ac),
+        ("model.layers.1.mlp", summary_mlp),
+        ("model.layers.10", summary_ac),
+        ("model.layers.10.mlp", summary_mlp),
+    ]
+
+    lines = _compress_fqn_runs(entries)
+
+    assert lines == [
+        f"model.layers.[0~1], model.layers.10 -> {summary_ac}",
+        f"model.layers.[0~1].mlp, model.layers.10.mlp -> {summary_mlp}",
     ]
 
 
@@ -1320,6 +1400,7 @@ def test_activation_checkpointing_disabled_warns_and_skips_plan_targets(monkeypa
         "logger",
         types.SimpleNamespace(
             warning_rank0=lambda *args, **kwargs: warnings.append(args),
+            info_rank0=lambda *args, **kwargs: None,
         ),
     )
 
