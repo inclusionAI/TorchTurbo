@@ -340,8 +340,19 @@ def _npu_li(
         0,
         self.ratio,
     )
-    k_tnd = k_tnd.detach().to(torch.bfloat16).unsqueeze(1).contiguous()
     sparse_count = min(self.index_topk, k_indexer.size(1))
+    if k_tnd.numel() == 0:
+        # No complete compressed block is visible; avoid the op crash and return all -1 (no hit).
+        topk_idxs = torch.full(
+            (bsz, q_full.size(1), self.index_topk),
+            -1,
+            dtype=torch.int64,
+            device=q_indexer.device,
+        )
+        if sp_size > 1:
+            topk_idxs = topk_idxs[:, sp_rank * local_len : (sp_rank + 1) * local_len]
+        return topk_idxs.contiguous(), None
+    k_tnd = k_tnd.detach().to(torch.bfloat16).unsqueeze(1).contiguous()
     # TND batch size equals the number of segments.
     metadata = ops.lightning_indexer_metadata(
         num_heads_q=num_heads,
