@@ -12,7 +12,7 @@ from torchturbo.logging import get_logger
 from torchturbo.runtime import DeviceRuntime, TurboDevice
 
 from .base import OpImpl, OpImplKind, OpPolicy, OpSpec
-from .moe import MoEPermutation, get_expert_indices
+from .moe import MoEMegakernel, MoEPermutation, get_expert_indices
 from .packed_params import get_packed_params
 from .providers import iter_provider_modules
 from .registry import OpRegistry
@@ -526,6 +526,10 @@ class OpDispatcher:
         return self._dispatch(
             "lightning_indexer_metadata", *args, impl=impl, **kwargs
         )
+
+    def mega_moe(self, *, impl: str | None = None) -> MoEMegakernel:
+        """Build a model-scoped MoE backend for the selected device."""
+        return self._dispatch("mega_moe", impl=impl)
 
     def moe_permutation(
         self,

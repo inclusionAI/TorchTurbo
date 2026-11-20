@@ -1,10 +1,15 @@
-"""Shared tensor contract for MoE permutation and unpermutation operators."""
+"""Shared tensor data and routed expert interface for MoE operators."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import Enum
+from typing import TYPE_CHECKING, Protocol
 
 import torch
+
+if TYPE_CHECKING:
+    from torchturbo.models.modules.moe.moe_layer import MoELayer
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,3 +69,18 @@ def get_expert_indices(routing_map: torch.Tensor) -> torch.Tensor:
             "MoE permutation requires the same top-k count for every token."
         )
     return experts.view(num_tokens, topk)
+
+
+class RouteFormat(Enum):
+    DENSE = "dense"
+    TOPK = "topk"
+
+
+class MoEMegakernel(Protocol):
+    """Providers may declare route_format for layer.route()."""
+
+    def forward_experts(
+        self, layer: MoELayer, hidden_states: torch.Tensor, input_ids: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the complete expert output in token order (including shared experts) and router logits."""
+        ...

@@ -486,7 +486,10 @@ class MoEConfig:
     token_dispatcher: str = "alltoall"
     """Expert token dispatcher type."""
 
+    enable_mega_moe: bool = False
+
     def __post_init__(self) -> None:
+        self.enable_mega_moe = string_to_bool(self.enable_mega_moe)
         if self.token_dispatcher != "alltoall":
             raise ValueError("moe.token_dispatcher must be 'alltoall'.")
 
@@ -1323,6 +1326,7 @@ def _build_moe_config(fields: Mapping[str, Any]) -> MoEConfig:
     """MoEConfig from the merged config dict."""
     moe_d = fields.get("moe") or {}
     return MoEConfig(
+        enable_mega_moe=moe_d.get("enable_mega_moe", False),
         aux_loss_coeff=float(moe_d.get("aux_loss_coeff", 0.0)),
         z_loss_coeff=float(moe_d.get("z_loss_coeff", 0.0)),
         token_dispatcher=moe_d.get("token_dispatcher", "alltoall"),

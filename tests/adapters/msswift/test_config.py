@@ -865,3 +865,16 @@ def test_lora_config_dora_rslora_flags():
     )
     assert lora.use_rslora is True
     assert lora.use_dora is True
+
+
+def test_mega_moe_uses_dynamic_hmc_capacity():
+    _set_tt(enable_mega_moe=True, sp_size=2)
+    args = _base_args(packing=True, packing_length=257, max_length=1024, per_device_train_batch_size=2)
+    config = build_config_from_swift_args(args)
+    assert config.moe.enable_mega_moe
+    assert not hasattr(config.moe, "local_token_capacity")
+
+
+def test_swift_passes_mega_moe_setting_to_backend_for_lora():
+    _set_tt(enable_mega_moe=True)
+    assert build_config_from_swift_args(_base_args(tuner_type="lora")).moe.enable_mega_moe

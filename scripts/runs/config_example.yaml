@@ -120,6 +120,7 @@ engine_config:
     aux_loss_coeff: 0.0
     z_loss_coeff: 0.0
     token_dispatcher: alltoall
+    enable_mega_moe: false        # Ascend A3, BF16, ep_size > 1
 
   mtp:
     enabled: false
