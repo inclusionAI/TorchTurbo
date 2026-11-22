@@ -8,13 +8,15 @@ from .base import (
 )
 from .dispatcher import OpDispatcher
 from .ops import get_ops, get_or_create_ops, ops
+from .plugins import OpBinding, OpPlugin
 from .registry import OpRegistry, register_op, registry
 
-
 __all__ = [
+    "OpBinding",
     "OpDispatcher",
     "OpImpl",
     "OpImplKind",
+    "OpPlugin",
     "OpPolicy",
     "OpRegistry",
     "OpSpec",

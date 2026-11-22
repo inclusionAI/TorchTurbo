@@ -72,6 +72,43 @@ def _build_from_argv(argv: list[str]) -> EngineConfig:
     return build_from_args(tt)
 
 
+def test_ops_plugins_load_from_yaml(tmp_path):
+    path = _write(tmp_path, "plugins.yaml", _engine_config(
+        "ops:\n  plugins:\n    - my_project.tt_ops_plugin:plugin\n"
+    ))
+    cfg = _build_from_argv(["--tt_config", path])
+    assert cfg.ops.plugins == ("my_project.tt_ops_plugin:plugin",)
+    assert EngineConfig.from_dict(cfg.to_dict()).ops.plugins == cfg.ops.plugins
+
+
+def test_inline_ops_plugin_from_training_config(tmp_path):
+    import torch
+
+    from torchturbo.ops import OpDispatcher, OpRegistry
+    from torchturbo.runtime.cpu import CpuRuntime
+
+    path = _write(tmp_path, "inline_plugins.yaml", _engine_config(
+        "ops:\n"
+        "  plugins:\n"
+        "    - name: external\n"
+        "      bindings:\n"
+        "        - op_name: square\n"
+        "          impl_name: external::square\n"
+        "          target: torch:square\n"
+        "          devices: [cpu]\n"
+        "          kind: custom\n"
+        "          priority: 200\n"
+    ))
+    cfg = _build_from_argv(["--tt_config", path])
+    restored = EngineConfig.from_dict(cfg.to_dict())
+    assert restored.ops.plugins == cfg.ops.plugins
+    ops = OpDispatcher(device_runtime=CpuRuntime(), registry=OpRegistry(),
+                       plugins=restored.ops.plugins)
+    x = torch.tensor([2.0], requires_grad=True)
+    ops.square(x).sum().backward()
+    torch.testing.assert_close(x.grad, 2 * x)
+
+
 class _FakeQwen35Moe(TurboModel):
     """Model whose default plan mirrors ``qwen3_5_moe.parallel_plan``."""
 

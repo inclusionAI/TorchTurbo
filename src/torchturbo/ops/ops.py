@@ -1,13 +1,13 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 
 from torchturbo.runtime import DeviceRuntime
 
 from .base import OpPolicy
 from .dispatcher import OpDispatcher
+from .plugins import PluginInput, normalize_plugins
 from .registry import registry
-
 
 _OPS: OpDispatcher | None = None
 
@@ -17,16 +17,18 @@ def get_or_create_ops(
     device_runtime: DeviceRuntime,
     default_policy: OpPolicy = OpPolicy.AUTO,
     overrides: Mapping[str, str] | None = None,
+    plugins: Sequence[PluginInput] = (),
 ) -> OpDispatcher:
     """Return or create the process-wide dispatcher.
 
-    Reuse requires matching device, policy, and per-op overrides.
+    Reuse requires matching device, policy, overrides, and plugin references.
     """
     global _OPS
 
     if not isinstance(default_policy, OpPolicy):
         raise TypeError("default_policy must be an OpPolicy.")
     requested_overrides = dict(overrides or {})
+    requested_plugins = normalize_plugins(plugins)
 
     if _OPS is None:
         _OPS = OpDispatcher(
@@ -34,10 +36,13 @@ def get_or_create_ops(
             registry=registry,
             default_policy=default_policy,
             overrides=requested_overrides,
+            plugins=requested_plugins,
         )
         return _OPS
 
     conflicts: list[str] = []
+    if _OPS.plugins != requested_plugins:
+        conflicts.append(f"plugins={_OPS.plugins!r} vs {requested_plugins!r}")
     if _OPS.device_runtime.turbo_device != device_runtime.turbo_device:
         conflicts.append(
             f"device={_OPS.device_runtime.turbo_device.value!r} vs "
@@ -80,4 +85,4 @@ class _OpsProxy:
 ops = _OpsProxy()
 
 
-__all__ = ["get_or_create_ops", "get_ops", "ops"]
+__all__ = ["get_ops", "get_or_create_ops", "ops"]

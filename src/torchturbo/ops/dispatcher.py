@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import importlib
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from types import ModuleType
 from typing import Any
@@ -14,6 +14,14 @@ from torchturbo.runtime import DeviceRuntime, TurboDevice
 from .base import OpImpl, OpImplKind, OpPolicy, OpSpec
 from .moe import MoEPermutation, get_expert_indices
 from .packed_params import get_packed_params
+from .plugins import (
+    CallableOpImpl,
+    OpBinding,
+    OpPlugin,
+    PluginInput,
+    load_plugins,
+    normalize_plugins,
+)
 from .providers import iter_provider_modules
 from .registry import OpRegistry
 
@@ -35,6 +43,7 @@ class OpDispatcher:
         registry: OpRegistry,
         default_policy: OpPolicy = OpPolicy.AUTO,
         overrides: Mapping[str, str] | None = None,
+        plugins: Sequence[PluginInput] = (),
     ) -> None:
         if not isinstance(default_policy, OpPolicy):
             raise TypeError("default_policy must be an OpPolicy.")
@@ -42,6 +51,8 @@ class OpDispatcher:
         self._device_runtime = device_runtime
         self._default_policy = default_policy
         self._overrides = dict(overrides or {})
+        self._plugins = normalize_plugins(plugins)
+        self._plugin_bindings: dict[str, tuple[OpPlugin, OpBinding]] = {}
         if any(
             not isinstance(op_name, str) or not isinstance(impl_name, str)
             for op_name, impl_name in self._overrides.items()
@@ -68,6 +79,10 @@ class OpDispatcher:
     @property
     def overrides(self) -> dict[str, str]:
         return dict(self._overrides)
+
+    @property
+    def plugins(self) -> tuple[str | OpPlugin, ...]:
+        return self._plugins
 
     def _index_provider_module(
         self,
@@ -109,6 +124,21 @@ class OpDispatcher:
         device = self._device_runtime.turbo_device
 
         self._impl_classes = self._load_provider_impl_classes(device)
+        self.registry = self.registry.copy()
+        builtin_ops = {spec.op_name for spec in self.registry.list()}
+        impl_names = {spec.impl_name for spec in self.registry.list()} | set(self._impl_classes)
+        plugins = load_plugins(self._plugins)
+        reserved_names = set(dir(type(self))) | set(self.__dict__)
+        for plugin in plugins:
+            for binding in plugin.bindings:
+                if binding.impl_name in impl_names:
+                    raise ValueError(f"Duplicate op implementation {binding.impl_name!r} in plugin {plugin.name!r}.")
+                if binding.op_name not in builtin_ops and binding.op_name in reserved_names:
+                    raise ValueError(f"Plugin op_name {binding.op_name!r} conflicts with the dispatcher API.")
+                impl_names.add(binding.impl_name)
+                self._plugin_bindings[binding.impl_name] = (plugin, binding)
+        for _, binding in self._plugin_bindings.values():
+            self.registry.register(binding.to_spec())
         specs = self.registry.list(
             spec_filter=lambda spec: not spec.devices or device in spec.devices
         )
@@ -173,10 +203,16 @@ class OpDispatcher:
             specs = self.registry.list(spec_filter=matches)
 
         unavailable: list[str] = []
+        missing_dependency: ModuleNotFoundError | None = None
         for spec in specs:
             impl_obj = self._load_impl(spec)
             if not impl_obj.available():
-                unavailable.append(spec.impl_name)
+                if isinstance(impl_obj, CallableOpImpl):
+                    unavailable.append(impl_obj.unavailable_reason or spec.impl_name)
+                    if impl_obj.missing_dependency is not None:
+                        missing_dependency = impl_obj.missing_dependency
+                else:
+                    unavailable.append(spec.impl_name)
                 continue
             self._candidate_impl_cache[key] = _Candidate(
                 impl=impl_obj,
@@ -194,11 +230,18 @@ class OpDispatcher:
         raise RuntimeError(
             f"No implementation for op={op_name!r}, device={device.value}, "
             f"{selected_policy}{detail_msg}."
-        )
+        ) from missing_dependency
 
     def _load_impl(self, spec: OpSpec) -> OpImpl:
         impl = self._impls.get(spec.impl_name)
         if impl is not None:
+            return impl
+
+        plugin_binding = self._plugin_bindings.get(spec.impl_name)
+        if plugin_binding is not None:
+            plugin, binding = plugin_binding
+            impl = CallableOpImpl(plugin, binding)
+            self._impls[spec.impl_name] = impl
             return impl
 
         impl_cls = self._impl_classes.get(spec.impl_name)
@@ -218,11 +261,11 @@ class OpDispatcher:
             if impl_name == self._overrides.get(op_name)
         }
         op_names = sorted(set(selected_candidates) | set(self._unresolved_ops))
-        rows: list[tuple[str, str, str, str, str]] = []
+        rows: list[tuple[str, str, str, str, str, str]] = []
         for op_name in op_names:
             candidate = selected_candidates.get(op_name)
             if candidate is None:
-                rows.append((op_name, "-", "-", "-", "unavailable"))
+                rows.append((op_name, "-", "-", "-", "unavailable", "-"))
                 continue
 
             if op_name in self._overrides:
@@ -237,13 +280,17 @@ class OpDispatcher:
                     candidate.spec.kind.value,
                     str(candidate.spec.priority),
                     status,
+                    (
+                        self._plugin_bindings[candidate.spec.impl_name][0].name
+                        if candidate.spec.impl_name in self._plugin_bindings else "builtin"
+                    ),
                 )
             )
 
         if not rows:
-            rows.append(("<no registered ops>", "-", "-", "-", "-"))
+            rows.append(("<no registered ops>", "-", "-", "-", "-", "-"))
 
-        headers = ("Op", "Implementation", "Kind", "Priority", "Status")
+        headers = ("Op", "Implementation", "Kind", "Priority", "Status", "Source")
         widths = [
             max(len(header), *(len(row[index]) for row in rows)) + 2
             for index, header in enumerate(headers)
@@ -268,6 +315,21 @@ class OpDispatcher:
         ]
         if unavailable:
             lines.extend(["", "Unavailable details:", *unavailable])
+
+        if self._plugin_bindings:
+            sources = [
+                f"  {name}: plugin={plugin.name}, target={binding.target}, "
+                f"devices={[item.value for item in binding.devices]}, api_version={plugin.api_version}"
+                for name, (plugin, binding) in sorted(self._plugin_bindings.items())
+            ]
+            lines.extend(["", "Plugin sources:", *sources])
+            plugin_unavailable = [
+                f"  {impl.unavailable_reason}"
+                for impl in self._impls.values()
+                if isinstance(impl, CallableOpImpl) and impl.unavailable_reason is not None
+            ]
+            if plugin_unavailable:
+                lines.extend(["", "Plugin unavailable details:", *plugin_unavailable])
 
         logger.info_rank0(
             "TorchTurbo ops selection (device=%s, policy=%s):\n%s",

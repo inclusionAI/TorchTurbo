@@ -41,6 +41,15 @@ engine_config:
 
   ops:
     policy: auto
+    plugins: []  # Inline plugin descriptions; see ../internal/docs/design/runtime_and_ops.md.
+    # plugins:
+    #   - name: external_npu
+    #     bindings:
+    #       - op_name: swiglu
+    #         impl_name: external_npu::swiglu
+    #         target: torch_npu:npu_swiglu
+    #         devices: [npu]
+    #         priority: 200
     overrides:
       rms_norm: torch_rms_norm
 
