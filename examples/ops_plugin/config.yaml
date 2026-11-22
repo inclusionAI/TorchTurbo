@@ -1,9 +1,0 @@
-engine_config:
-  ops:
-    plugins:
-      - name: example
-        bindings:
-          - op_name: scaled_square
-            impl_name: example::scaled_square
-            target: external_ops:scaled_square
-            devices: [cpu]
