@@ -150,6 +150,14 @@ class ActivationCheckpointingConfig:
 
     enabled: bool = True
     use_reentrant: bool = False
+    offload_input_to_cpu: bool = False
+    offload_large_inputs_to_cpu: bool = False
+
+    def __post_init__(self):
+        if self.offload_input_to_cpu and (not self.enabled or self.use_reentrant):
+            raise ValueError("CPU checkpoint input offload requires enabled non-reentrant checkpointing.")
+        if self.offload_large_inputs_to_cpu and (not self.enabled or not self.use_reentrant):
+            raise ValueError("Large-input checkpoint offload requires enabled reentrant checkpointing.")
 
 
 # ---------------------------------------------------------------------------
@@ -1130,6 +1138,10 @@ def build_from_args(
         ac_d["enabled"] = string_to_bool(ac_d["enabled"])
     if "use_reentrant" in ac_d:
         ac_d["use_reentrant"] = string_to_bool(ac_d["use_reentrant"])
+    if "offload_input_to_cpu" in ac_d:
+        ac_d["offload_input_to_cpu"] = string_to_bool(ac_d["offload_input_to_cpu"])
+    if "offload_large_inputs_to_cpu" in ac_d:
+        ac_d["offload_large_inputs_to_cpu"] = string_to_bool(ac_d["offload_large_inputs_to_cpu"])
     comm_d = dict(fields.get("comm") or {})
     if "overlap_comm_compute" in comm_d:
         comm_d["overlap_comm_compute"] = string_to_bool(

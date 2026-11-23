@@ -22,6 +22,7 @@ from .configuration_deepseek_v41 import DeepseekV41Config, text_config_of
 from .modeling_deepseek_v41 import (
     DeepseekV41ForCausalLM,
     DeepseekV41Indexer,
+    HostOffloadEngram,
 )
 
 if TYPE_CHECKING:
@@ -55,6 +56,14 @@ class DeepseekV41WeightConverter(BaseWeightConverter):
     def get_hf_gate_bias_name(self):
         return "gate.bias"
 
+    def get_param_load_entries(self, name, numel, param_to_filename=None):
+        # Engram params sit in the 197GiB table shards; loading them through
+        # the generic path would materialize whole shards on the host.
+        # HostOffloadEngram loads them itself in on_materialized (the parallel
+        # plan always swaps the engram modules on the engine path).
+        if ".engram." in name:
+            return [], None, {}
+        return super().get_param_load_entries(name, numel, param_to_filename)
 
 
 @register_model(
@@ -70,9 +79,6 @@ class TurboDeepseekV41ForCausalLM(TurboVLMModel, DeepseekV41ForCausalLM):
         super().__init__(config)
         self._post_init_patches()
         self._model_path = None
-        for layer in self.layers:
-            if layer.engram is not None:
-                layer.engram.embed.weight.requires_grad_(False)
 
     @classmethod
     def get_default_parallel_plan(cls, **kwargs):
@@ -254,13 +260,33 @@ class TurboDeepseekV41ForCausalLM(TurboVLMModel, DeepseekV41ForCausalLM):
                     param.requires_grad_(kl_active)
 
     def on_materialized(self):
+        """Build engram runtime state after parameters are on a real device.
+
+        Host-offload tables materialize their owner-local CPU shard on the
+        EP group and stream the rows in from the checkpoint; the sibling
+        params (wkv/q/k) share the giant table shard files, so they are read
+        here too (the converter skips them - see
+        DeepseekV41WeightConverter). Table training is opt-in.
+        """
         from torchturbo.runtime import get_device_runtime
 
+        device = get_device_runtime().device
+        train_engram = False
         if self.engram_hash is not None:
-            self.engram_hash.build(get_device_runtime().device, self._model_path)
-        for layer in self.layers:
-            if layer.engram is not None:
-                layer.engram.embed.weight.requires_grad_(False)
+            self.engram_hash.build(device, self._model_path)
+        for module in self.modules():
+            if isinstance(module, HostOffloadEngram):
+                module.materialize()
+                if self._model_path is not None:
+                    module.embed.load_rows(self._model_path, module.table_key)
+                    module.load_params(self._model_path, device)
+                else:
+                    module.embed.init_rows_random()
+                    module.init_params_random(device)
+                module.embed.weight.requires_grad_(train_engram)
+                if self.engram_hash is not None:
+                    module.embed.hash_fingerprint = self.engram_hash.hash_fingerprint
+        # Checkpoint assign can replace parameters and restore requires_grad.
         self._freeze_indexers()
 
     def set_aux_loss_scale(self, scale: float) -> None:

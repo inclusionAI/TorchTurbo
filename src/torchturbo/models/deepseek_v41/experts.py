@@ -3,6 +3,7 @@ import torch
 import torch.nn.functional as F
 from ...ops import ops
 from ..modules.moe.experts import GroupedMLP, transformer_engine_is_available
+from ..modules.moe.chunked_mlp import CHUNK_ROWS, chunked_expert_mlp
 
 
 class DeepseekV41GroupedMLP(GroupedMLP):
@@ -74,6 +75,20 @@ class DeepseekV41GroupedMLP(GroupedMLP):
                     self.num_local_experts, -1, self.config.hidden_size
                 )
 
+                if (
+                    permuted_local_hidden_states.device.type == "npu"
+                    and self.config.gated_linear_unit
+                    and self.config.activation_func is F.silu
+                    and self.swiglu_limit > 0
+                    and permuted_local_hidden_states.shape[0] > CHUNK_ROWS
+                ):
+                    return chunked_expert_mlp(
+                        permuted_local_hidden_states,
+                        w1,
+                        w2,
+                        tokens_per_expert,
+                        limit=self.swiglu_limit,
+                    ), None
 
                 fc1_output = ops.grouped_matmul(
                     permuted_local_hidden_states, w1, tokens_per_expert, trans_b=False

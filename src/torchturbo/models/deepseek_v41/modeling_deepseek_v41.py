@@ -61,6 +61,7 @@ from .source_hyper_connections import (
 )
 from . import source_packing_utils as pu
 from .configuration_deepseek_v41 import DeepseekV41Config
+from .host_offload_embedding import TorchHostOffloadEmbedding
 
 from torchturbo.models.modules.attention.ulysses import (
     all_gather_sp_with_grad_reduce,
@@ -1255,6 +1256,112 @@ class DeepseekV41Engram(nn.Module):
 MAX_ENGRAM_PACKED_TOKENS = 131072
 
 
+class HostOffloadEngram(DeepseekV41Engram):
+    """Training-path engram with the table host-offloaded (FSDPTurbo PR100).
+
+    The table lives on the host, sharded over the EP group inside a
+    TorchHostOffloadEmbedding; only the requested rows cross to the device
+    (routed by all_to_all, gradients return as sparse COO). The remaining
+    params (wkv/q_weight/k_weight) stay ordinary NPU params: they share the
+    giant table shard files, so the weight converter skips them and the
+    wrapper loads them via load_params.
+    """
+
+    def __init__(self, text_config, layer_idx: int, layer_hash_index: int, ep_group=None):
+        super().__init__(text_config, layer_idx, layer_hash_index)
+        del self.embed  # full table never materializes on the training path
+        n_hash_cols = (text_config.engram_max_ngram_size - 1) * text_config.engram_n_heads
+        # Capacity covers a full packed micro-batch of lookups.
+        max_packed_tokens = MAX_ENGRAM_PACKED_TOKENS
+        self.embed = TorchHostOffloadEmbedding(
+            text_config.engram_num_embeddings[layer_hash_index],
+            text_config.engram_head_dim,
+            layer_id=layer_idx,
+            num_max_tokens_per_rank=max_packed_tokens * n_hash_cols,
+            pin_memory=True,
+        )
+        self.table_key = f"layers.{layer_idx}.engram.embed.weight"
+        self.ep_group = ep_group
+
+    def materialize(self, ep_group=None):
+        """Materialize the owner-local CPU shard on the EP group."""
+        group = ep_group or self.ep_group
+        if group is None:
+            raise RuntimeError(
+                f"HostOffloadEngram {self.table_key} has no EP group; pass one "
+                "to materialize()."
+            )
+        self.embed.shard_(group)
+        return self
+
+    def _materialize_param(self, module, name, device):
+        """Replace a meta parameter with an empty real tensor.
+
+        The weight converter skips every ``.engram.`` key, and this module is
+        ``no_shard``, so wkv/q/k stay meta until here. ``copy_`` cannot write
+        into a meta parameter.
+        """
+        param = getattr(module, name)
+        if not param.is_meta:
+            return param
+        real = nn.Parameter(
+            torch.empty(param.shape, dtype=param.dtype, device=device),
+            requires_grad=param.requires_grad,
+        )
+        setattr(module, name, real)
+        return real
+
+    def load_params(self, model_path: str, device=None):
+        """Load wkv/q_weight/k_weight straight from their checkpoint shard.
+
+        These params share the giant engram shard files with the tables, so
+        the generic loader must not touch those files (it would load_file()
+        a whole 197GiB shard for a 315MiB tensor): the weight converter
+        skips them and this method reads just the three tensors.
+        """
+        if device is None:
+            from torchturbo.runtime import get_device_runtime
+
+            device = get_device_runtime().device
+        index_path = Path(model_path) / "model.safetensors.index.json"
+        with open(index_path) as f:
+            weight_map = json.load(f)["weight_map"]
+        specs = (
+            ("wkv.weight", self.wkv, "weight"),
+            ("q_weight", self, "q_weight"),
+            ("k_weight", self, "k_weight"),
+        )
+        by_file: dict = {}
+        for suffix, module, name in specs:
+            key = f"layers.{self.layer_idx}.engram.{suffix}"
+            by_file.setdefault(weight_map[key], []).append((key, module, name))
+        for filename, items in by_file.items():
+            with safe_open(Path(model_path) / filename, framework="pt") as f:
+                for key, module, name in items:
+                    param = self._materialize_param(module, name, device)
+                    param.data.copy_(
+                        f.get_tensor(key).to(device=param.device, dtype=param.dtype)
+                    )
+
+    def init_params_random(self, device=None):
+        """Fallback for train-from-scratch runs without a checkpoint."""
+        needs_storage = (
+            self.wkv.weight.is_meta or self.q_weight.is_meta or self.k_weight.is_meta
+        )
+        if needs_storage and device is None:
+            from torchturbo.runtime import get_device_runtime
+
+            device = get_device_runtime().device
+        if needs_storage:
+            self._materialize_param(self.wkv, "weight", device)
+            self._materialize_param(self, "q_weight", device)
+            self._materialize_param(self, "k_weight", device)
+        nn.init.trunc_normal_(self.wkv.weight, mean=0.0, std=0.02)
+        nn.init.ones_(self.q_weight)
+        nn.init.ones_(self.k_weight)
+
+    def _embed_lookup(self, hash_ids: torch.Tensor) -> torch.Tensor:
+        return self.embed(hash_ids)
 
 
 

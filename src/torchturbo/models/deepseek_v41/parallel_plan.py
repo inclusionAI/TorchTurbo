@@ -114,6 +114,24 @@ def _replace_moe_only(
     return moe_layer
 
 
+def _replace_engram_only(
+    original_module,
+    hf_config,
+    sp_info,
+    ep_info,
+    engine_config,
+    **kwargs,
+):
+    from .modeling_deepseek_v41 import DeepseekV41Engram, HostOffloadEngram
+
+    if not isinstance(original_module, DeepseekV41Engram):
+        return original_module
+    return HostOffloadEngram(
+        text_config_of(hf_config),
+        original_module.layer_idx,
+        original_module.layer_hash_index,
+        ep_group=ep_info["ep_group"],
+    )
 
 
 def get_parallel_plan(**kwargs) -> FSDPParallelPlan:
@@ -138,6 +156,8 @@ def get_parallel_plan(**kwargs) -> FSDPParallelPlan:
                 module_kwargs={"moe_submodules": moe_submodules},
             ),
             "layers.*.engram": FSDPPlanSpec(
+                activation_checkpoint=True,
+                replace_module=_replace_engram_only,
                 # The host-offload table is a CPU parameter and wkv/q/k read
                 # their shard manually, so the whole module stays out of
                 # FSDP; grads (once unfrozen) sync through the no_shard AVG

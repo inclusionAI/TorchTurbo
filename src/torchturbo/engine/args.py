@@ -169,7 +169,10 @@ class TorchTurboArgs:
     gbs: int | None = None
     gradient_checkpointing: bool = True
     ac_use_reentrant: bool = False
+    ac_offload_input_to_cpu: bool = False
+    ac_offload_large_inputs_to_cpu: bool = False
     indexer_kl_loss_coeff: float | None = None
+    npu_memory_fraction: float | None = None
     cpu_offload: CPUOffloadConfig = field(default_factory=CPUOffloadConfig)
     cpu_offload_enabled: bool | None = None
     enable_mtp: bool = False
@@ -368,12 +371,38 @@ _TURBO_ARG_SPECS: tuple[TurboArgSpec, ...] = (
         "attention workloads. Replaces TORCH_TURBO_AC_USE_REENTRANT.",
     ),
     TurboArgSpec(
+        name="ac_offload_input_to_cpu",
+        args_name="ac_offload_input_to_cpu",
+        cli_name="--tt_ac_offload_input_to_cpu",
+        config_path="activation_checkpointing.offload_input_to_cpu",
+        type=string_to_bool,
+        help="Offload the first non-reentrant checkpoint input to CPU.",
+    ),
+    TurboArgSpec(
+        name="ac_offload_large_inputs_to_cpu",
+        args_name="ac_offload_large_inputs_to_cpu",
+        cli_name="--tt_ac_offload_large_inputs_to_cpu",
+        config_path="activation_checkpointing.offload_large_inputs_to_cpu",
+        type=string_to_bool,
+        metavar="BOOL",
+        help="Offload activation checkpoint inputs of at least 64 MiB to CPU. "
+        "Requires reentrant checkpointing.",
+    ),
+    TurboArgSpec(
         name="indexer_kl_loss_coeff",
         args_name="indexer_kl_loss_coeff",
         cli_name="--tt_indexer_kl_loss_coeff",
         type=float,
         metavar="COEFF",
         help="DeepSeek V4.1 indexer KL loss coefficient; overrides the checkpoint value.",
+    ),
+    TurboArgSpec(
+        name="npu_memory_fraction",
+        args_name="npu_memory_fraction",
+        cli_name="--tt_npu_memory_fraction",
+        type=float,
+        metavar="FRACTION",
+        help="NPU per-process memory fraction in (0, 1].",
     ),
     TurboArgSpec(
         name="cpu_offload",

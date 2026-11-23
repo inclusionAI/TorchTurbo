@@ -53,6 +53,7 @@ from ...config import EngineConfig
 from ...distributed import assert_finite, init_process_group_if_needed
 from ..base import BaseBackend
 from .checkpoint import FSDP2CheckpointManager
+from .checkpoint_input import checkpoint_with_cpu_input, checkpoint_with_large_input_offload
 from .config import CPUOffloadMode, FSDPConfig
 from .optimizers.adamw import prepare_fsdp_adamw_optimizer
 from .optimizers.memory import OptimizerMemoryController
@@ -905,6 +906,13 @@ class FSDP2Backend(BaseBackend):
             )
 
             use_reentrant = self.config.activation_checkpointing.use_reentrant
+            checkpoint_fn = (
+                checkpoint_with_large_input_offload
+                if self.config.activation_checkpointing.offload_large_inputs_to_cpu
+                else checkpoint_with_cpu_input
+                if self.config.activation_checkpointing.offload_input_to_cpu
+                else checkpoint
+            )
 
             @functools.wraps(original_forward)
             def checkpointed_forward(*args, **kwargs):
@@ -936,7 +944,7 @@ class FSDP2Backend(BaseBackend):
                     return nullcontext(), recompute_context(module, False, replay_inputs)
 
                 if not use_reentrant:
-                    return checkpoint(
+                    return checkpoint_fn(
                         base_fn,
                         *args,
                         use_reentrant=False,
@@ -976,12 +984,12 @@ class FSDP2Backend(BaseBackend):
                             # skips every trainable parameter (disabled LoRA).
                             return (*outputs, _grad_anchor, is_tuple)
 
-                        *outputs, _, is_tuple = checkpoint(
+                        *outputs, _, is_tuple = checkpoint_fn(
                             run_with_grad_anchor, grad_anchor, *args, use_reentrant=True
                         )
                         return tuple(outputs) if is_tuple else outputs[0]
 
-                return checkpoint(
+                return checkpoint_fn(
                     run_fn,
                     *args,
                     use_reentrant=True,

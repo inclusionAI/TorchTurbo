@@ -1,5 +1,6 @@
 import gc
 import json
+import struct
 import math
 import os
 import shutil
@@ -123,6 +124,11 @@ class ShardedParamManager:
         )
         self.param_to_filename = self._src_weight_map
         self._cpu_keys = {}
+        self._host_engram_tables = {
+            strip_peft_prefix(f"{name}.weight"): module
+            for name, module in model.named_modules()
+            if getattr(module, "uses_host_offload", False)
+        }
         self.local_params = self._build_meta_info()
         self._lora_delta_map = build_lora_delta_map(model)
         if self._lora_delta_map:
@@ -212,7 +218,7 @@ class ShardedParamManager:
             # Skip LoRA adapter params (lora_A, lora_B) — they are not part
             # of the base model checkpoint.
             clean_name = strip_peft_prefix(name)
-            if is_peft_adapter_param(clean_name):
+            if is_peft_adapter_param(clean_name) or clean_name in self._host_engram_tables:
                 continue
 
             if isinstance(param, CPUResidentParameter):
@@ -388,7 +394,7 @@ class ShardedParamManager:
         for name, param in self.model.named_parameters():
             # Strip PEFT prefixes and skip LoRA adapter params.
             clean_name = strip_peft_prefix(name)
-            if is_peft_adapter_param(clean_name):
+            if is_peft_adapter_param(clean_name) or clean_name in self._host_engram_tables:
                 continue
 
             # Per-param trace is DEBUG-only (it was a large share of the sample
@@ -466,6 +472,63 @@ class ShardedParamManager:
     def _get_cpu_memory_usage_percent(self):
         return psutil.virtual_memory().percent
 
+    def _save_host_engram_tables(
+        self, save_path: Path, first_file_index: int, num_total_files: int
+    ) -> dict[str, str]:
+        """Stream BF16 row shards into one HF tensor per Host Engram table.
+
+        The export dtype is pinned to bfloat16 (the base-model engram format)
+        regardless of the runtime dtype of the host buffer: header dtype,
+        data_offsets and the bytes written all derive from ``out_dtype`` so the
+        header can never disagree with the payload.
+        """
+        out_dtype = torch.bfloat16
+        out_dtype_name = "BF16"
+        bytes_per_element = torch.empty((), dtype=out_dtype).element_size()
+        weight_map = {}
+        for file_index, (name, table) in enumerate(self._host_engram_tables.items(), first_file_index):
+            weight = table.weight.detach()
+            rows, dim = table.logical_num_embeddings, table.embedding_dim
+            if weight.dtype != out_dtype:
+                logger.warning_rank0(
+                    "[Engram] host table %s holds runtime dtype %s (expected bfloat16); "
+                    "casting to bfloat16 on export",
+                    name, weight.dtype,
+                )
+            row_bytes = dim * bytes_per_element
+            header = json.dumps({
+                "__metadata__": {"format": "pt"},
+                name: {"dtype": out_dtype_name, "shape": [rows, dim], "data_offsets": [0, rows * row_bytes]},
+            }).encode("utf-8")
+            header += b" " * (-len(header) % 8)
+            data_start = 8 + len(header)
+            filename = f"model-{file_index:05d}-of-{num_total_files:05d}.safetensors"
+            path = save_path / filename
+            temporary = path.with_suffix(".tmp")
+            if self.rank == 0:
+                with temporary.open("wb") as handle:
+                    handle.write(struct.pack("<Q", len(header)))
+                    handle.write(header)
+                    handle.truncate(data_start + rows * row_bytes)
+            dist.barrier()
+
+            # One writer per EP owner. Each writes a disjoint logical row range.
+            if self.rank == self.edp_ranks[0]:
+                count = max(0, min(weight.size(0), rows - table.row_start))
+                if count:
+                    with temporary.open("r+b") as handle:
+                        handle.seek(data_start + table.row_start * row_bytes)
+                        chunk_rows = max(1, (16 << 20) // row_bytes)
+                        for chunk in weight[:count].split(chunk_rows):
+                            if chunk.dtype != out_dtype:
+                                chunk = chunk.to(out_dtype)
+                            handle.write(memoryview(chunk.view(torch.uint8).numpy()).cast("B"))
+            dist.barrier()
+            if self.rank == 0:
+                temporary.replace(path)
+                weight_map[name] = filename
+        return weight_map
+
     def save_hf(self, state_dict, save_path):
         # step 1, assign file index
         cur_num_shards = len(self.sharded_param_groups)
@@ -477,7 +540,8 @@ class ShardedParamManager:
             if i == self.rank:
                 cur_start_index = start_index
             start_index += num_shards_list[i]
-        num_total_files = start_index
+        num_regular_files = start_index
+        num_total_files = num_regular_files + len(self._host_engram_tables)
 
         def write_files() -> tuple[dict[str, str], int]:
             file_index = cur_start_index
@@ -514,6 +578,12 @@ class ShardedParamManager:
             return weight_map, total_size
 
         saved_info = collective_check(write_files)
+        table_map = self._save_host_engram_tables(save_path, num_regular_files + 1, num_total_files)
+        if self.rank == 0:
+            saved_info[0].update(table_map)
+            table_bytes = sum(table.logical_num_embeddings * table.embedding_dim * 2
+                              for table in self._host_engram_tables.values())
+            saved_info = (saved_info[0], saved_info[1] + table_bytes)
 
         def write_metadata() -> None:
             self._copy_non_safetensor_files(self.src_path, save_path)

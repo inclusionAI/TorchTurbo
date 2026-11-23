@@ -71,6 +71,8 @@ engine_config:
   activation_checkpointing:
     enabled: true
     use_reentrant: false
+    offload_input_to_cpu: false  # Requires enabled non-reentrant checkpointing.
+    offload_large_inputs_to_cpu: false  # Requires enabled reentrant checkpointing.
 
   # Engine-managed optimizer configuration.
   optimizer:

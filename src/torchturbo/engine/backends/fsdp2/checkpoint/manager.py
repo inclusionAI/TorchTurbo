@@ -79,6 +79,13 @@ class FSDP2CheckpointManager(BaseCheckpointManager):
         assign: bool = False,
     ) -> None:
         self._hf_loader(model, weights_dir, weight_converter).load_weights(assign=assign)
+        if not assign:
+            from torchturbo.models.deepseek_v41.modeling_deepseek_v41 import HostOffloadEngram
+
+            for module in model.modules():
+                if isinstance(module, HostOffloadEngram):
+                    module.embed.load_rows(weights_dir, module.table_key)
+                    module.load_params(weights_dir)
 
     def save_hf(
         self,

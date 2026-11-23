@@ -57,6 +57,21 @@ def _isolate_env(monkeypatch):
     monkeypatch.delenv("TT_OUTPUT_DIR", raising=False)
 
 
+def test_checkpoint_input_offload_yaml_and_cli(tmp_path):
+    path = tmp_path / "offload.yaml"
+    path.write_text(
+        "engine_config:\n  activation_checkpointing:\n"
+        "    offload_input_to_cpu: true\n"
+    )
+    args, _ = parse_torchturbo_args(["--tt_config", str(path)])
+    assert build_from_args(args).activation_checkpointing.offload_input_to_cpu
+    args, remaining = parse_torchturbo_args([
+        "--tt_config", str(path), "--tt_ac_offload_input_to_cpu", "false",
+    ])
+    assert remaining == []
+    assert not build_from_args(args).activation_checkpointing.offload_input_to_cpu
+
+
 def test_internal_megamoe_yaml(tmp_path):
     config_path = tmp_path / "mega.yaml"
     config_path.write_text(
