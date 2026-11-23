@@ -37,6 +37,7 @@ engine_config:
         no_shard: true
 
   mixed_precision: bf16
+  mega_moe: false
   use_deterministic_algorithms: false
 
   ops:
@@ -73,6 +74,8 @@ engine_config:
   activation_checkpointing:
     enabled: true
     use_reentrant: false
+    offload_input_to_cpu: false  # Requires enabled non-reentrant checkpointing.
+    offload_large_inputs_to_cpu: false  # Requires enabled reentrant checkpointing.
 
   # Engine-managed optimizer configuration.
   optimizer:
@@ -119,7 +122,8 @@ engine_config:
   moe:
     aux_loss_coeff: 0.0
     z_loss_coeff: 0.0
-    token_dispatcher: alltoall
+    token_dispatcher: alltoall  # alltoall or mega_moe
+    # Maximum tokens per rank, a positive multiple of 128. null lets adapters derive it.
 
   mtp:
     enabled: false

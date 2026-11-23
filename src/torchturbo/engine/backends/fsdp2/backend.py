@@ -53,6 +53,7 @@ from ...config import EngineConfig
 from ...distributed import assert_finite, init_process_group_if_needed
 from ..base import BaseBackend
 from .checkpoint import FSDP2CheckpointManager
+from .checkpoint_input import checkpoint_with_cpu_input, checkpoint_with_large_input_offload
 from .config import CPUOffloadMode, FSDPConfig
 from .optimizers.adamw import prepare_fsdp_adamw_optimizer
 from .optimizers.memory import OptimizerMemoryController
@@ -83,6 +84,7 @@ class _FSDPUnit:
     modules: list[nn.Module]
     mesh: Any
     reshard_after_forward: bool | None = None
+    cast_forward_inputs: bool | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -465,6 +467,11 @@ class FSDP2Backend(BaseBackend):
             logger.info_rank0("Applying PEFT LoRA to model")
             model = apply_peft(model, peft_config)
 
+        if self.config.mega_moe:
+            from ....optimizations.mega_moe.integration import install
+
+            install(model, self.config, self.get_ep_info()["ep_group"])
+
         # Models slice inputs at their declared boundary. Install slicing
         # first so activation checkpointing wraps it and remains effective.
         sp_info = self.get_sp_info()
@@ -656,6 +663,10 @@ class FSDP2Backend(BaseBackend):
             if unit.reshard_after_forward is not None:
                 target_fsdp_kwargs["reshard_after_forward"] = (
                     unit.reshard_after_forward
+                )
+            if unit.cast_forward_inputs is not None and mp_policy is not None:
+                target_fsdp_kwargs["mp_policy"] = replace(
+                    mp_policy, cast_forward_inputs=unit.cast_forward_inputs,
                 )
             if mp_policy is not None and any(
                 module in expert_modules for module in unit.modules
@@ -895,6 +906,13 @@ class FSDP2Backend(BaseBackend):
             )
 
             use_reentrant = self.config.activation_checkpointing.use_reentrant
+            checkpoint_fn = (
+                checkpoint_with_large_input_offload
+                if self.config.activation_checkpointing.offload_large_inputs_to_cpu
+                else checkpoint_with_cpu_input
+                if self.config.activation_checkpointing.offload_input_to_cpu
+                else checkpoint
+            )
 
             @functools.wraps(original_forward)
             def checkpointed_forward(*args, **kwargs):
@@ -926,7 +944,7 @@ class FSDP2Backend(BaseBackend):
                     return nullcontext(), recompute_context(module, False, replay_inputs)
 
                 if not use_reentrant:
-                    return checkpoint(
+                    return checkpoint_fn(
                         base_fn,
                         *args,
                         use_reentrant=False,
@@ -966,12 +984,12 @@ class FSDP2Backend(BaseBackend):
                             # skips every trainable parameter (disabled LoRA).
                             return (*outputs, _grad_anchor, is_tuple)
 
-                        *outputs, _, is_tuple = checkpoint(
+                        *outputs, _, is_tuple = checkpoint_fn(
                             run_with_grad_anchor, grad_anchor, *args, use_reentrant=True
                         )
                         return tuple(outputs) if is_tuple else outputs[0]
 
-                return checkpoint(
+                return checkpoint_fn(
                     run_fn,
                     *args,
                     use_reentrant=True,
@@ -1229,6 +1247,7 @@ class FSDP2Backend(BaseBackend):
             modules: nn.Module | list[nn.Module],
             mesh: Any,
             reshard_after_forward: bool | None = None,
+            cast_forward_inputs: bool | None = None,
         ) -> None:
             modules = modules if isinstance(modules, list) else [modules]
             unit_ids = {id(module) for module in modules}
@@ -1239,6 +1258,7 @@ class FSDP2Backend(BaseBackend):
                     modules=modules,
                     mesh=mesh,
                     reshard_after_forward=reshard_after_forward,
+                    cast_forward_inputs=cast_forward_inputs,
                 )
             )
             wrapped_modules.update(unit_ids)
@@ -1274,7 +1294,7 @@ class FSDP2Backend(BaseBackend):
             explicit_subtree_modules.update(
                 id(child) for child in submodule.modules()
             )
-            _add_unit(submodule, target_mesh)
+            _add_unit(submodule, target_mesh, cast_forward_inputs=spec.cast_forward_inputs)
 
         # Default policy: each ModuleList child is a world-mesh FSDP unit.
         # Iterate reversed: named_modules() is a pre-order DFS (ancestors before
@@ -1294,7 +1314,10 @@ class FSDP2Backend(BaseBackend):
                 # split ModuleList children inside that explicitly wrapped subtree.
                 if id(child) in explicit_subtree_modules:
                     continue
-                _add_unit(child, self._world_mesh)
+                child_spec = plan.modules.get(f"{fqn}.{idx}")
+                _add_unit(child, self._world_mesh, cast_forward_inputs=(
+                    child_spec.cast_forward_inputs if isinstance(child_spec, FSDPPlanSpec) else None
+                ))
 
         units = self._optimize_fsdp_units(model, units)
         self._apply_fsdp(model=model, units=units, fsdp_kwargs=fsdp_kwargs)

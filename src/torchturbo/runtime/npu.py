@@ -108,6 +108,17 @@ class _NpuProfiler(BaseProfiler):
             self._profiler.stop()
 
 
+def _npu_memory_fraction() -> float | None:
+    """Resolve the CLI setting before the legacy memory-limit variable."""
+    from ..engine.args import get_torchturbo_args
+
+    args = get_torchturbo_args()
+    if args is not None and args.npu_memory_fraction is not None:
+        return float(args.npu_memory_fraction)
+    raw = os.environ.get("TORCH_TURBO_NPU_MEMORY_FRACTION")
+    return float(raw) if raw is not None else None
+
+
 class NpuRuntime(DeviceRuntime):
     turbo_device = TurboDevice.NPU
     dist_backend = "hccl"
@@ -150,6 +161,11 @@ class NpuRuntime(DeviceRuntime):
 
     def set_device(self, device: int) -> None:
         self._npu.set_device(device)
+        fraction = _npu_memory_fraction()
+        if fraction is not None:
+            if not 0 < fraction <= 1:
+                raise ValueError("--tt_npu_memory_fraction must be in (0, 1].")
+            self._npu.set_per_process_memory_fraction(fraction, device)
 
     def synchronize(self) -> None:
         if self.available():

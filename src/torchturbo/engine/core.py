@@ -364,9 +364,8 @@ class TorchTurboEngine:
             self.checkpoint.load_pretrained(model, model_name_or_path)
         else:
             self.backend.materialize(model)
-        self.backend.finalize_model_load(model)
-
         model.on_materialized()
+        self.backend.finalize_model_load(model)
         meta_tensor_names = has_meta_tensor(model)
         if meta_tensor_names:
             raise RuntimeError(
@@ -1101,6 +1100,10 @@ class TorchTurboEngine:
         self._prepare_moe_runtime(
             model, inputs, gradient_accumulation_steps
         )
+        from ..models.deepseek_v41 import TurboDeepseekV41ForCausalLM
+
+        if isinstance(model, TurboDeepseekV41ForCausalLM):
+            model.set_aux_loss_scale(1.0 / gradient_accumulation_steps if model.training else 1.0)
         result = self.backend.compute_loss(
             model,
             inputs,

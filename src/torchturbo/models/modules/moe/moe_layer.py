@@ -106,6 +106,7 @@ class MoELayer(BaseMoELayer):
         sp_group: dist.ProcessGroup | None = None,
     ) -> None:
         self.use_te = use_te
+        self._routed_experts_backend = None
         self.submodules = submodules
         super(MoELayer, self).__init__(
             config=config, ep_group=ep_group, layer_number=layer_number
@@ -156,21 +157,17 @@ class MoELayer(BaseMoELayer):
         )
         logits = logits.view(-1, logits.shape[-1])
 
-        dispatcher = self.token_dispatcher
-        # Reuse stage variables so completed layouts are not kept alive here.
-        expert_tokens, expert_probs = dispatcher.dispatch_preprocess(
-            hidden_states, routing_map, probs, expert_indices=expert_indices,
-        )
-        expert_tokens, expert_probs = dispatcher.token_dispatch(expert_tokens, expert_probs)
-        expert_tokens, tokens_per_expert, expert_probs = dispatcher.dispatch_postprocess(
-            expert_tokens, expert_probs,
-        )
-        expert_tokens, bias = self.experts(expert_tokens, tokens_per_expert, expert_probs)
-        assert bias is None, "Bias is not supported in MoEAlltoAllTokenDispatcher"
-        expert_tokens = dispatcher.combine_preprocess(expert_tokens)
-        expert_tokens = dispatcher.token_combine(expert_tokens)
-        expert_tokens = dispatcher.combine_postprocess(expert_tokens)
-        output = expert_tokens.to(hidden_states.dtype)
+        if self._routed_experts_backend is not None:
+            output, bias = self._routed_experts_backend.route(
+                self.experts, hidden_states, probs,
+                routing_map if getattr(self.experts, "apply_probs_after_experts", False) else expert_indices,
+            )
+            assert bias is None, "Bias is not supported by MegaMoE"
+        else:
+            output = self._forward_dispatched_experts(
+                hidden_states, probs, routing_map, expert_indices,
+            )
+        output = output.to(hidden_states.dtype)
 
         if self.shared_expert is not None:
             shared_expert_output = self.shared_expert(hidden_states)
@@ -181,3 +178,22 @@ class MoELayer(BaseMoELayer):
         if self.shared_experts is not None:
             output = output + self.shared_experts(hidden_states)
         return output, logits
+
+    def _forward_dispatched_experts(self, hidden_states, probs, routing_map, expert_indices):
+        dispatcher = self.token_dispatcher
+        expert_tokens, expert_probs = dispatcher.dispatch_preprocess(
+            hidden_states, routing_map, probs, expert_indices=expert_indices,
+        )
+        expert_tokens, expert_probs = dispatcher.token_dispatch(expert_tokens, expert_probs)
+        expert_tokens, tokens_per_expert, expert_probs = dispatcher.dispatch_postprocess(
+            expert_tokens, expert_probs,
+        )
+        expert_tokens, bias = self.experts(expert_tokens, tokens_per_expert, expert_probs)
+        assert bias is None, "Bias is not supported in MoEAlltoAllTokenDispatcher"
+        if getattr(self.experts, "apply_probs_after_experts", False) and not getattr(
+            dispatcher, "deferred_probs_to_unpermutation", False,
+        ):
+            expert_tokens = expert_tokens * expert_probs.unsqueeze(-1)
+        expert_tokens = dispatcher.combine_preprocess(expert_tokens)
+        expert_tokens = dispatcher.token_combine(expert_tokens)
+        return dispatcher.combine_postprocess(expert_tokens)

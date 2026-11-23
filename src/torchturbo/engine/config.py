@@ -150,6 +150,14 @@ class ActivationCheckpointingConfig:
 
     enabled: bool = True
     use_reentrant: bool = False
+    offload_input_to_cpu: bool = False
+    offload_large_inputs_to_cpu: bool = False
+
+    def __post_init__(self):
+        if self.offload_input_to_cpu and (not self.enabled or self.use_reentrant):
+            raise ValueError("CPU checkpoint input offload requires enabled non-reentrant checkpointing.")
+        if self.offload_large_inputs_to_cpu and (not self.enabled or not self.use_reentrant):
+            raise ValueError("Large-input checkpoint offload requires enabled reentrant checkpointing.")
 
 
 # ---------------------------------------------------------------------------
@@ -657,6 +665,9 @@ class EngineConfig:
     mtp: MTPConfig = field(default_factory=MTPConfig)
     """Multi-Token-Prediction settings."""
 
+    mega_moe: bool = False
+    """Enable the optional fused MegaMoE backend."""
+
     dspark: DSparkTrainingConfig = field(default_factory=DSparkTrainingConfig)
     """DeepSeek-V4 DSpark training overrides."""
 
@@ -692,6 +703,7 @@ class EngineConfig:
             self.mixed_precision = _parse_mixed_precision_policy(
                 self.mixed_precision
             )
+        self.mega_moe = string_to_bool(self.mega_moe)
         self.use_deterministic_algorithms = string_to_bool(
             self.use_deterministic_algorithms
         )
@@ -866,6 +878,7 @@ class EngineConfig:
             "mtp",
             "dspark",
             "moe",
+            "mega_moe",
             "enable_mtp",
             "mtp_loss_scaling_factor",
             "mtp_log_loss",
@@ -896,6 +909,7 @@ class EngineConfig:
             mtp=mtp_config,
             dspark=dspark_config,
             moe=moe_config,
+            mega_moe=d.get("mega_moe", False),
             loss_chunk=loss_chunk_config,
             freeze_policy=freeze_policy,
             diffusion=_build_diffusion_config(d),
@@ -1134,6 +1148,10 @@ def build_from_args(
         ac_d["enabled"] = string_to_bool(ac_d["enabled"])
     if "use_reentrant" in ac_d:
         ac_d["use_reentrant"] = string_to_bool(ac_d["use_reentrant"])
+    if "offload_input_to_cpu" in ac_d:
+        ac_d["offload_input_to_cpu"] = string_to_bool(ac_d["offload_input_to_cpu"])
+    if "offload_large_inputs_to_cpu" in ac_d:
+        ac_d["offload_large_inputs_to_cpu"] = string_to_bool(ac_d["offload_large_inputs_to_cpu"])
     comm_d = dict(fields.get("comm") or {})
     if "overlap_comm_compute" in comm_d:
         comm_d["overlap_comm_compute"] = string_to_bool(
@@ -1154,6 +1172,7 @@ def build_from_args(
         mtp=_build_mtp_config(fields),
         dspark=_build_dspark_training_config(fields),
         moe=_build_moe_config(fields),
+        mega_moe=fields.get("mega_moe", False),
         loss_chunk=_build_loss_chunk_config(fields),
         freeze_policy=_build_freeze_policy(fields),
         mfu=_build_mfu_config(fields),
@@ -1201,6 +1220,7 @@ def _validate_config_file(data: Mapping[str, Any], parents: tuple[str, ...] = ()
     allowed.update(
         {
             "backend_config.cpu_offload.enabled",
+            "mega_moe",
             "backend_config.cpu_offload.mode",
             "backend_config.cpu_offload.optimizer_memory_fraction",
             "freeze_policy.patterns",

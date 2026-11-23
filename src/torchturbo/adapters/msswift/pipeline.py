@@ -54,6 +54,13 @@ class TurboEnginePipelineMixin:
         logging_configure(tt_args.log_level if tt_args is not None else LogLevel.INFO)
 
         config = build_config_from_swift_args(self.args)
+        if config.mega_moe:
+            from ...optimizations.mega_moe.integration import configure_token_capacity
+
+            length = self.args.packing_length if self.args.packing else self.args.max_length
+            configure_token_capacity(
+                config, length or self.args.max_length, self.args.per_device_train_batch_size,
+            )
         engine = TorchTurboEngine(config)
 
         from .plugins import SwiftPluginHost
