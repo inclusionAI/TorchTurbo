@@ -1,5 +1,5 @@
-# Use the CANN 9.0.0 runtime for Ascend A3 on openEuler with Python 3.11.
-FROM quay.io/ascend/cann:9.0.0-a3-openeuler24.03-py3.11
+# Use the CANN 9.2.1 runtime for Ascend A3 on openEuler with Python 3.11.
+FROM quay.io/ascend/cann:9.2.1-a3-openeuler24.03-py3.11
 
 # Install build tools, tmux, NFS utilities, ossutil, and installation dependencies.
 RUN dnf install -y \
@@ -30,7 +30,7 @@ RUN pip install triton==3.5.0
 RUN pip install triton-ascend==3.2.2.post2 \
         --index-url=https://repo.huaweicloud.com/ascend/repos/pypi \
         --extra-index-url=https://repo.huaweicloud.com/repository/pypi/simple
-RUN pip install torch_npu==2.10.0.post2
+RUN pip install torch_npu==2.10.0.post7
 # flash-linear-attention: built in-image from the fla-org/flash-linear-attention
 # main branch at commit 954438d1
 RUN git clone https://github.com/fla-org/flash-linear-attention.git /tmp/flash-linear-attention \
@@ -53,9 +53,17 @@ RUN git clone --branch v2.10.0 --depth 1 --recurse-submodules --shallow-submodul
     && pip install dist/torch-*.whl --force-reinstall --no-deps \
     && cd / \
     && rm -rf /tmp/pytorch
-# Install the prebuilt A3 wheel to avoid compiling its operators with CANN 9.0.0.
-RUN pip install --no-deps flash-linear-attention-npu-a3==26.10.0+feature \
-        --index-url=https://repo.huaweicloud.com/ascend/repos/pypi
+# Build fla-npu v26.10.0-feature for Ascend A3 from source
+# at commit ccaed06323db64bb635ab90c8c95db473587592e.
+RUN bash -c "source /usr/local/Ascend/ascend-toolkit/set_env.sh \
+    && git clone https://github.com/flashserve/flash-linear-attention-npu.git /tmp/flash-linear-attention-npu \
+    && git -C /tmp/flash-linear-attention-npu checkout ccaed06323db64bb635ab90c8c95db473587592e \
+    && cd /tmp/flash-linear-attention-npu \
+    && python -m pip install --no-cache-dir 'setuptools>=70.1' wheel -r requirements.txt \
+    && FLA_NPU_SOC=ascend910_93 FLA_NPU_LOCAL_VERSION=feature python scripts/build_wheel.py \
+    && python -m pip install --force-reinstall --no-cache-dir --no-deps dist/flash_linear_attention_npu_a3-*.whl \
+    && cd / \
+    && rm -rf /tmp/flash-linear-attention-npu"
 # Install other packages
 RUN pip install py-spy==0.4.2
 
