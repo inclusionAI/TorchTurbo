@@ -61,10 +61,11 @@ def test_invalid_activation_and_negative_limit(dispatcher):
         dispatcher.gated_activation(x, activation_func=F.silu, limit=-1)
 
 
-def test_missing_triton_falls_back_to_native(monkeypatch):
+def test_missing_triton_falls_back_to_native(monkeypatch, tmp_path):
     from torchturbo.ops.providers.npu import gated_activation
 
     original_find_spec = gated_activation.find_spec
+    monkeypatch.setenv("TORCHTURBO_ASCENDC_LIB_DIR", str(tmp_path))
     monkeypatch.setattr(
         gated_activation, "find_spec",
         lambda name: None if name == "triton" else original_find_spec(name),

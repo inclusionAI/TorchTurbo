@@ -190,6 +190,7 @@ docker build \
 --platform linux/arm64 \
 -f Dockerfile_aarch64 \
 -t torchturbo:aarch64 \
+../..
 ```
 
 Platform dependency scripts are available in `scripts/runs/deps/`, while model-specific installers are located under `scripts/runs/<model>/`.
