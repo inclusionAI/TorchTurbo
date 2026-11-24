@@ -119,7 +119,7 @@ class MixedPrecisionConfig:
 
 @dataclass
 class OpsConfig:
-    """Op dispatch policy and per-op implementation overrides."""
+    """Op dispatch policy and optional per-op overrides."""
 
     policy: OpPolicy = OpPolicy.AUTO
     overrides: dict[str, str] = field(default_factory=dict)
