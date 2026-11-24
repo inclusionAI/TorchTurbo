@@ -16,7 +16,11 @@ import torch.nn.functional as F
 
 from .moe_config import MoEConfig
 from .router import TopKRouter
-from .token_dispatcher import MoETokenDispatcher, MoEAlltoAllTokenDispatcher
+from .token_dispatcher import (
+    MoEAlltoAllTokenDispatcher,
+    MoEFlexTokenDispatcher,
+    MoETokenDispatcher,
+)
 from .module import ModuleSpec, build_module
 
 
@@ -126,6 +130,13 @@ class MoELayer(BaseMoELayer):
                 config=self.config,
                 ep_group=ep_group,
             )
+        elif config.moe_token_dispatcher_type == "flex":
+            self.token_dispatcher = MoEFlexTokenDispatcher(
+                self.num_local_experts,
+                self.local_expert_indices,
+                config=self.config,
+                ep_group=ep_group,
+            )
         else:
             raise ValueError(
                 f"Unsupported token dispatcher type: {config.moe_token_dispatcher_type}"
@@ -139,6 +150,8 @@ class MoELayer(BaseMoELayer):
             self.config,
             layer_number=self.layer_number,
         )
+        if config.moe_virtual_expert_load_balance:
+            self.token_dispatcher._comm_manager.bind_experts(self.experts)
 
         # Initialize shared experts
         if self.use_shared_expert:
@@ -146,38 +159,64 @@ class MoELayer(BaseMoELayer):
                 self.submodules.shared_experts, config=self.config
             )
 
+    def _forward_shared_experts(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
+        """Compute optional shared-expert outputs on the original hidden layout."""
+        output = None
+        if self.shared_expert is not None:
+            output = self.shared_expert(hidden_states)
+            output = F.sigmoid(self.shared_expert_gate(hidden_states)) * output
+        if self.shared_experts is not None:
+            shared_output = self.shared_experts(hidden_states)
+            output = shared_output if output is None else output + shared_output
+        return output
+
     def forward(
         self, hidden_states: torch.Tensor, input_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Route tokens, compute local experts, and combine their outputs."""
-        probs, routing_map, expert_indices, logits = self.router(
-            hidden_states, input_ids, self._runtime_inputs.padding_mask,
-            self._runtime_inputs.accumulate_tokens_per_expert,
-        )
-        logits = logits.view(-1, logits.shape[-1])
-
         dispatcher = self.token_dispatcher
-        # Reuse stage variables so completed layouts are not kept alive here.
-        expert_tokens, expert_probs = dispatcher.dispatch_preprocess(
-            hidden_states, routing_map, probs, expert_indices=expert_indices,
-        )
-        expert_tokens, expert_probs = dispatcher.token_dispatch(expert_tokens, expert_probs)
-        expert_tokens, tokens_per_expert, expert_probs = dispatcher.dispatch_postprocess(
-            expert_tokens, expert_probs,
-        )
-        expert_tokens, bias = self.experts(expert_tokens, tokens_per_expert, expert_probs)
-        assert bias is None, "Bias is not supported in MoEAlltoAllTokenDispatcher"
-        expert_tokens = dispatcher.combine_preprocess(expert_tokens)
-        expert_tokens = dispatcher.token_combine(expert_tokens)
-        expert_tokens = dispatcher.combine_postprocess(expert_tokens)
-        output = expert_tokens.to(hidden_states.dtype)
-
-        if self.shared_expert is not None:
-            shared_expert_output = self.shared_expert(hidden_states)
-            shared_expert_output = (
-                F.sigmoid(self.shared_expert_gate(hidden_states)) * shared_expert_output
+        try:
+            hidden_states = dispatcher.wrap_layer_input(hidden_states)
+            probs, routing_map, expert_indices, logits = self.router(
+                hidden_states, input_ids, self._runtime_inputs.padding_mask,
+                self._runtime_inputs.accumulate_tokens_per_expert,
             )
-            output = output + shared_expert_output
-        if self.shared_experts is not None:
-            output = output + self.shared_experts(hidden_states)
-        return output, logits
+            logits = logits.view(-1, logits.shape[-1])
+            # Reuse stage variables so completed layouts are not kept alive here.
+            if self.config.moe_token_dispatcher_type == "flex":
+                expert_tokens, expert_probs = dispatcher.dispatch_preprocess(
+                    hidden_states, routing_map, probs, expert_indices=expert_indices,
+                    padding_mask=self._runtime_inputs.padding_mask,
+                )
+            else:
+                expert_tokens, expert_probs = dispatcher.dispatch_preprocess(
+                    hidden_states, routing_map, probs, expert_indices=expert_indices,
+                )
+            del routing_map, probs, expert_indices
+            shared_expert_output = (
+                self._forward_shared_experts(hidden_states)
+                if self.config.moe_virtual_expert_load_balance
+                else None
+            )
+            expert_tokens, expert_probs = dispatcher.token_dispatch(expert_tokens, expert_probs)
+            expert_tokens, tokens_per_expert, expert_probs = dispatcher.dispatch_postprocess(
+                expert_tokens, expert_probs,
+            )
+            expert_tokens, bias = self.experts(
+                expert_tokens, tokens_per_expert, expert_probs,
+            )
+            del expert_probs
+            assert bias is None, "Bias is not supported in MoE token dispatch"
+            expert_tokens = dispatcher.combine_preprocess(expert_tokens)
+            expert_tokens = dispatcher.token_combine(expert_tokens)
+            expert_tokens = dispatcher.combine_postprocess(expert_tokens)
+            output = expert_tokens.to(hidden_states.dtype)
+
+            if not self.config.moe_virtual_expert_load_balance:
+                shared_expert_output = self._forward_shared_experts(hidden_states)
+            if shared_expert_output is not None:
+                output = output + shared_expert_output
+            output = dispatcher.finalize_layer_output(output)
+            return output, logits
+        finally:
+            dispatcher.release_routing_state()

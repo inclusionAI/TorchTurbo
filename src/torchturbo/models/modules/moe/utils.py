@@ -136,6 +136,7 @@ def topk_softmax_with_capacity(
     use_hash_routing: bool = False,
     hash_table: Optional[torch.Tensor] = None,
     input_ids: Optional[torch.Tensor] = None,
+    compact_output: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Select fixed-top-k experts and compute their routing probabilities.
     Args:
@@ -147,12 +148,12 @@ def topk_softmax_with_capacity(
         scaling_factor (float): Scaling factor of routing score in top-k selection.
         score_function (str): "softmax", "sigmoid", or "sqrtsoftplus".
         expert_bias (torch.Tensor): The bias added to logits for expert routing.
+        compact_output (bool): Return weights and routes in top-k column order.
 
     Returns:
-        Dense weights, boolean assignment mask, and the selected expert IDs.
-        Both learned and hash routing return the compact top-k IDs in their
-        native order; the packed layout only needs a consistent pairing
-        between expert IDs, row indices, and gathered probabilities.
+        Routing weights, assignment map, and selected expert IDs in top-k order.
+        The default map is boolean with one column per expert. In compact mode
+        the weights have one column per selection and the map is the IDs.
     """
     assert (
         logits.dim() == 2
@@ -222,6 +223,8 @@ def topk_softmax_with_capacity(
         probs = probs * scaling_factor
 
     probs = probs.type_as(logits)
+    if compact_output:
+        return probs, top_indices, top_indices
 
     # TODO Try using element-wise operations instead of scatter?
     topk_masked_gates = torch.zeros_like(logits).scatter(1, top_indices, probs)

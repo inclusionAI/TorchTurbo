@@ -65,8 +65,7 @@ def test_permutation_saves_only_indices(chunks):
             expected = torch.cat([tokens[192:], tokens[64:192], tokens[:64]])
         else:
             indices = torch.tensor([[0, 2]], device="npu").expand(256, -1).contiguous()
-            mask = torch.zeros(256, 3, device="npu", dtype=torch.bool).scatter_(1, indices, True)
-            output = get_ops().moe_permutation(tokens, mask, expert_indices=indices).tokens
+            output = get_ops().moe_permutation(tokens, indices).tokens
             expected = tokens.repeat(2, 1)
     assert saved and all(not tensor.is_floating_point() for tensor in saved)
     torch.testing.assert_close(output, expected, rtol=0, atol=0)
@@ -129,18 +128,17 @@ def test_custom_permutation_matches_native(
     mask = probs.detach().bool()
     mapping = get_ops().moe_permutation(
         tokens,
-        mask,
-        probs=probs if with_probs else None,
+        indices,
+        probs=probs.gather(1, indices) if with_probs else None,
         num_out_tokens=num_tokens * topk,
-        expert_indices=indices.sort(dim=-1).values,
         impl="npu_moe_mask_permutation",
     )
     packed = mapping.tokens
     packed_probs = mapping.probs
     native_mapping = get_ops().moe_permutation(
         tokens,
-        mask,
-        probs=probs if with_probs else None,
+        indices,
+        probs=probs.gather(1, indices) if with_probs else None,
         impl="torch_moe_mask_permutation",
     )
     native_packed = native_mapping.tokens
@@ -180,7 +178,7 @@ def test_permutation_keeps_zero_probability_routes(use_tokens):
     tokens = torch.full((1, 128), 2.0, device="npu", dtype=torch.bfloat16, requires_grad=True)
     probs = torch.tensor([[0.0, 1.0]], device="npu", requires_grad=True)
     mapping = get_ops().moe_permutation(
-        tokens, torch.ones(1, 2, device="npu", dtype=torch.bool), probs,
+        tokens, torch.tensor([[0, 1]], device="npu"), probs,
         impl="npu_moe_mask_permutation",
     )
     torch.testing.assert_close(mapping.tokens, tokens.repeat(2, 1), rtol=0, atol=0)
@@ -205,13 +203,12 @@ def test_permutation_preserves_mixed_dtypes_and_probability_gradients(
     probs = (torch.arange(20, device="npu").reshape(5, 4) / 31).to(prob_dtype)
     probs.requires_grad_()
     indices = torch.tensor([[0, 2], [1, 3], [0, 1], [2, 3], [1, 2]], device="npu")
-    mask = torch.zeros(5, 4, device="npu", dtype=torch.bool).scatter_(1, indices, True)
     actual = get_ops().moe_permutation(
-        tokens, mask, probs, expert_indices=indices,
+        tokens, indices, probs.gather(1, indices),
         impl="npu_moe_mask_permutation",
     )
     expected = get_ops().moe_permutation(
-        tokens, mask, probs, expert_indices=indices, impl="torch_moe_mask_permutation",
+        tokens, indices, probs.gather(1, indices), impl="torch_moe_mask_permutation",
     )
     torch.testing.assert_close(actual.tokens, expected.tokens, rtol=0, atol=0)
     torch.testing.assert_close(actual.probs, expected.probs, rtol=0, atol=0)
@@ -290,3 +287,22 @@ def test_weighted_combine_keeps_packed_activation_dtype(dtype):
     expected = torch.autograd.grad(reference, (packed, probs), gradient)
     for result, expected_grad in zip(actual, expected):
         torch.testing.assert_close(result, expected_grad, rtol=2e-4, atol=2e-4)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("columns", [1, 3])
+def test_chunk_probability_rows_keep_shape_and_gradients(dtype, columns):
+    tokens = torch.arange(5, device="npu").to(dtype)[:, None].requires_grad_()
+    storage = (torch.arange(20 * columns, device="npu").to(dtype) / 32).view(10, columns * 2)
+    probs = storage[::2, ::2].detach().requires_grad_()
+    output, weights = get_ops().moe_sort_chunks(
+        tokens, torch.tensor([2, 0, 3], device="npu"),
+        torch.tensor([2, 1, 0], device="npu"), probs, impl="npu_moe_sort_chunks",
+    )
+    source_rows = torch.tensor([2, 3, 4, 0, 1], device="npu")
+    assert weights.shape == probs.shape
+    torch.testing.assert_close(output, tokens[source_rows], rtol=0, atol=0)
+    torch.testing.assert_close(weights, probs[source_rows], rtol=0, atol=0)
+    (output * weights).sum().backward()
+    torch.testing.assert_close(tokens.grad, probs.detach().sum(1, keepdim=True), rtol=0, atol=0)
+    torch.testing.assert_close(probs.grad, tokens.detach().expand_as(probs), rtol=0, atol=0)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import logging
+import sys
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -122,6 +123,31 @@ def test_provider_modules_are_discovered_from_provider_packages():
         "torchturbo.ops.providers.native.matmul_add"
         in cpu_modules
     )
+
+
+def test_planner_requires_caller_owned_workspace():
+    planner = get_ops().plan_virtual_expert_routes
+    routes = torch.zeros((1, 1), dtype=torch.int64)
+    with pytest.raises(TypeError, match="workspace"):
+        planner(routes)
+    with pytest.raises(TypeError, match="workspace"):
+        planner(routes, workspace=None)
+
+
+def test_native_planner_workspace_only_allocates_its_histogram(monkeypatch):
+    from torchturbo.ops.moe import VirtualExpertPlannerWorkspace
+
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: 2)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda group: 0)
+    allocate = Mock(wraps=torch.empty)
+    monkeypatch.setattr(torch, "empty", allocate)
+    workspace = VirtualExpertPlannerWorkspace(
+        num_experts=4, device=torch.device("cpu"), group=None,
+    )
+
+    assert workspace.gathered_counts.shape == (2, 4)
+    assert [call.args[0] for call in allocate.call_args_list] == [(2, 4)]
+    workspace.destroy()
 
 
 def test_custom_policy_errors_when_no_cpu_custom_impl_exists():
@@ -463,6 +489,71 @@ def test_registry_rejects_duplicate_impl_name_across_ops():
         )
 
 
+@pytest.mark.parametrize("trans_b", [False, True])
+def test_native_grouped_matmul_accepts_strided_weights(trans_b):
+    weights = torch.arange(8.).reshape(2, 2, 2).transpose(1, 2).requires_grad_()
+    x = torch.tensor([[1., 2.], [3., 4.]], requires_grad=True)
+    actual = get_ops().grouped_matmul(x, weights, torch.tensor([1, 1]), trans_b=trans_b)
+    expected = [[4., 7.], [36., 43.]] if trans_b else [[2., 8.], [32., 46.]]
+    torch.testing.assert_close(actual, torch.tensor(expected))
+    actual.sum().backward()
+    expected_dw = x.detach().view(2, 2, 1).expand(2, 2, 2)
+    torch.testing.assert_close(weights.grad, expected_dw.transpose(1, 2) if trans_b else expected_dw)
+
+
+@pytest.mark.parametrize("trans_b", [False, True])
+@pytest.mark.parametrize("case", ["only_empty_trainable", "mixed", "all_empty"])
+@pytest.mark.parametrize("backend", ["native", "cuda_fallback"])
+def test_grouped_matmul_empty_banks_preserve_autograd(monkeypatch, backend, case, trans_b):
+    from torchturbo.ops.providers.cuda.grouped_matmul import GroupedGemmMatmul
+    from torchturbo.ops.providers.native.grouped_matmul import TorchGroupedMatmul
+
+    def reference(x, weight, counts, *, trans_b):
+        rows = torch.repeat_interleave(torch.arange(len(counts)), counts)
+        matrices = weight.transpose(-1, -2) if trans_b else weight
+        return torch.bmm(x.unsqueeze(1), matrices.index_select(0, rows)).squeeze(1)
+
+    gmm = Mock(side_effect=reference)
+    if backend == "cuda_fallback":
+        monkeypatch.setitem(sys.modules, "grouped_gemm", SimpleNamespace(ops=SimpleNamespace(gmm=gmm)))
+    provider = GroupedGemmMatmul() if backend == "cuda_fallback" else TorchGroupedMatmul()
+    counts = {
+        "only_empty_trainable": [1, 0, 0, 0],
+        "mixed": [1, 0, 0, 2],
+        "all_empty": [0, 0, 0, 0],
+    }[case]
+    counts = torch.tensor(counts)
+    sizes = [1, 2, 0, 1]
+    train_active = case != "only_empty_trainable"
+    x = torch.arange(int(counts.sum()) * 2, dtype=torch.float32).reshape(-1, 2).requires_grad_(train_active)
+    weights = torch.arange(sum(sizes) * 6, dtype=torch.float32).view(-1, 2, 3)
+    # Inactive rows must contribute zeros even if their stored weights are nonfinite.
+    weights[counts == 0] = float("nan")
+    if trans_b:
+        weights = weights.transpose(1, 2)
+    banks = tuple(
+        bank.detach().requires_grad_(train_active or i in (1, 2))
+        for i, bank in enumerate(weights.split(sizes))
+    )
+    actual = provider(x, banks, counts, trans_b=trans_b)
+    ref_x = x.detach().requires_grad_()
+    ref_weight = weights.detach().requires_grad_()
+    expected = reference(ref_x, ref_weight, counts, trans_b=trans_b)
+    torch.testing.assert_close(actual, expected)
+    actual.sum().backward()
+    expected.sum().backward()
+    if train_active:
+        torch.testing.assert_close(x.grad, ref_x.grad)
+    for bank, ref_grad in zip(banks, ref_weight.grad.split(sizes)):
+        if bank.requires_grad:
+            torch.testing.assert_close(bank.grad, ref_grad)
+        else:
+            assert bank.grad is None
+    if backend == "cuda_fallback":
+        active_banks = [bank for bank, parts in zip(banks, counts.split(sizes)) if parts.sum()]
+        assert [call.args[1].data_ptr() for call in gmm.call_args_list] == [b.data_ptr() for b in active_banks]
+
+
 def test_grouped_matmul_facade_dispatches_registered_impl(monkeypatch):
     registry = OpRegistry()
     spec = OpSpec(
@@ -732,7 +823,9 @@ def test_dispatcher_logs_selected_ops(caplog):
         key[0] for key in dispatcher._candidate_impl_cache
     } >= {
         "attention_with_max_logits", "cross_entropy_loss",
-        "grouped_matmul", "rms_norm", "swiglu",
+        "grouped_matmul", "hybrid_ep_combine", "hybrid_ep_dispatch",
+        "plan_virtual_expert_routes", "rms_norm", "swiglu",
+        "virtual_expert_weight_exchange",
     }
     dispatcher.log_ops_selection()
 

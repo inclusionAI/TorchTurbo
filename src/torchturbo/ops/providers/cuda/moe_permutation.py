@@ -1,4 +1,4 @@
-"""Transformer Engine mask permutation and expert chunk sorting."""
+"""Transformer Engine compact permutation and expert chunk sorting."""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ from torchturbo.runtime import TurboDevice
 from ...base import OpImpl, OpImplKind
 from ...moe import MoEPermutation
 from ...registry import register_op
+from ..native.moe_permutation import TorchMoEMaskPermutation
 
 
 def _supports_packed_mask_map() -> bool:
@@ -35,6 +36,54 @@ def _input_for_probs(tokens: torch.Tensor, probs: torch.Tensor | None) -> torch.
     return tokens
 
 
+def _compact_mask_map(row_indices: torch.Tensor) -> torch.Tensor:
+    """Describe selected slots in TE's packed mask-map format."""
+    num_tokens, topk = row_indices.shape
+    slots = torch.arange(topk, dtype=torch.int32, device=row_indices.device)
+    counts = torch.full(
+        (num_tokens, 1), topk, dtype=torch.int32, device=row_indices.device,
+    )
+    return torch.cat((row_indices, slots.expand(num_tokens, -1), counts), dim=1)
+
+
+class _TokenPermutation(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, tokens, routing_map, expert_indices):
+        if routing_map.dtype == torch.bool and tokens.shape[1] > 0:
+            from transformer_engine.pytorch.permutation import moe_permute
+
+            permuted, row_map = moe_permute(
+                tokens, routing_map, num_out_tokens=expert_indices.numel(),
+            )
+            topk = expert_indices.shape[1]
+            num_experts = routing_map.shape[1]
+            # TE pairs destination rows with expert IDs in its own slot order.
+            row_indices = row_map[:, :topk].clone(memory_format=torch.contiguous_format)
+            expert_indices = row_map[:, num_experts : num_experts + topk].long().contiguous()
+        else:
+            # TE's index kernel shares a workspace across streams. PyTorch's
+            # compact sort also supports zero-width features and unaligned views.
+            packed = TorchMoEMaskPermutation()(tokens, expert_indices)
+            permuted, row_indices = packed.tokens, packed.row_indices
+        ctx.save_for_backward(row_indices)
+        ctx.restore_shape = tokens.shape
+        return permuted, row_indices, expert_indices
+
+    @staticmethod
+    def backward(ctx, grad_output, _grad_rows, _grad_experts):
+        from transformer_engine.pytorch.permutation import moe_unpermute
+
+        (row_indices,) = ctx.saved_tensors
+        if grad_output.numel() == 0:
+            return grad_output.reshape(ctx.restore_shape), None, None
+        # The packed-mask kernel sums BF16/FP16 contributions in FP32.
+        grad_input = moe_unpermute(
+            grad_output.contiguous(), _compact_mask_map(row_indices),
+            merging_probs=None, restore_shape=ctx.restore_shape,
+        )
+        return grad_input, None, None
+
+
 @register_op(
     op_name="moe_permutation",
     impl_name="te_moe_mask_permutation",
@@ -47,7 +96,9 @@ class TransformerEngineMoEMaskPermutation(OpImpl):
         if not _supports_packed_mask_map():
             return False
         try:
-            from transformer_engine.pytorch.permutation import moe_permute  # noqa: F401
+            from transformer_engine.pytorch.permutation import (  # noqa: F401
+                moe_permute, moe_unpermute,
+            )
         except (ImportError, OSError, RuntimeError):
             return False
         return True
@@ -55,49 +106,36 @@ class TransformerEngineMoEMaskPermutation(OpImpl):
     def __call__(
         self,
         tokens: torch.Tensor,
-        routing_map: torch.Tensor,
+        routing_map: torch.Tensor | None = None,
         probs: torch.Tensor | None = None,
         num_out_tokens: int | None = None,
         expert_indices: torch.Tensor | None = None,
     ) -> MoEPermutation:
-        """Translate TE's mask map into shared per-token assignment metadata."""
-        from transformer_engine.pytorch.permutation import moe_permute
-
-        num_experts = routing_map.shape[1]
-        topk = expert_indices.shape[1]
-        if num_out_tokens == 0:
+        """Pack dense masks with TE and compact slots with a stream-local sort."""
+        if routing_map is None:
+            routing_map = expert_indices
+        elif expert_indices is None:
+            expert_indices = routing_map
+        if expert_indices.numel() == 0:
             return MoEPermutation(
                 tokens[:0],
                 None if probs is None else probs.reshape(-1)[:0],
                 torch.empty_like(expert_indices, dtype=torch.int32),
                 expert_indices,
             )
-        # The fused probability path treats zero weights as padding. Routing
-        # membership depends on the mask, including selected zero-weight tokens.
-        permuted_input, row_id_map = moe_permute(
-            tokens,
-            routing_map,
-            num_out_tokens=num_out_tokens,
-        )
-        # TE packs destination rows first, expert IDs at offset num_experts,
-        # and the routed count last. Slot order is opaque but paired.
-        row_indices = row_id_map[:, :topk].contiguous()
-        expert_indices = (
-            row_id_map[:, num_experts : num_experts + topk].long().contiguous()
+        permuted_input, row_indices, expert_indices = _TokenPermutation.apply(
+            tokens, routing_map, expert_indices,
         )
         permuted_probs = None
         if probs is not None:
-            selected_probs = probs.gather(1, expert_indices).flatten()
+            if routing_map.dtype == torch.bool:
+                probs = probs.gather(1, expert_indices)
+            selected_probs = probs.flatten()
             permuted_probs = torch.empty_like(selected_probs).scatter(
-                0,
-                row_indices.flatten().long(),
-                selected_probs,
+                0, row_indices.flatten().long(), selected_probs,
             )
         return MoEPermutation(
-            permuted_input,
-            permuted_probs,
-            row_indices,
-            expert_indices,
+            permuted_input, permuted_probs, row_indices, expert_indices,
         )
 
 
@@ -128,11 +166,12 @@ class TransformerEngineMoEMaskUnpermutation(OpImpl):
         from transformer_engine.pytorch.permutation import moe_unpermute
 
         permuted_tokens = permutation.tokens
-        num_tokens, topk = permutation.row_indices.shape
-        if permutation.row_indices.numel() == 0:
+        row_indices = permutation.row_indices
+        num_tokens, topk = row_indices.shape
+        if permuted_tokens.numel() == 0:
             # Keep the inverse-map dependency so checkpoint recomputes before EP backward.
             restored = permuted_tokens.index_select(
-                0, permutation.row_indices.flatten().long()
+                0, row_indices.flatten().long()
             )
             output = restored.view(num_tokens, topk, permuted_tokens.shape[-1]).sum(1)
             if probs is not None:
@@ -140,13 +179,7 @@ class TransformerEngineMoEMaskUnpermutation(OpImpl):
             return output.view(restore_shape).to(permuted_tokens.dtype)
         # Treat the selected slots as the compact map's experts. Dense routing
         # probabilities are gathered into the same slot order before the call.
-        slots = torch.arange(topk, dtype=torch.int32, device=permuted_tokens.device)
-        counts = torch.full(
-            (num_tokens, 1), topk, dtype=torch.int32, device=permuted_tokens.device
-        )
-        row_id_map = torch.cat(
-            (permutation.row_indices, slots.expand(num_tokens, -1), counts), dim=1
-        )
+        row_id_map = _compact_mask_map(row_indices)
         weights = None if probs is None else probs.gather(1, permutation.expert_indices)
         return moe_unpermute(
             _input_for_probs(permuted_tokens, weights),

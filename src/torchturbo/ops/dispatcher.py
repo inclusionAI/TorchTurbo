@@ -7,12 +7,16 @@ from types import ModuleType
 from typing import Any
 
 import torch
+import torch.distributed as dist
 
 from torchturbo.logging import get_logger
 from torchturbo.runtime import DeviceRuntime, TurboDevice
 
 from .base import OpImpl, OpImplKind, OpPolicy, OpSpec
-from .moe import MoEPermutation, get_expert_indices
+from .moe import (
+    HybridEPHandle, HybridEPMetadata, MoEPermutation, VirtualExpertPlan,
+    VirtualExpertPlannerWorkspace, get_expert_indices,
+)
 from .packed_params import get_packed_params
 from .providers import iter_provider_modules
 from .registry import OpRegistry
@@ -310,13 +314,14 @@ class OpDispatcher:
 
     def grouped_matmul(
         self,
-        x,
-        weight,
+        x: torch.Tensor,
+        weight: torch.Tensor | tuple[torch.Tensor, ...],
         group_list,
         *,
         trans_b: bool = False,
         impl: str | None = None,
     ):
+        """Multiply expert-ordered tokens by one or more banks of expert weights."""
         return self._dispatch(
             "grouped_matmul",
             x,
@@ -343,6 +348,18 @@ class OpDispatcher:
             transpose_lhs=transpose_lhs,
             impl=impl,
         )
+
+    def grouped_matmul_add(
+        self,
+        accumulator: torch.Tensor,
+        x: torch.Tensor,
+        dy: torch.Tensor,
+        tokens_per_expert: torch.Tensor,
+        *,
+        impl: str | None = None,
+    ) -> None:
+        """Add each expert's X.T @ dY to its accumulator slice in place."""
+        self._dispatch("grouped_matmul_add", accumulator, x, dy, tokens_per_expert, impl=impl)
 
     def gated_activation(
         self,
@@ -530,14 +547,14 @@ class OpDispatcher:
     def moe_permutation(
         self,
         tokens: torch.Tensor,
-        routing_map: torch.Tensor,
+        routing_map: torch.Tensor | None = None,
         probs: torch.Tensor | None = None,
         num_out_tokens: int | None = None,
         expert_indices: torch.Tensor | None = None,
         *,
         impl: str | None = None,
     ) -> MoEPermutation:
-        """Duplicate and group token assignments by expert without weighting.
+        """Duplicate and group compact token assignments without weighting.
 
         Every source token selects the same number of distinct experts. Each
         assignment produces one output row, ordered by expert ID, then source
@@ -545,22 +562,16 @@ class OpDispatcher:
 
         Args:
             tokens: Source features of shape [num_tokens, hidden_size].
-            routing_map: Boolean assignment mask of shape
-                [num_tokens, num_experts] on the token device. Each row must
-                contain exactly topk selected experts; token dropping is
-                unsupported.
-            probs: Optional dense routing weights of shape
-                [num_tokens, num_experts] on the token device. Selected weights
-                are gathered into packed row order, retaining their dtype.
-                They are not multiplied into token features by this operator.
-            num_out_tokens: Optional output row count. Must equal
-                num_tokens * topk; when omitted, derive it from the assignments.
-            expert_indices: Optional int64 tensor of shape [num_tokens, topk]
-                on the token device. Each row must contain the selected expert
-                IDs in ascending order and match routing_map. Providing it
-                avoids deriving the IDs from the mask. For empty inputs,
-                pass shape [0, topk] to retain the known topk; otherwise the
-                inferred index shape is [0, 0].
+            routing_map: Boolean mask [num_tokens, num_experts], or compact
+                int32/int64 IDs [num_tokens, topk] on the token device.
+                Each row selects the same number of distinct experts.
+            probs: Optional routing weights with the same shape and slot order
+                as routing_map, or as expert_indices for keyword-only compact
+                input. Packing retains their dtype.
+            num_out_tokens: Optional output row count, equal to num_tokens * topk.
+            expert_indices: Optional cached IDs for a boolean mask, including
+                shape [0, topk] for empty inputs. When routing_map is omitted,
+                this argument supplies the compact IDs directly.
             impl: Optional explicit implementation name. When omitted, use
                 the configured operator override or dispatch policy.
 
@@ -569,24 +580,43 @@ class OpDispatcher:
             and provider-independent row/expert indices for unpermutation.
 
         Raises:
-            ValueError: If deriving indices reveals nonuniform topk, or
+            ValueError: If compact input shapes or index dtype are invalid, or
                 num_out_tokens differs from the number of assignments.
         """
+        dense_mask = routing_map is not None and routing_map.dtype == torch.bool
+        if dense_mask:
+            if routing_map.ndim != 2 or routing_map.shape[0] != tokens.shape[0]:
+                raise ValueError("Routing mask must have shape [num_tokens, num_experts].")
+            if probs is not None and probs.shape != routing_map.shape:
+                raise ValueError("Routing mask and dense probabilities must have the same shape.")
+            if expert_indices is None:
+                expert_indices = get_expert_indices(routing_map)
+        elif routing_map is not None:
+            if expert_indices is not None:
+                raise ValueError("Pass compact expert indices only once.")
+            expert_indices = routing_map
         if expert_indices is None:
-            expert_indices = get_expert_indices(routing_map)
+            raise ValueError("Permutation requires a routing map or compact expert indices.")
+        if expert_indices.dtype not in (torch.int32, torch.int64):
+            raise ValueError("Compact expert indices must have dtype int32 or int64.")
+        if expert_indices.ndim != 2 or expert_indices.shape[0] != tokens.shape[0]:
+            raise ValueError("Compact expert indices must have shape [num_tokens, topk].")
+        expert_indices = expert_indices.long()
+        if not dense_mask and probs is not None and probs.shape != expert_indices.shape:
+            raise ValueError("Compact expert indices and probabilities must have the same shape.")
         expected_tokens = expert_indices.numel()
         if num_out_tokens is not None and num_out_tokens != expected_tokens:
             raise ValueError(
                 "num_out_tokens must equal num_tokens * topk; token dropping is unsupported."
             )
+        if dense_mask:
+            return self._dispatch(
+                "moe_permutation", tokens, routing_map, probs=probs,
+                num_out_tokens=expected_tokens, expert_indices=expert_indices, impl=impl,
+            )
         return self._dispatch(
-            "moe_permutation",
-            tokens,
-            routing_map,
-            probs=probs,
-            num_out_tokens=expected_tokens,
-            expert_indices=expert_indices,
-            impl=impl,
+            "moe_permutation", tokens, expert_indices, probs=probs,
+            num_out_tokens=expected_tokens, impl=impl,
         )
 
     def moe_unpermutation(
@@ -657,6 +687,202 @@ class OpDispatcher:
             sorted_idxs,
             probs=probs,
             impl=impl,
+        )
+
+    def plan_virtual_expert_routes(
+        self,
+        top_indices: torch.Tensor,
+        *,
+        workspace: VirtualExpertPlannerWorkspace,
+        async_finish: bool = False,
+        impl: str | None = None,
+    ) -> VirtualExpertPlan:
+        """Plan global virtual-expert placement and map local routes.
+
+        The native provider computes route metadata and remapping directly in PyTorch.
+
+        Args:
+            top_indices: Int32/int64 [num_tokens, topk] logical expert IDs in
+                [0, num_experts).
+            workspace: Caller-owned planner buffers. Its group and histogram
+                shape define the EP ranks and number of logical experts.
+            async_finish: Permit deferred host metadata. Device copy decisions
+                remain usable in stream order; call plan.wait() before native transport.
+            impl: Optional explicit implementation name.
+
+        Returns:
+            Per-forward VirtualExpertPlan. Runtime IDs retain input column order
+            in [0, 2 * num_experts). The copy table has shape [ep_size,
+            num_local_experts] with logical IDs (-1 for unused slots). Opaque
+            dispatch/weight contexts are passed unchanged to their matching ops.
+            Context validity depends on the planned routes and EP group, not
+            tensor object identity. After wait(), num_local_replicas counts this
+            rank's active replica slots. has_global_replicas determines whether
+            every rank participates in weight exchange and gradient reduction.
+            All ranks use the same planning mode.
+        """
+        if workspace is None:
+            raise TypeError("plan_virtual_expert_routes requires a workspace")
+        return self._dispatch(
+            "plan_virtual_expert_routes",
+            top_indices,
+            workspace=workspace,
+            async_finish=async_finish,
+            impl=impl,
+        )
+
+    def hybrid_ep_dispatch(
+        self,
+        hidden_states: torch.Tensor,
+        routing_map: torch.Tensor,
+        probs: torch.Tensor,
+        ep_group: dist.ProcessGroup,
+        num_local_experts: int,
+        router_topk: int,
+        expert_indices: torch.Tensor | None = None,
+        *,
+        dispatch_context: HybridEPMetadata | None = None,
+        impl: str | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, HybridEPHandle]:
+        """Permute tokens, exchange across EP, and sort by local expert.
+
+        The native provider performs packing and chunk sorting directly in PyTorch.
+
+        Args:
+            hidden_states: Source token features of shape [num_tokens, hidden_size].
+            routing_map: Boolean mask [num_tokens, num_experts] or compact
+                integer expert IDs [num_tokens, router_topk]. Without a plan,
+                -1 marks a padded assignment to omit from expert computation.
+            probs: Dense probabilities for a boolean routing_map, or matching
+                [num_tokens, router_topk] probabilities for integer route IDs.
+                Compact probabilities follow the input ID column order.
+            ep_group: Expert-parallel communication group.
+            num_local_experts: Number of local expert slots on each EP rank.
+            router_topk: Number of experts selected per token.
+            expert_indices: Optional sorted expert IDs of shape [num_tokens, router_topk].
+            dispatch_context: Optional explicit state returned by route planning.
+                Every EP rank must consistently supply or omit its planned state.
+                It may be reused with equal routes, including cloned tensors.
+            impl: Optional explicit implementation name.
+
+        Returns:
+            A tuple ``(dispatched_hidden, dispatched_probs, tokens_per_expert, handle)``.
+        """
+        return self._dispatch(
+            "hybrid_ep_dispatch",
+            hidden_states,
+            routing_map,
+            probs,
+            ep_group,
+            num_local_experts,
+            router_topk,
+            expert_indices=expert_indices,
+            dispatch_context=dispatch_context,
+            impl=impl,
+        )
+
+    def hybrid_ep_combine(
+        self,
+        hidden_states: torch.Tensor,
+        handle: HybridEPHandle,
+        *,
+        impl: str | None = None,
+    ) -> torch.Tensor:
+        """Restore chunk order, exchange across EP, and unpermute to source rows.
+
+        The native provider performs chunk sorting and merging directly in PyTorch.
+
+        Args:
+            hidden_states: Expert output features in local expert order.
+            handle: Opaque state returned by ``hybrid_ep_dispatch``.
+            impl: Optional explicit implementation name.
+
+        Returns:
+            Combined features with the source 2D token shape.
+        """
+        return self._dispatch(
+            "hybrid_ep_combine",
+            hidden_states,
+            handle,
+            impl=impl,
+        )
+
+    def virtual_expert_weight_exchange(
+        self,
+        weight1: torch.Tensor,
+        weight2: torch.Tensor,
+        hidden_states: torch.Tensor | None,
+        probs: torch.Tensor | None,
+        context: object,
+        *,
+        prefetched: tuple[torch.Tensor, torch.Tensor] | None = None,
+        out: tuple[torch.Tensor, torch.Tensor] | None = None,
+        grad_buffer: torch.Tensor | None = None,
+        impl: str | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+        """Exchange selected native expert matrices in rank-major EP order.
+
+        Args:
+            weight1: Local native FC1 weights of shape [num_local_experts, ...].
+            weight2: Local native FC2 weights of shape [num_local_experts, ...].
+            hidden_states: Dispatched token activations, or None for no-grad prefetch.
+            probs: Dispatched routing probabilities, or None for no-grad prefetch.
+            context: Per-forward route plan or its opaque weight_context.
+                Native exchange finishes deferred host metadata.
+            prefetched: Graph-free replicas for this context. The caller orders
+                writes and restores shared slots before their backward reads.
+                Skips only forward communication; backward still returns
+                replica gradients to their owners.
+            out: Optional caller-owned FC1/FC2 slots for received replicas.
+            grad_buffer: Optional flat scratch for returning replica gradients.
+                The caller orders its reuse across executions.
+            impl: Optional explicit implementation name.
+
+        Returns:
+            A tuple ``(replica_weight1, replica_weight2, hidden_states, probs)``.
+        """
+        return self._dispatch(
+            "virtual_expert_weight_exchange",
+            weight1,
+            weight2,
+            hidden_states,
+            probs,
+            context,
+            prefetched=prefetched,
+            out=out,
+            grad_buffer=grad_buffer,
+            impl=impl,
+        )
+
+    def virtual_expert_grad_reduce(
+        self,
+        native_grad: torch.Tensor,
+        replica_grad: torch.Tensor,
+        context: object,
+        *,
+        grad_buffer: torch.Tensor,
+        arena_offset: int = 0,
+        allow_inplace: bool = False,
+        impl: str | None = None,
+    ) -> torch.Tensor:
+        """Sum one FC's native gradients and all replicas on their owning rank.
+
+        Gradients have shape [experts, ...], with replica rows in the plan's
+        destination-slot order. The result matches native_grad's shape, dtype
+        and device. By default it has independent storage. With allow_inplace,
+        the caller transfers ownership of native_grad and the provider may
+        accumulate into it. The replica rows must be disjoint from native_grad.
+        The flat grad_buffer section starts at arena_offset in tensor elements.
+        Callers serialize reuse of the gradient buffer.
+        This backward-only transport is invoked under no_grad on the caller's
+        selected stream; stream completion and first-order autograd belong to
+        the surrounding readiness and completion gates.
+        """
+        return self._dispatch(
+            "virtual_expert_grad_reduce", native_grad, replica_grad, context,
+            grad_buffer=grad_buffer, arena_offset=arena_offset,
+            impl=impl,
+            **({"allow_inplace": True} if allow_inplace else {}),
         )
 
     def __getattr__(self, name: str):
