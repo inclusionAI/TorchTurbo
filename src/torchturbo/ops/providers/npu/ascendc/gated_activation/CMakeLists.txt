@@ -1,0 +1,3 @@
+ascendc_library(gated_activation_kernel STATIC gated_activation.cpp)
+add_library(torchturbo_gated_activation SHARED binding.cpp)
+torchturbo_ascendc_library(torchturbo_gated_activation gated_activation_kernel)

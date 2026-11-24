@@ -67,6 +67,15 @@ RUN bash -c "source /usr/local/Ascend/ascend-toolkit/set_env.sh \
 # Install other packages
 RUN pip install py-spy==0.4.2
 
+# Compile against the final PyTorch/torch_npu ABI without requiring an NPU
+# during image construction. The build context must be the repository root.
+ARG TORCHTURBO_ASCENDC_SOC=Ascend910_9382
+COPY src/torchturbo/ops/providers/npu/ascendc/ /tmp/torchturbo-ascendc/
+RUN bash -c 'source /usr/local/Ascend/ascend-toolkit/set_env.sh \
+    && PYTHON=python bash /tmp/torchturbo-ascendc/install.sh \
+        "$TORCHTURBO_ASCENDC_SOC" \
+    && rm -rf /tmp/torchturbo-ascendc'
+
 # Configure shell startup and SSH access.
 RUN rm -f /etc/profile.d/system-info.sh /etc/motd
 RUN sed -i \

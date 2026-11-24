@@ -221,9 +221,30 @@ On the training host, build the image from the repository root:
 docker build \
     --platform linux/arm64 \
     -f docker/npu/Dockerfile_aarch64 \
+    --build-arg TORCHTURBO_ASCENDC_SOC=Ascend910_9382 \
     -t torchturbo:aarch64 \
     .
 ```
+
+The image build compiles TorchTurbo's AscendC operators after installing the
+final PyTorch and torch_npu versions. It installs `libtorchturbo_*.so` and
+`manifest.json` into `/opt/torchturbo/ascendc/lib`; temporary build trees,
+static libraries and generated headers are not retained. The manifest records
+the target SoC, dependency versions and source/library hashes.
+
+Set `TORCHTURBO_ASCENDC_SOC` to the deployment hardware's CANN SoC identifier.
+The default is `Ascend910_9382`. The target is explicit, so the operator build
+does not query NPU 0 or require an attached NPU. Rebuild the image when the
+target SoC, kernel sources, CANN, PyTorch or torch_npu versions change.
+
+Installation and runtime loading share the default directory defined in
+`ascendc/_config.py`, which has no PyTorch or NPU dependencies. Docker does not
+set `TORCHTURBO_ASCENDC_LIB_DIR`; this variable is an optional override.
+For development, mount a directory containing compatible prebuilt libraries
+and override this environment variable. No runtime compilation or fallback
+to another library directory occurs. Installing the libraries does not change
+operator priorities: select `ascendc_gated_activation` explicitly in the engine
+override when required; Triton remains the higher-priority AUTO provider.
 
 ### Running the Container
 
