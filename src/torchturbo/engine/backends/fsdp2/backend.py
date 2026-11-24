@@ -1735,6 +1735,7 @@ class FSDP2Backend(BaseBackend):
 
         labels = inputs.pop("labels", None)
         assert labels is not None, "'labels' should not be None in inputs"
+        loss_scale = inputs.pop("loss_scale", None)
 
         num_items_in_batch = kwargs.get("num_items_in_batch", None)
         sp_size = self.get_sp_info()["sp_size"]
@@ -1747,7 +1748,7 @@ class FSDP2Backend(BaseBackend):
         # num_items_in_batch = num_items_in_batch // sp_size
 
         use_chunked_loss = self.config.loss_chunk.enabled and model.training
-        mtp_loss_scale = self.config.mtp.loss_scaling_factor
+        mtp_loss_scaling_factor = self.config.mtp.loss_scaling_factor
         outputs, chunk_hidden_states = self._forward_for_lm_loss(
             model,
             inputs,
@@ -1765,7 +1766,8 @@ class FSDP2Backend(BaseBackend):
             sp_group=sp_group,
             sp_rank=sp_rank,
             num_items_in_batch=num_items_in_batch,
-            mtp_loss_scale=mtp_loss_scale,
+            mtp_loss_scaling_factor=mtp_loss_scaling_factor,
+            loss_scale=loss_scale,
         )
         if dspark_loss_fn is not None:
             outputs.dspark_loss_fn = None
@@ -1781,7 +1783,7 @@ class FSDP2Backend(BaseBackend):
                 if num_items_in_batch is None:
                     dspark_loss = dspark_loss / sp_size
                 else:
-                    shifted_labels, normalizers = self._prepare_loss_labels(
+                    shifted_labels, normalizers, _ = self._prepare_loss_labels(
                         [labels],
                         labels,
                         sp_size=sp_size,
@@ -1813,7 +1815,7 @@ class FSDP2Backend(BaseBackend):
         if mtp_losses:
             outputs.mtp_loss = [loss.detach() for loss in mtp_losses]
             outputs.mtp_loss_scaled = (
-                sum(mtp_losses) * mtp_loss_scale
+                sum(mtp_losses) * mtp_loss_scaling_factor
             ).detach()
         return (total_loss, outputs) if return_outputs else total_loss
 
@@ -1828,14 +1830,13 @@ class FSDP2Backend(BaseBackend):
         num_items_in_batch: int | torch.Tensor | None,
         cu_seq_lens: torch.Tensor | None = None,
         ignore_index: int = -100,
-    ) -> tuple[list[torch.Tensor], list[float | torch.Tensor]]:
-        """Build shifted labels and normalizers for each LM prediction stream.
-
-        When supplied, ``num_items_in_batch`` must be a positive global count of
-        valid tokens. This is a caller precondition, not a value checked here
-        for device tensors: a zero value can produce a zero denominator and a
-        NaN loss. Device tensors remain on device to avoid a synchronizing branch.
-        """
+        loss_scale: torch.Tensor | None = None,
+    ) -> tuple[
+        list[torch.Tensor],
+        list[float | torch.Tensor],
+        list[torch.Tensor] | None,
+    ]:
+        """Align labels and optional token weights for each prediction stream."""
         use_num_items = num_items_in_batch is not None
         num_items_normalizer: float | torch.Tensor | None = None
         if use_num_items:
@@ -1883,14 +1884,26 @@ class FSDP2Backend(BaseBackend):
             ).clamp(max=cu_seq_lens.numel() - 2)
             sequence_ends = cu_seq_lens[segment_index + 1]
 
+        if loss_scale is not None and loss_scale.shape != labels.shape:
+            raise ValueError("loss_scale must have the same shape as labels")
+
+        def shift_targets(values: torch.Tensor, shift: int, padding: int) -> torch.Tensor:
+            width = min(shift, values.size(-1))
+            return nn.functional.pad(values[..., width:], (0, width), value=padding)
+
+        def local_shard(values: torch.Tensor) -> torch.Tensor:
+            if sp_size == 1:
+                return values
+            return slice_input_tensor(values, dim=1, group=sp_group, rank=sp_rank)
+
         shifted_labels: list[torch.Tensor] = []
         normalizers: list[float | torch.Tensor] = []
+        shifted_loss_scale: list[torch.Tensor] | None = (
+            [] if loss_scale is not None else None
+        )
         for shift_extra, prediction in enumerate(predictions):
             shift = 1 + shift_extra
-            labels_i = nn.functional.pad(
-                labels, (0, shift), value=ignore_index
-            )
-            labels_i = labels_i[..., shift:].contiguous()
+            labels_i = shift_targets(labels, shift, ignore_index)
             if sequence_ends is not None:
                 # Every prediction stream must target a token in its own sample.
                 crosses_boundary = token_positions + shift >= sequence_ends
@@ -1902,20 +1915,17 @@ class FSDP2Backend(BaseBackend):
                 if use_num_items
                 else (labels_i != ignore_index).sum().clamp(min=1)
             )
-            if sp_size > 1:
-                labels_i = slice_input_tensor(
-                    labels_i,
-                    dim=1,
-                    group=sp_group,
-                    rank=sp_rank,
-                )
+            labels_i = local_shard(labels_i)
             shifted_labels.append(labels_i.to(prediction.device))
+            if shifted_loss_scale is not None:
+                weights_i = local_shard(shift_targets(loss_scale, shift, 0))
+                shifted_loss_scale.append(weights_i.masked_fill(labels_i == ignore_index, 0).to(prediction.device))
             normalizers.append(
                 num_items_normalizer
                 if use_num_items
                 else label_num * sp_size
             )
-        return shifted_labels, normalizers
+        return shifted_labels, normalizers, shifted_loss_scale
 
     def _compute_lm_loss_with_sp(
         self,
@@ -1927,18 +1937,15 @@ class FSDP2Backend(BaseBackend):
         sp_group: Any,
         sp_rank: int,
         num_items_in_batch: int | torch.Tensor | None,
-        mtp_loss_scale: float,
+        mtp_loss_scaling_factor: float,
         cu_seq_lens: torch.Tensor | None = None,
+        loss_scale: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
-        """Select the LM loss path and handle its SP-specific preparation.
-
-        Returns the scaled total plus ``1 + num_mtp`` detached per-stream
-        losses, main path first.
-        """
+        """Compute the total and per-stream LM losses with sequence parallelism."""
         if chunk_hidden_states is not None:
             hidden_states = chunk_hidden_states
 
-            shifted_labels, normalizers = self._prepare_loss_labels(
+            shifted_labels, normalizers, shifted_loss_scale = self._prepare_loss_labels(
                 hidden_states,
                 labels,
                 sp_size=sp_size,
@@ -1946,8 +1953,9 @@ class FSDP2Backend(BaseBackend):
                 sp_rank=sp_rank,
                 num_items_in_batch=num_items_in_batch,
                 cu_seq_lens=cu_seq_lens,
+                loss_scale=loss_scale,
             )
-            loss_scales = [1.0] + [mtp_loss_scale] * (len(hidden_states) - 1)
+            loss_scaling_factors = [1.0] + [mtp_loss_scaling_factor] * (len(hidden_states) - 1)
             (
                 lm_head_weight,
                 hidden_states[0],
@@ -1958,7 +1966,8 @@ class FSDP2Backend(BaseBackend):
                 shifted_labels,
                 lm_head=lm_head_weight,
                 normalizers=normalizers,
-                loss_scales=loss_scales,
+                loss_scaling_factors=loss_scaling_factors,
+                loss_scale=shifted_loss_scale,
                 chunk_size=self.config.loss_chunk.chunk_size,
             )
             # The anchor is always zero. It only requires grad when the main
@@ -1976,7 +1985,7 @@ class FSDP2Backend(BaseBackend):
             if self.config.mtp.enabled and mtp_logits:
                 logits.extend(mtp_logits)
 
-            shifted_labels, normalizers = self._prepare_loss_labels(
+            shifted_labels, normalizers, shifted_loss_scale = self._prepare_loss_labels(
                 logits,
                 labels,
                 sp_size=sp_size,
@@ -1984,13 +1993,15 @@ class FSDP2Backend(BaseBackend):
                 sp_rank=sp_rank,
                 num_items_in_batch=num_items_in_batch,
                 cu_seq_lens=cu_seq_lens,
+                loss_scale=loss_scale,
             )
-            loss_scales = [1.0] + [mtp_loss_scale] * (len(logits) - 1)
+            loss_scaling_factors = [1.0] + [mtp_loss_scaling_factor] * (len(logits) - 1)
             total_loss, component_losses = logits_loss(
                 logits,
                 shifted_labels,
                 normalizers=normalizers,
-                loss_scales=loss_scales,
+                loss_scaling_factors=loss_scaling_factors,
+                loss_scale=shifted_loss_scale,
             )
 
         if sp_size > 1 and sp_group is not None:

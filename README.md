@@ -149,6 +149,11 @@ SFT samples are always isolated, including with LlamaFactory's
 `packing=True, neat_packing=False`. `train_on_prompt=True` enables prompt
 supervision within each sample; predictions never cross sample boundaries.
 
+For ms-swift SFT, the engine applies each `loss_scale` value to the token
+being predicted. Both regular and chunked CE divide the weighted sum by the
+valid-target count, not the sum of weights. For example, a weight of `0.25`
+quarters that token's contribution without changing the denominator.
+
 The `src/torchturbo/adapters/rl/` package provides reusable packed-sequence and SP helpers for reinforcement learning frameworks; it is a utilities package rather than a registered adapter.
 
 RL callers can suspend the prepared FSDP2 optimizer between training windows.

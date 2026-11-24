@@ -117,6 +117,10 @@ LlamaFactory 和 ms-swift adapter 会拒绝不满足以下条件的配置：`eva
 SFT 样本始终相互隔离，包括 LlamaFactory 的 `packing=True, neat_packing=False`。
 `train_on_prompt=True` 只增加各样本内部的 prompt 监督，不产生跨样本的预测目标。
 
+ms-swift SFT 中，`loss_scale` 对应被预测的目标 token。无论是否开启 chunk，
+加权交叉熵的分母都是有效目标数，而不是权重之和。例如，`0.25` 会把该 token
+的贡献降为四分之一，但不会改变分母。
+
 `src/torchturbo/adapters/rl/` 提供强化学习框架可复用的 packed-sequence / SP 工具；它是工具包，不是已注册的 adapter。
 
 RL 调用方可以在两个训练窗口之间挂起已准备的 FSDP2 优化器。

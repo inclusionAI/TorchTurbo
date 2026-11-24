@@ -586,6 +586,7 @@ def test_qwen4_sp_input_contract_contains_only_real_qwen4_fields() -> None:
         ("input_ids", SequencePadding.ZERO),
         ("mm_token_type_ids", SequencePadding.ZERO),
         ("labels", SequencePadding.IGNORE_INDEX),
+        ("loss_scale", SequencePadding.ZERO),
         ("position_ids", SequencePadding.POSITION),
     )
     assert all(name != "text_position_ids" for name, _ in spec.padded_inputs)

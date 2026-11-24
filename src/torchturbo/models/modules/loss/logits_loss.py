@@ -12,26 +12,47 @@ from torchturbo.ops import ops
 __all__ = ["logits_loss"]
 
 
+def prepare_loss_scale(
+    weights: Sequence[torch.Tensor] | None, num_inputs: int,
+) -> tuple[torch.Tensor | None, ...]:
+    """Return flat, non-differentiable coefficients for each target stream."""
+    if weights is None:
+        return (None,) * num_inputs
+    return tuple(weight.detach().reshape(-1).float() for weight in weights)
+
+
+def token_ce_sum(
+    logits: torch.Tensor, labels: torch.Tensor, weights: torch.Tensor | None, ignore_index: int,
+) -> torch.Tensor:
+    """Sum token CE before the caller applies the valid-target denominator."""
+    if weights is None:
+        return ops.cross_entropy_loss(logits, labels, reduction="sum", ignore_index=ignore_index)
+    losses = ops.cross_entropy_loss(logits.float(), labels, reduction="none", ignore_index=ignore_index)
+    return (losses * weights).sum()
+
+
 def logits_loss(
     logits: Sequence[torch.Tensor],
     labels: Sequence[torch.Tensor],
     *,
     normalizers: Sequence[float | torch.Tensor],
-    loss_scales: Sequence[float],
+    loss_scaling_factors: Sequence[float],
+    loss_scale: Sequence[torch.Tensor] | None = None,
     ignore_index: int = -100,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Compute logits CE while keeping zero-scaled streams diagnostics-only."""
+    """Compute token-weighted cross entropy from materialized logits."""
     logits = tuple(logits)
     labels = tuple(labels)
     num_inputs = len(logits)
     if num_inputs == 0:
         raise ValueError("at least one LM loss input is required")
     if not (
-        len(labels) == len(normalizers) == len(loss_scales) == num_inputs
+        len(labels) == len(normalizers) == len(loss_scaling_factors) == num_inputs
     ):
         raise ValueError(
-            "logits, labels, normalizers and loss_scales must have the same length"
+            "logits, labels, normalizers and loss_scaling_factors must have the same length"
         )
+    loss_scale_per_stream = prepare_loss_scale(loss_scale, num_inputs)
 
     for logits_i, label in zip(logits, labels):
         if logits_i.dim() != 3:
@@ -68,8 +89,8 @@ def logits_loss(
         normalizer_scalars.append(scalar.reshape(()))
     normalizer_tensor = torch.stack(normalizer_scalars)
 
-    loss_scale_values: list[float] = []
-    for value in loss_scales:
+    scaling_factor_values: list[float] = []
+    for value in loss_scaling_factors:
         if torch.is_tensor(value):
             raise TypeError(
                 "loss scale values must be host scalars so zero-scaled "
@@ -80,25 +101,21 @@ def logits_loss(
             raise ValueError(
                 f"loss scale values must be finite, got {scalar_value}"
             )
-        loss_scale_values.append(scalar_value)
+        scaling_factor_values.append(scalar_value)
 
     total_loss: torch.Tensor | None = None
     raw_losses: list[torch.Tensor] = []
-    for logits_i, label, normalizer, loss_scale in zip(
-        logits, labels, normalizer_tensor, loss_scale_values
+    for logits_i, label, normalizer, loss_scaling_factor, weight_i in zip(
+        logits, labels, normalizer_tensor, scaling_factor_values, loss_scale_per_stream
     ):
-        loss_logits = logits_i if loss_scale != 0.0 else logits_i.detach()
-        raw_loss = (
-            ops.cross_entropy_loss(
-                loss_logits.reshape(-1, loss_logits.shape[-1]),
-                label.reshape(-1).to(logits_i.device),
-                reduction="sum",
-                ignore_index=ignore_index,
-            )
-            / normalizer
-        )
-        if loss_scale != 0.0:
-            scaled_loss = raw_loss * loss_scale
+        loss_logits = logits_i if loss_scaling_factor != 0.0 else logits_i.detach()
+        flat_logits = loss_logits.reshape(-1, loss_logits.shape[-1])
+        flat_labels = label.reshape(-1).to(logits_i.device)
+        if weight_i is not None:
+            weight_i = weight_i.to(flat_logits.device)
+        raw_loss = token_ce_sum(flat_logits, flat_labels, weight_i, ignore_index) / normalizer
+        if loss_scaling_factor != 0.0:
+            scaled_loss = raw_loss * loss_scaling_factor
             total_loss = (
                 scaled_loss if total_loss is None else total_loss + scaled_loss
             )
