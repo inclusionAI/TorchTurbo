@@ -43,6 +43,7 @@ class OpSpec:
 
 
 class OpImpl(ABC):
+    requires_peer_memory: ClassVar[bool] = False
     __op_spec__: ClassVar[OpSpec | None] = None
 
     @classmethod

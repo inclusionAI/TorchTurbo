@@ -76,10 +76,10 @@ class _VirtualExpertRuntime:
 
     def __init__(
         self, runtime: DeviceRuntime, num_experts: int, device: torch.device,
-        group: dist.ProcessGroup | None,
+        group: dist.ProcessGroup | None, peer_access: bool,
     ) -> None:
         self.planner = VirtualExpertPlannerWorkspace(
-            num_experts=num_experts, device=device, group=group,
+            num_experts=num_experts, device=device, group=group, runtime=runtime, peer_access=peer_access,
         )
         self.planner_stream: object | None = None
         self.weight_streams: tuple[object, object] | None = None
@@ -106,6 +106,8 @@ class _VirtualExpertConfig:
     member_shapes: tuple[torch.Size, torch.Size]
     dtype: torch.dtype
     grad_dtype: torch.dtype
+    weight_peer_access: bool = True
+    grad_peer_access: bool = True
 
 
 class _VirtualExpertStorage:
@@ -114,7 +116,7 @@ class _VirtualExpertStorage:
     def __init__(self, config: _VirtualExpertConfig) -> None:
         self.config = config
         self._runtime = get_device_runtime()
-        self.weight_arena = self.grad_arena = None
+        self.weight_arena = self.grad_arena = self.weight_handle = self.grad_handle = None
         self.slot_weights = ()
         self.last_use: object | None = None
         try:
@@ -124,10 +126,18 @@ class _VirtualExpertStorage:
             raise
 
     def _allocate(self, config: _VirtualExpertConfig) -> None:
-        sections = tuple(config.num_local_experts * prod(shape) for shape in config.member_shapes)
+        self.member_numels = tuple(prod(shape) for shape in config.member_shapes)
+        sections = tuple(config.num_local_experts * size for size in self.member_numels)
+        runtime = self._runtime
         with torch.inference_mode(False):
-            self.weight_arena = torch.empty(sum(sections), dtype=config.dtype, device=config.device)
-            self.grad_arena = torch.empty(sum(sections), dtype=config.grad_dtype, device=config.device)
+            self.weight_arena, self.weight_handle = runtime.allocate_communication_buffer(
+                sum(sections), dtype=config.dtype, device=config.device, group=config.group,
+                peer_access=config.weight_peer_access,
+            )
+            self.grad_arena, self.grad_handle = runtime.allocate_communication_buffer(
+                sum(sections), dtype=config.grad_dtype, device=config.device, group=config.group,
+                peer_access=config.grad_peer_access,
+            )
         self.slot_weights = tuple(
             section.view(config.num_local_experts, *shape)
             for section, shape in zip(self.weight_arena.split(sections), config.member_shapes)
@@ -142,7 +152,7 @@ class _VirtualExpertStorage:
             for slot in self.slot_weights:
                 slot.set_()
         self.slot_weights = ()
-        self.weight_arena = self.grad_arena = None
+        self.weight_arena = self.grad_arena = self.weight_handle = self.grad_handle = None
         self.last_use = None
 
     def record_use(self) -> None:
@@ -193,6 +203,10 @@ class VirtualExpertLoadBalancer:
         tuple[DeviceRuntime, dist.ProcessGroup | None, torch.device, int, int],
         _VirtualExpertRuntime,
     ]] = WeakValueDictionary()
+
+    # A rank-local GC cycle must not evict one side of a WORLD-collective
+    # allocation. Native-only layouts can still expire with their last layer.
+    _peer_resources: ClassVar[list[_VirtualExpertRuntime | _VirtualExpertStorage]] = []
 
     def initialize_virtual_expert_load_balancer(
         self,
@@ -261,24 +275,47 @@ class VirtualExpertLoadBalancer:
             self.ep_size * self.num_owned_experts, self.ep_size,
         )
         shared = self.runtimes.get(key)
-        if shared is None:
-            shared = _VirtualExpertRuntime(runtime, key[3], device, self.group)
-            self.runtimes[key] = shared
-        self._shared_runtime = shared
-        self.planner_stream = shared.planner_stream
-        self.weight_streams = shared.weight_streams
-        self.grad_stream = shared.grad_stream
+        planner_peer_access = ops.requires_peer_memory("plan_virtual_expert_routes")
+        histogram_bytes = weight_bytes = grad_bytes = None
+        if shared is None and planner_peer_access:
+            histogram_bytes = self.ep_size * key[3] * torch.int64.itemsize
+        storage = None
         if self._experts is not None:
             w1, w2 = self._experts.native_weights()
             config = _VirtualExpertConfig(
                 self.group, w1.device, self.num_owned_experts,
                 (w1.shape[1:], w2.shape[1:]), w1.dtype,
                 torch.float32 if w1.dtype in (torch.float16, torch.bfloat16) else w1.dtype,
+                ops.requires_peer_memory("virtual_expert_weight_exchange"),
+                ops.requires_peer_memory("virtual_expert_grad_reduce"),
             )
             storage = self.storages.get(config)
             if storage is None:
+                elements = w1.numel() + w2.numel()
+                if config.weight_peer_access:
+                    weight_bytes = elements * config.dtype.itemsize
+                if config.grad_peer_access:
+                    grad_bytes = elements * config.grad_dtype.itemsize
+        if shared is None or (self._experts is not None and storage is None):
+            # Native-only ranks must agree with their SHMEM peers before any allocation.
+            runtime.shmem.prepare_heap([histogram_bytes, weight_bytes, grad_bytes])
+        if shared is None:
+            shared = _VirtualExpertRuntime(
+                runtime, key[3], device, self.group, planner_peer_access,
+            )
+            self.runtimes[key] = shared
+            if planner_peer_access:
+                self._peer_resources.append(shared)
+        self._shared_runtime = shared
+        self.planner_stream = shared.planner_stream
+        self.weight_streams = shared.weight_streams
+        self.grad_stream = shared.grad_stream
+        if self._experts is not None:
+            if storage is None:
                 storage = _VirtualExpertStorage(config)
                 self.storages[config] = storage
+                if config.weight_peer_access or config.grad_peer_access:
+                    self._peer_resources.append(storage)
             self.storage = storage
         self.planner = shared.planner
 
@@ -288,6 +325,7 @@ class VirtualExpertLoadBalancer:
 
         Call after training and all live graphs have finished. Bound layers
         must not execute again; construct new layers to initialize new resources.
+        All WORLD ranks using NPU SHMEM call finalize before destroying their group.
         """
         for storage in tuple(cls.storages.values()):
             storage.destroy()
@@ -295,6 +333,8 @@ class VirtualExpertLoadBalancer:
             runtime.destroy()
         cls.storages.clear()
         cls.runtimes.clear()
+        cls._peer_resources.clear()
+        get_device_runtime().shmem.release_unused()
 
     @property
     def num_runtime_experts(self) -> int:
@@ -329,7 +369,8 @@ class VirtualExpertLoadBalancer:
 
         Native gradient completion is attached inside the expert FSDP boundary.
         """
-        # Join the previous push before checkpoint replay replaces its plan.
+        # Replay must join the previous push before replacing its plan, so
+        # planner and weight kernels preserve the SHMEM team's barrier order.
         self._wait_weight_push()
         self._runtime_init(hidden_states)
         self._plan = self.planner_done = None
@@ -404,6 +445,7 @@ class VirtualExpertLoadBalancer:
             r1, r2, _, _ = ops.virtual_expert_weight_exchange(
                 w1, w2, None, None, plan.routing,
                 out=storage.slot_weights, grad_buffer=storage.grad_arena,
+                buffer_handles=(storage.weight_handle, storage.grad_handle),
             )
             if plan.slot_weights is None:
                 # Other passes overwrite these slots, then backward restores this
@@ -460,7 +502,7 @@ class VirtualExpertLoadBalancer:
             plan.grad_results[fc_layer] = ops.virtual_expert_grad_reduce(
                 wgrad[:self.num_owned_experts], wgrad[self.num_owned_experts:], plan.routing.weight_context,
                 grad_buffer=storage.grad_arena, arena_offset=offset,
-                allow_inplace=True,
+                buffer_handle=storage.grad_handle, allow_inplace=True,
             )
 
     @torch.no_grad()

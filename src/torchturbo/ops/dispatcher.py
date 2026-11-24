@@ -214,6 +214,13 @@ class OpDispatcher:
         self._impls[spec.impl_name] = impl
         return impl
 
+    def requires_peer_memory(self, op_name: str) -> bool:
+        """Whether the configured provider accesses communication buffers on its peers."""
+        provider = self._candidate_impl(
+            op_name, self._device_runtime.turbo_device, self._overrides.get(op_name),
+        )
+        return provider.requires_peer_memory
+
     def log_ops_selection(self) -> None:
         """Log the selected ops for this dispatcher."""
         selected_candidates = {
@@ -818,6 +825,7 @@ class OpDispatcher:
         prefetched: tuple[torch.Tensor, torch.Tensor] | None = None,
         out: tuple[torch.Tensor, torch.Tensor] | None = None,
         grad_buffer: torch.Tensor | None = None,
+        buffer_handles: tuple[object, object] | None = None,
         impl: str | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
         """Exchange selected native expert matrices in rank-major EP order.
@@ -828,14 +836,20 @@ class OpDispatcher:
             hidden_states: Dispatched token activations, or None for no-grad prefetch.
             probs: Dispatched routing probabilities, or None for no-grad prefetch.
             context: Per-forward route plan or its opaque weight_context.
-                Native exchange finishes deferred host metadata.
+                Native exchange finishes deferred host metadata. Managed no-grad
+                SHMEM push consumes device copy decisions directly.
             prefetched: Graph-free replicas for this context. The caller orders
                 writes and restores shared slots before their backward reads.
                 Skips only forward communication; backward still returns
                 replica gradients to their owners.
-            out: Optional caller-owned FC1/FC2 slots for received replicas.
-            grad_buffer: Optional flat scratch for returning replica gradients.
-                The caller orders its reuse across executions.
+            out: Caller-owned FC1/FC2 slots, required for a direct SHMEM push.
+                SHMEM replicas alias these slots. A no-grad push given a plan
+                returns the full slots until the caller slices the active prefix.
+            grad_buffer: Flat scratch for replica gradients, required for direct
+                SHMEM weight backward. The caller orders reuse across executions.
+            buffer_handles: Peer mappings for out and grad_buffer. Direct SHMEM
+                requires the weight handle for a push and the gradient handle
+                for weight backward.
             impl: Optional explicit implementation name.
 
         Returns:
@@ -851,6 +865,7 @@ class OpDispatcher:
             prefetched=prefetched,
             out=out,
             grad_buffer=grad_buffer,
+            buffer_handles=buffer_handles,
             impl=impl,
         )
 
@@ -862,6 +877,7 @@ class OpDispatcher:
         *,
         grad_buffer: torch.Tensor,
         arena_offset: int = 0,
+        buffer_handle: object | None = None,
         allow_inplace: bool = False,
         impl: str | None = None,
     ) -> torch.Tensor:
@@ -873,7 +889,7 @@ class OpDispatcher:
         the caller transfers ownership of native_grad and the provider may
         accumulate into it. The replica rows must be disjoint from native_grad.
         The flat grad_buffer section starts at arena_offset in tensor elements.
-        Callers serialize reuse of the gradient buffer.
+        Callers serialize its use and, for SHMEM, provide its peer buffer_handle.
         This backward-only transport is invoked under no_grad on the caller's
         selected stream; stream completion and first-order autograd belong to
         the surrounding readiness and completion gates.
@@ -881,7 +897,7 @@ class OpDispatcher:
         return self._dispatch(
             "virtual_expert_grad_reduce", native_grad, replica_grad, context,
             grad_buffer=grad_buffer, arena_offset=arena_offset,
-            impl=impl,
+            buffer_handle=buffer_handle, impl=impl,
             **({"allow_inplace": True} if allow_inplace else {}),
         )
 

@@ -180,6 +180,7 @@ def _run_megatron_planner_cases(rank, size, init_file):
             num_experts = size * case["num_local_experts"]
             workspace = VirtualExpertPlannerWorkspace(
                 num_experts=num_experts, device=torch.device("cpu"), group=dist.group.WORLD,
+                runtime=dispatcher.device_runtime, peer_access=False,
             )
             for dtype in (torch.int32, torch.int64):
                 indices = torch.tensor(case["top_indices"][rank], dtype=dtype).reshape(-1, case["topk"])

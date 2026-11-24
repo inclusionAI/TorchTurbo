@@ -4,10 +4,14 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, replace
+from typing import TYPE_CHECKING
 
 import torch
 import torch.distributed as dist
 from torch.nn.utils.rnn import invert_permutation
+
+if TYPE_CHECKING:
+    from torchturbo.runtime import DeviceRuntime
 
 
 class _EPAllToAll(torch.autograd.Function):
@@ -82,27 +86,51 @@ class HybridEPMetadata:
 
 
 class VirtualExpertPlannerWorkspace:
-    """Reusable local histogram for native planning in one EP group."""
+    """Reusable histogram window and provider scratch for one EP group.
+
+    Set peer_access=False to allocate a local histogram for native collectives.
+    Peer-mapped communication storage is bound to the EP group at creation.
+    A provider may allocate its own scratch once on first use. Plans retain
+    their own routes and copy tables. Providers order readers before reuse.
+    """
 
     def __init__(
         self, *, num_experts: int, device: torch.device, group: dist.ProcessGroup | None,
+        runtime: DeviceRuntime | None = None, peer_access: bool = True,
     ) -> None:
+        from torchturbo.runtime import get_device_runtime
+
+        self._runtime = get_device_runtime() if runtime is None else runtime
         self.ep_group = group
         self.num_experts = num_experts
         self.rank = dist.get_rank(group)
         ep_size = dist.get_world_size(group)
+        self.scratch: dict[str, torch.Tensor] | None = None
+        self.last_use: object | None = None
         # Evaluation may initialize a layer before its first training forward.
         with torch.inference_mode(False):
-            self.gathered_counts = torch.empty((ep_size, num_experts), dtype=torch.int64, device=device)
+            window, self.histogram_handle = self._runtime.allocate_communication_buffer(
+                ep_size * num_experts, dtype=torch.int64, device=device, group=group,
+                peer_access=peer_access,
+            )
+            self.gathered_counts = window.view(ep_size, num_experts)
 
     @property
     def device(self) -> torch.device:
         """Device holding the histogram for this expert group."""
         return self.gathered_counts.device
 
+    def field(self, name: str) -> torch.Tensor:
+        """View a scratch field initialized by the active planner."""
+        if self.scratch is None:
+            raise KeyError(name)
+        return self.scratch[name]
+
     def destroy(self) -> None:
-        """Release the histogram after all uses of the workspace have finished."""
-        self.gathered_counts = None
+        """Drop the workspace's buffers while its process group is still alive."""
+        if self.histogram_handle is not None or self.last_use is not None:
+            self._runtime.synchronize()
+        self.histogram_handle = self.gathered_counts = self.scratch = self.last_use = None
 
 
 @dataclass(slots=True)

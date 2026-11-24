@@ -381,8 +381,9 @@ def _check_finalize_rebuild(config, group, device):
     VirtualExpertLoadBalancer.finalize()
     VirtualExpertLoadBalancer.finalize()
     assert storage.weight_arena is None and storage.grad_arena is None
+    assert storage.weight_handle is None and storage.grad_handle is None
     assert all(slot.numel() == 0 for slot in slots)
-    assert planner.gathered_counts is None
+    assert planner.scratch is None and planner.gathered_counts is None
     assert shared.planner is None
     assert not VirtualExpertLoadBalancer.storages and not VirtualExpertLoadBalancer.runtimes
     for parameter, expected in zip(layers[0].parameters(), expected_parameters):
@@ -402,7 +403,8 @@ def test_storage_cleans_partial_allocation_on_failure(cpu_dispatch, monkeypatch)
         _VirtualExpertConfig, _VirtualExpertStorage,
     )
 
-    allocate = torch.empty
+    runtime = cpu_dispatch.device_runtime
+    allocate = runtime.allocate_communication_buffer
     calls = 0
 
     def fail_gradient_allocation(*args, **kwargs):
@@ -412,7 +414,7 @@ def test_storage_cleans_partial_allocation_on_failure(cpu_dispatch, monkeypatch)
             raise RuntimeError("gradient allocation failed")
         return allocate(*args, **kwargs)
 
-    monkeypatch.setattr(torch, "empty", fail_gradient_allocation)
+    monkeypatch.setattr(runtime, "allocate_communication_buffer", fail_gradient_allocation)
     config = _VirtualExpertConfig(
         None, torch.device("cpu"), 2, (torch.Size((4, 3)), torch.Size((3, 4))),
         torch.float32, torch.float32,
@@ -421,6 +423,7 @@ def test_storage_cleans_partial_allocation_on_failure(cpu_dispatch, monkeypatch)
     with pytest.raises(RuntimeError, match="gradient allocation failed"):
         storage.__init__(config)
     assert storage.weight_arena is None and storage.grad_arena is None
+    assert storage.weight_handle is None and storage.grad_handle is None
     assert storage.slot_weights == ()
 
 
@@ -437,6 +440,7 @@ def test_inference_workspace_can_run_training_planner(monkeypatch, cpu_dispatch)
     with torch.inference_mode():
         workspace = VirtualExpertPlannerWorkspace(
             num_experts=4, device=torch.device("cpu"), group=ep_group,
+            runtime=cpu_dispatch.device_runtime, peer_access=False,
         )
         cpu_dispatch.plan_virtual_expert_routes(
             torch.zeros((3, 1), dtype=torch.int64), workspace=workspace,

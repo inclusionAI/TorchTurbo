@@ -132,6 +132,7 @@ def test_planner_returns_explicit_state_and_dispatch_accepts_cloned_routes(dispa
     ids = torch.tensor([[3, 0], [1, 2]])
     workspace = VirtualExpertPlannerWorkspace(
         num_experts=4, device=ids.device, group=dist.group.WORLD,
+        runtime=dispatcher.device_runtime, peer_access=False,
     )
     plan = dispatcher.plan_virtual_expert_routes(ids, workspace=workspace)
     assert not isinstance(plan, tuple), "Planning must expose a per-forward context."

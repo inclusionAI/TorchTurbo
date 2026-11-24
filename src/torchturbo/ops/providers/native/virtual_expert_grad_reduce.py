@@ -25,6 +25,7 @@ class TorchVirtualExpertGradReduce(OpImpl):
         *,
         grad_buffer: torch.Tensor,
         arena_offset: int = 0,
+        buffer_handle: object | None = None,
         allow_inplace: bool = False,
     ) -> torch.Tensor:
         """Add returned replica gradients, reusing an owned accumulator when possible."""

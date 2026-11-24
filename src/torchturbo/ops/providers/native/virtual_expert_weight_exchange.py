@@ -179,6 +179,7 @@ class TorchVirtualExpertWeightExchange(OpImpl):
         prefetched: tuple[torch.Tensor, torch.Tensor] | None = None,
         out: tuple[torch.Tensor, torch.Tensor] | None = None,
         grad_buffer: torch.Tensor | None = None,
+        buffer_handles: tuple[object, object] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
         """Exchange selected native expert matrices in rank-major EP order."""
         if isinstance(context, VirtualExpertPlan):
