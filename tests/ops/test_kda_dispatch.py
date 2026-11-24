@@ -10,6 +10,7 @@ themselves.
 
 from __future__ import annotations
 
+import importlib
 import sys
 from types import SimpleNamespace
 
@@ -28,6 +29,7 @@ from torchturbo.runtime.cpu import CpuRuntime
 
 @pytest.fixture(autouse=True)
 def _reset_state(monkeypatch):
+    monkeypatch.setattr(importlib.import_module("torchturbo.ops.ops"), "_OPS", None)
     monkeypatch.setattr(runtime_impl, "_SELECTED_RUNTIME", None)
     runtime_impl.is_device_available.cache_clear()
     get_or_create_ops(device_runtime=CpuRuntime())

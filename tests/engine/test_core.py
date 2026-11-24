@@ -2,8 +2,7 @@
 
 import importlib
 import os
-import sys
-from types import ModuleType, SimpleNamespace
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -250,22 +249,23 @@ def dummy_engine():
     return TorchTurboEngine()
 
 
-def test_engine_enables_configured_operator_plugin(monkeypatch):
-    from torchturbo.ops import OpBinding, OpPlugin
-    from torchturbo.runtime import TurboDevice
-
-    module = ModuleType("engine_ops_plugin")
-    module.square = lambda x: x.square()
-    module.plugin = OpPlugin(name="engine_test", bindings=(OpBinding(
-        op_name="plugin_square", impl_name="engine_test::square",
-        target="engine_ops_plugin:square", devices=(TurboDevice.CPU,),
-    ),))
-    monkeypatch.setitem(sys.modules, module.__name__, module)
+def test_engine_enables_configured_operator_plugin(tmp_path):
+    path = tmp_path / "engine_ops_plugin.py"
+    path.write_text(
+        "from torchturbo.engine.plugins import OpPlugin, register_plugin\n"
+        "from torchturbo.ops import OpBinding\n"
+        "from torchturbo.runtime import TurboDevice\n"
+        "@register_plugin('engine_test')\n"
+        "class EngineOps(OpPlugin):\n"
+        "    def get_bindings(self):\n"
+        "        return (OpBinding(op_name='plugin_square', impl_name='engine_test::square',\n"
+        "            target='torch:square', devices=(TurboDevice.CPU,)),)\n"
+    )
     register_backend("fsdp2", DummyBackend)
-    engine = TorchTurboEngine(config=EngineConfig(ops=OpsConfig(
-        plugins=("engine_ops_plugin:plugin",),
-        overrides={"plugin_square": "engine_test::square"},
-    )))
+    engine = TorchTurboEngine(config=EngineConfig(
+        plugin_paths=[str(path)],
+        ops=OpsConfig(overrides={"plugin_square": "engine_test::square"}),
+    ))
     x = torch.tensor([2.0], requires_grad=True)
     engine.ops.plugin_square(x).sum().backward()
     torch.testing.assert_close(x.grad, 2 * x)

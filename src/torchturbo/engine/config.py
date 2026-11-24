@@ -28,7 +28,6 @@ from omegaconf import OmegaConf
 
 from ..logging import get_logger
 from ..ops.base import OpPolicy
-from ..ops.plugins import PluginInput, normalize_plugins
 from .args import TorchTurboArgs, get_arg_specs, string_to_bool
 
 logger = get_logger(__name__)
@@ -120,11 +119,10 @@ class MixedPrecisionConfig:
 
 @dataclass
 class OpsConfig:
-    """Op dispatch policy, per-op overrides, and explicit plugin references."""
+    """Op dispatch policy and per-op implementation overrides."""
 
     policy: OpPolicy = OpPolicy.AUTO
     overrides: dict[str, str] = field(default_factory=dict)
-    plugins: tuple[PluginInput, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.policy, OpPolicy):
@@ -139,7 +137,6 @@ class OpsConfig:
                 "OpsConfig.overrides must map op names to implementation names."
             )
         self.overrides = dict(self.overrides)
-        self.plugins = normalize_plugins(self.plugins)
 
 
 @dataclass
@@ -1197,7 +1194,6 @@ def _validate_config_file(data: Mapping[str, Any], parents: tuple[str, ...] = ()
             "backend_config.cpu_offload.mode",
             "backend_config.cpu_offload.optimizer_memory_fraction",
             "freeze_policy.patterns",
-            "ops.plugins",
         }
     )
     allowed.update(_dataclass_config_paths(OptimizerConfig, ("optimizer",)))
@@ -1278,7 +1274,6 @@ def _build_ops_config(fields: Mapping[str, Any]) -> OpsConfig:
     return OpsConfig(
         policy=policy,
         overrides=ops_d.get("overrides", {}),
-        plugins=ops_d.get("plugins", ()),
     )
 
 

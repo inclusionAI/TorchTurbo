@@ -6,7 +6,10 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from torchturbo.ops import OpDispatcher, OpRegistry
+from torchturbo.engine.plugins import OpPlugin, register_plugin
+from torchturbo.ops import OpBinding, OpDispatcher, OpRegistry
+from torchturbo.ops.plugins import OpPluginConsumer
+from torchturbo.runtime import TurboDevice
 from torchturbo.runtime.npu import NpuRuntime
 
 
@@ -16,12 +19,19 @@ def test_external_npu_swiglu_forward_and_backward(dtype, noncontiguous):
     pytest.importorskip("torch_npu")
     if not torch.npu.is_available():
         pytest.skip("NPU is required for numerical plugin integration.")
+    @register_plugin("external_npu")
+    class NpuOps(OpPlugin):
+        def get_bindings(self):
+            return (OpBinding(
+                op_name="plugin_swiglu", impl_name="external_npu::swiglu",
+                target="torch_npu:npu_swiglu", devices=(TurboDevice.NPU,),
+            ),)
+
+    consumer = OpPluginConsumer()
+    consumer.consume(NpuOps())
     ops = OpDispatcher(
         device_runtime=NpuRuntime(), registry=OpRegistry(),
-        plugins=[{"name": "external_npu", "bindings": [{
-            "op_name": "plugin_swiglu", "impl_name": "external_npu::swiglu",
-            "target": "torch_npu:npu_swiglu", "devices": ["npu"],
-        }]}],
+        plugin_specs=consumer.specs,
     )
     source = torch.randn(8, 4, dtype=dtype)
     if noncontiguous:

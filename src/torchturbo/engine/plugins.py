@@ -8,7 +8,10 @@ import importlib.util
 import os
 import sys
 from dataclasses import dataclass
-from typing import Any, Callable, Mapping, Optional
+from typing import TYPE_CHECKING, Any, Callable, Mapping, Optional
+
+if TYPE_CHECKING:
+    from ..ops.plugins import OpBinding
 
 from ..logging import get_logger
 
@@ -63,14 +66,16 @@ class PluginManager:
                     cls.plugin_name, cls.__name__,
                 )
 
-    def try_consume(self, consumer: PluginConsumer) -> None:
-        """Hand each loaded plugin to the consumer if it ``matches``; failures are logged and skipped."""
+    def try_consume(self, consumer: PluginConsumer, *, strict: bool = False) -> None:
+        """Consume matching plugins; strict mode propagates errors, otherwise logs and skips."""
         for plugin in self.plugins:
             if not consumer.matches(plugin):
                 continue
             try:
                 consumer.consume(plugin)
             except Exception:
+                if strict:
+                    raise
                 logger.warning_rank0(
                     "Plugin consumer %s failed on plugin '%s' (%s); skipping.",
                     type(consumer).__name__,
@@ -126,6 +131,14 @@ class CheckpointExportPlugin(Plugin):
         raise NotImplementedError
 
 
+class OpPlugin(Plugin):
+    """Supply external operator bindings through the shared plugin lifecycle."""
+
+    def get_bindings(self) -> tuple[OpBinding, ...]:
+        """Return bindings without importing or initializing device kernels."""
+        raise NotImplementedError
+
+
 @dataclass(frozen=True)
 class DatasetPrepareContext:
     """Context for DatasetPlugin"""
@@ -172,6 +185,7 @@ __all__ = [
     "Plugin",
     "PluginConsumer",
     "PluginManager",
+    "OpPlugin",
     "CheckpointExportPlugin",
     "DatasetPlugin",
     "DatasetPrepareContext",

@@ -17,10 +17,8 @@ from .packed_params import get_packed_params
 from .plugins import (
     CallableOpImpl,
     OpBinding,
-    OpPlugin,
-    PluginInput,
-    load_plugins,
-    normalize_plugins,
+    OpPluginSpec,
+    normalize_plugin_specs,
 )
 from .providers import iter_provider_modules
 from .registry import OpRegistry
@@ -43,7 +41,7 @@ class OpDispatcher:
         registry: OpRegistry,
         default_policy: OpPolicy = OpPolicy.AUTO,
         overrides: Mapping[str, str] | None = None,
-        plugins: Sequence[PluginInput] = (),
+        plugin_specs: Sequence[OpPluginSpec] = (),
     ) -> None:
         if not isinstance(default_policy, OpPolicy):
             raise TypeError("default_policy must be an OpPolicy.")
@@ -51,8 +49,8 @@ class OpDispatcher:
         self._device_runtime = device_runtime
         self._default_policy = default_policy
         self._overrides = dict(overrides or {})
-        self._plugins = normalize_plugins(plugins)
-        self._plugin_bindings: dict[str, tuple[OpPlugin, OpBinding]] = {}
+        self._plugin_specs = normalize_plugin_specs(plugin_specs)
+        self._plugin_bindings: dict[str, tuple[OpPluginSpec, OpBinding]] = {}
         if any(
             not isinstance(op_name, str) or not isinstance(impl_name, str)
             for op_name, impl_name in self._overrides.items()
@@ -81,8 +79,8 @@ class OpDispatcher:
         return dict(self._overrides)
 
     @property
-    def plugins(self) -> tuple[str | OpPlugin, ...]:
-        return self._plugins
+    def plugin_specs(self) -> tuple[OpPluginSpec, ...]:
+        return self._plugin_specs
 
     def _index_provider_module(
         self,
@@ -127,7 +125,7 @@ class OpDispatcher:
         self.registry = self.registry.copy()
         builtin_ops = {spec.op_name for spec in self.registry.list()}
         impl_names = {spec.impl_name for spec in self.registry.list()} | set(self._impl_classes)
-        plugins = load_plugins(self._plugins)
+        plugins = self._plugin_specs
         reserved_names = set(dir(type(self))) | set(self.__dict__)
         for plugin in plugins:
             for binding in plugin.bindings:
@@ -319,7 +317,7 @@ class OpDispatcher:
         if self._plugin_bindings:
             sources = [
                 f"  {name}: plugin={plugin.name}, target={binding.target}, "
-                f"devices={[item.value for item in binding.devices]}, api_version={plugin.api_version}"
+                f"devices={[item.value for item in binding.devices]}"
                 for name, (plugin, binding) in sorted(self._plugin_bindings.items())
             ]
             lines.extend(["", "Plugin sources:", *sources])

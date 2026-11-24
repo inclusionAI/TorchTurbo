@@ -5,13 +5,14 @@ from __future__ import annotations
 import importlib
 import inspect
 import keyword
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
 
 import torch
 from torch.utils._pytree import tree_leaves
 
+from torchturbo.engine.plugins import OpPlugin, Plugin, PluginConsumer
 from torchturbo.runtime import TurboDevice
 
 from .base import OpImpl, OpImplKind, OpSpec
@@ -30,26 +31,6 @@ def _reference_parts(reference: str) -> tuple[str, str]:
     ):
         raise ValueError(f"Expected module:attribute reference, got {reference!r}.")
     return parts[0], parts[1]
-
-
-def normalize_plugins(plugins: Sequence[PluginInput]) -> tuple[str | OpPlugin, ...]:
-    """Normalize inline configuration and optional packaged descriptions."""
-    if not isinstance(plugins, (tuple, list)):
-        raise TypeError("plugins must be a tuple or list of plugin descriptions.")
-    normalized: list[str | OpPlugin] = []
-    for entry in plugins:
-        if isinstance(entry, Mapping):
-            entry = _plugin_from_config(entry)
-        if isinstance(entry, str):
-            _reference_parts(entry)
-        elif not isinstance(entry, OpPlugin):
-            raise TypeError("Each plugin must be a mapping, OpPlugin, or module:attribute string.")
-        normalized.append(entry)
-    if len(set(normalized)) != len(normalized):
-        raise ValueError("Duplicate plugin references are not allowed.")
-    return tuple(sorted(normalized, key=lambda item: (
-        0, item
-    ) if isinstance(item, str) else (1, item.name)))
 
 
 def _resolve(reference: str) -> Any:
@@ -107,72 +88,58 @@ class OpBinding:
 
 
 @dataclass(frozen=True, slots=True)
-class OpPlugin:
-    """A side-effect-free collection of external operator bindings."""
+class OpPluginSpec:
+    """Immutable operator configuration collected from an Engine plugin."""
 
     name: str
     bindings: tuple[OpBinding, ...]
-    api_version: int = 1
 
-    def __post_init__(self) -> None:
-        if not isinstance(self.name, str) or not self.name or "::" in self.name:
-            raise ValueError("OpPlugin.name must be non-empty and cannot contain '::'.")
-        object.__setattr__(self, "bindings", tuple(self.bindings))
-        for binding in self.bindings:
+
+class OpPluginConsumer(PluginConsumer):
+    """Collect operator bindings for dispatcher construction."""
+
+    def __init__(self) -> None:
+        self._specs: dict[str, OpPluginSpec] = {}
+
+    @property
+    def specs(self) -> tuple[OpPluginSpec, ...]:
+        return tuple(self._specs[name] for name in sorted(self._specs))
+
+    def matches(self, plugin: Plugin) -> bool:
+        return isinstance(plugin, OpPlugin)
+
+    def consume(self, plugin: Plugin) -> None:
+        if not isinstance(plugin, OpPlugin):
+            raise TypeError("Expected an OpPlugin.")
+        name = type(plugin).plugin_name
+        if not isinstance(name, str) or not name or "::" in name:
+            raise ValueError("Operator plugin name must be non-empty and cannot contain '::'.")
+        if name in self._specs:
+            raise ValueError(f"Duplicate plugin ID {name!r}.")
+        bindings = tuple(plugin.get_bindings())
+        for binding in bindings:
             if not isinstance(binding, OpBinding):
-                raise TypeError("OpPlugin.bindings must contain OpBinding values.")
-            prefix = f"{self.name}::"
+                raise TypeError("get_bindings() must return OpBinding values.")
+            prefix = f"{name}::"
             if not binding.impl_name.startswith(prefix) or binding.impl_name == prefix:
                 raise ValueError(f"impl_name must use the {prefix!r} namespace.")
+        self._specs[name] = OpPluginSpec(name, bindings)
 
 
-PluginInput = str | OpPlugin | Mapping[str, Any]
-
-
-def _plugin_from_config(config: Mapping[str, Any]) -> OpPlugin:
-    values = dict(config)
-    bindings = values.pop("bindings", None)
-    if not isinstance(bindings, (list, tuple)):
-        raise TypeError("Plugin bindings must be a list or tuple of mappings.")
-    parsed: list[OpBinding] = []
-    for binding in bindings:
-        if not isinstance(binding, Mapping):
-            raise TypeError("Each configured binding must be a mapping.")
-        fields = dict(binding)
-        devices = fields.get("devices")
-        if not isinstance(devices, (list, tuple)):
-            raise TypeError("Binding devices must be an explicit list or tuple.")
-        fields["devices"] = tuple(TurboDevice(device) for device in devices)
-        fields["kind"] = OpImplKind(fields.get("kind", "custom"))
-        parsed.append(OpBinding(**fields))
-    return OpPlugin(bindings=tuple(parsed), **values)
-
-
-def load_plugins(references: tuple[str | OpPlugin, ...]) -> tuple[OpPlugin, ...]:
-    """Load explicitly enabled descriptions without importing their targets."""
-    plugins: list[OpPlugin] = []
-    names: set[str] = set()
-    for reference in references:
-        try:
-            plugin = _resolve(reference) if isinstance(reference, str) else reference
-            if not isinstance(plugin, OpPlugin):
-                raise TypeError(f"Plugin {reference!r} must reference an OpPlugin.")
-            if type(plugin.api_version) is not int or plugin.api_version != 1:
-                raise ValueError(f"Unsupported plugin api_version={plugin.api_version!r}.")
-            if plugin.name in names:
-                raise ValueError(f"Duplicate plugin ID {plugin.name!r}.")
-        except Exception as exc:
-            exc.add_note(f"Loading ops plugin {reference!r}.")
-            raise
-        names.add(plugin.name)
-        plugins.append(plugin)
-    return tuple(plugins)
+def normalize_plugin_specs(specs: Sequence[OpPluginSpec]) -> tuple[OpPluginSpec, ...]:
+    """Freeze the collected operator configuration for singleton comparison."""
+    if any(not isinstance(spec, OpPluginSpec) for spec in specs):
+        raise TypeError("plugin_specs must contain OpPluginSpec values from the consumer.")
+    result = tuple(sorted(specs, key=lambda spec: spec.name))
+    if len({spec.name for spec in result}) != len(result):
+        raise ValueError("Duplicate operator plugin IDs.")
+    return result
 
 
 class CallableOpImpl(OpImpl):
     """Adapt a plugin binding while retaining its autograd execution path."""
 
-    def __init__(self, plugin: OpPlugin, binding: OpBinding) -> None:
+    def __init__(self, plugin: OpPluginSpec, binding: OpBinding) -> None:
         self.binding = binding
         self.source = (
             f"plugin={plugin.name!r}, op_name={binding.op_name!r}, "
@@ -297,4 +264,4 @@ class CallableOpImpl(OpImpl):
             raise
 
 
-__all__ = ["OpBinding", "OpPlugin"]
+__all__ = ["OpBinding", "OpPluginConsumer"]

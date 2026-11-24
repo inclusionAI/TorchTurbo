@@ -8,13 +8,15 @@ from types import ModuleType
 import pytest
 import torch
 
+from torchturbo.engine.plugins import OpPlugin, PluginManager, register_plugin
 from torchturbo.ops import (
     OpBinding,
     OpDispatcher,
-    OpPlugin,
     OpPolicy,
+    OpRegistry,
     get_or_create_ops,
 )
+from torchturbo.ops.plugins import OpPluginConsumer, OpPluginSpec
 from torchturbo.ops.registry import registry
 from torchturbo.runtime import TurboDevice
 from torchturbo.runtime.cpu import CpuRuntime
@@ -55,12 +57,19 @@ def binding(**kwargs):
 
 
 def dispatcher(module, *bindings, **kwargs):
-    module.plugin = OpPlugin(name="external", bindings=bindings or (binding(),))
+    selected = bindings or (binding(),)
+
+    @register_plugin("external")
+    class ExternalOps(OpPlugin):
+        def get_bindings(self):
+            return selected
+
+    consumer = OpPluginConsumer()
+    consumer.consume(ExternalOps())
+    module.plugin = consumer.specs[0]
     return OpDispatcher(
-        device_runtime=CpuRuntime(),
-        registry=registry,
-        plugins=(f"{module.__name__}:plugin",),
-        **kwargs,
+        device_runtime=CpuRuntime(), registry=registry,
+        plugin_specs=consumer.specs, **kwargs,
     )
 
 
@@ -78,30 +87,25 @@ def test_plugin_preserves_autograd_and_isolates_registry(plugin_module):
 
 
 def test_plugin_loads_real_python_modules(tmp_path, monkeypatch):
-    (tmp_path / "plain_kernels.py").write_text(
-        "def add(x, y, *, alpha=1):\n    return x + alpha * y\n"
-    )
-    (tmp_path / "project_plugin.py").write_text(
-        "from torchturbo.ops import OpBinding, OpPlugin\n"
+    path = tmp_path / "shared_loader_ops.py"
+    path.write_text(
+        "from torchturbo.engine.plugins import OpPlugin, register_plugin\n"
+        "from torchturbo.ops import OpBinding\n"
         "from torchturbo.runtime import TurboDevice\n"
-        "plugin = OpPlugin(name='plain', bindings=(OpBinding(\n"
-        "    op_name='scaled_add', impl_name='plain::add',\n"
-        "    target='plain_kernels:add', devices=(TurboDevice.CPU,)),))\n"
+        "@register_plugin('plain')\n"
+        "class PlainOps(OpPlugin):\n"
+        "    def get_bindings(self):\n"
+        "        return (OpBinding(op_name='square', impl_name='plain::square',\n"
+        "            target='torch:square', devices=(TurboDevice.CPU,)),)\n"
     )
-    monkeypatch.syspath_prepend(str(tmp_path))
-    try:
-        ops = OpDispatcher(
-            device_runtime=CpuRuntime(), registry=registry,
-            plugins=("project_plugin:plugin",),
-        )
-        x = torch.ones(3, requires_grad=True)
-        result = ops.scaled_add(x, x, alpha=2)
-        torch.testing.assert_close(result, 3 * x)
-        result.sum().backward()
-        torch.testing.assert_close(x.grad, torch.full_like(x, 3))
-    finally:
-        sys.modules.pop("plain_kernels", None)
-        sys.modules.pop("project_plugin", None)
+    manager = PluginManager([str(path)])
+    consumer = OpPluginConsumer()
+    manager.try_consume(consumer, strict=True)
+    ops = OpDispatcher(device_runtime=CpuRuntime(), registry=registry,
+                       plugin_specs=consumer.specs)
+    x = torch.ones(3, requires_grad=True)
+    ops.square(x).sum().backward()
+    torch.testing.assert_close(x.grad, 2 * x)
 
 
 def test_explicit_backward_wraps_black_box(plugin_module):
@@ -205,13 +209,14 @@ def test_reserved_op_names_rejected(plugin_module, op_name):
         dispatcher(plugin_module, binding(op_name=op_name))
 
 
-def test_invalid_plugin_version_and_reference(plugin_module):
-    plugin_module.plugin = OpPlugin(name="external", bindings=(binding(),), api_version=2)
-    with pytest.raises(ValueError, match="api_version"):
-        OpDispatcher(device_runtime=CpuRuntime(), registry=registry,
-                     plugins=("external_tt_plugin:plugin",))
-    with pytest.raises(ValueError, match="module:attribute"):
-        OpDispatcher(device_runtime=CpuRuntime(), registry=registry, plugins=("external_tt_plugin",))
+def test_consumer_rejects_invalid_bindings():
+    @register_plugin("external")
+    class InvalidOps(OpPlugin):
+        def get_bindings(self):
+            return ("invalid",)
+
+    with pytest.raises(TypeError, match="OpBinding"):
+        OpPluginConsumer().consume(InvalidOps())
 
 
 def test_setup_context_requires_backward():
@@ -222,14 +227,18 @@ def test_setup_context_requires_backward():
 def test_singleton_compares_plugins_and_preserves_failed_initialization(plugin_module, monkeypatch):
     singleton = importlib.import_module("torchturbo.ops.ops")
     monkeypatch.setattr(singleton, "_OPS", None)
-    plugin_module.plugin = OpPlugin(name="external", bindings=(binding(),))
-    ops = get_or_create_ops(device_runtime=CpuRuntime(), plugins=("external_tt_plugin:plugin",))
-    assert get_or_create_ops(device_runtime=CpuRuntime(), plugins=("external_tt_plugin:plugin",)) is ops
-    with pytest.raises(RuntimeError, match="plugins"):
+    spec = OpPluginSpec("external", (binding(),))
+    ops = get_or_create_ops(device_runtime=CpuRuntime(), plugin_specs=(spec,))
+    assert get_or_create_ops(device_runtime=CpuRuntime(), plugin_specs=(spec,)) is ops
+    with pytest.raises(RuntimeError, match="plugin_specs"):
         get_or_create_ops(device_runtime=CpuRuntime())
+    changed = OpPluginSpec("external", (binding(target="external_tt_plugin:detached"),))
+    with pytest.raises(RuntimeError, match="plugin_specs"):
+        get_or_create_ops(device_runtime=CpuRuntime(), plugin_specs=(changed,))
     monkeypatch.setattr(singleton, "_OPS", None)
-    with pytest.raises((ValueError, ModuleNotFoundError)):
-        get_or_create_ops(device_runtime=CpuRuntime(), plugins=("absent_plugin:plugin",))
+    with pytest.raises(RuntimeError, match="Invalid override"):
+        get_or_create_ops(device_runtime=CpuRuntime(), plugin_specs=(spec,),
+                          overrides={"plugin_square": "missing"})
     assert singleton._OPS is None
 
 
@@ -386,15 +395,16 @@ def test_explicit_backward_rejects_nested_outputs(plugin_module):
         ops.plugin_square(torch.ones(2, requires_grad=True))
 
 
-def test_duplicate_plugin_ids_and_references(plugin_module):
-    plugin_module.plugin = OpPlugin(name="external", bindings=(binding(),))
-    plugin_module.alias = plugin_module.plugin
+def test_duplicate_plugin_ids_and_references():
+    @register_plugin("external")
+    class ExternalOps(OpPlugin):
+        def get_bindings(self):
+            return (binding(),)
+
+    consumer = OpPluginConsumer()
+    consumer.consume(ExternalOps())
     with pytest.raises(ValueError, match="Duplicate plugin ID"):
-        OpDispatcher(device_runtime=CpuRuntime(), registry=registry,
-                     plugins=("external_tt_plugin:plugin", "external_tt_plugin:alias"))
-    with pytest.raises(ValueError, match="Duplicate plugin references"):
-        OpDispatcher(device_runtime=CpuRuntime(), registry=registry,
-                     plugins=("external_tt_plugin:plugin",) * 2)
+        consumer.consume(ExternalOps())
 
 
 def test_plugin_cannot_override_builtin_impl(plugin_module):
@@ -402,10 +412,10 @@ def test_plugin_cannot_override_builtin_impl(plugin_module):
 
     local = OpRegistry()
     local.register(OpSpec(op_name="plugin_square", impl_name="external::square"))
-    plugin_module.plugin = OpPlugin(name="external", bindings=(binding(),))
+    plugin_module.plugin = OpPluginSpec(name="external", bindings=(binding(),))
     with pytest.raises(ValueError, match="Duplicate op implementation"):
         OpDispatcher(device_runtime=CpuRuntime(), registry=local,
-                     plugins=("external_tt_plugin:plugin",))
+                     plugin_specs=(plugin_module.plugin,))
 
 
 def test_dependency_error_keeps_original_cause(plugin_module, tmp_path, monkeypatch):
@@ -430,27 +440,55 @@ def test_availability_check_is_cached(plugin_module):
     assert len(calls) == 1
 
 
-def test_inline_plugin_singleton_compares_binding_content(monkeypatch):
-    singleton = importlib.import_module("torchturbo.ops.ops")
-    monkeypatch.setattr(singleton, "_OPS", None)
-    config = {"name": "external", "bindings": [{
-        "op_name": "square", "impl_name": "external::square",
-        "target": "torch:square", "devices": ["cpu"],
-    }]}
-    ops = get_or_create_ops(device_runtime=CpuRuntime(), plugins=[config])
-    assert get_or_create_ops(device_runtime=CpuRuntime(), plugins=[config]) is ops
-    config["bindings"][0]["target"] = "torch:neg"
-    with pytest.raises(RuntimeError, match="plugins"):
-        get_or_create_ops(device_runtime=CpuRuntime(), plugins=[config])
-    torch.testing.assert_close(ops.square(torch.tensor([2.])), torch.tensor([4.]))
+def test_consumer_errors_propagate_in_strict_mode():
+    @register_plugin("broken")
+    class BrokenOps(OpPlugin):
+        def get_bindings(self):
+            raise RuntimeError("bad operator configuration")
+
+    manager = PluginManager()
+    manager.plugins = [BrokenOps()]
+    with pytest.raises(RuntimeError, match="bad operator configuration"):
+        manager.try_consume(OpPluginConsumer(), strict=True)
 
 
-@pytest.mark.parametrize("field,value", [("devices", "cpu"), ("devices", ["invalid"]),
-                                       ("kind", "invalid"), ("unknown", True)])
-def test_inline_binding_rejects_invalid_configuration(field, value):
-    config = {"name": "external", "bindings": [{
-        "op_name": "square", "impl_name": "external::square",
-        "target": "torch:square", "devices": ["cpu"], field: value,
-    }]}
-    with pytest.raises((TypeError, ValueError)):
-        OpDispatcher(device_runtime=CpuRuntime(), registry=registry, plugins=[config])
+def test_non_operator_plugins_are_ignored():
+    from torchturbo.engine.plugins import Plugin
+
+    manager = PluginManager()
+    manager.plugins = [Plugin()]
+    consumer = OpPluginConsumer()
+    manager.try_consume(consumer, strict=True)
+    assert consumer.specs == ()
+
+
+def test_shared_loader_supports_multiple_plugins_and_bound_config(tmp_path):
+    config = tmp_path / "operator.conf"
+    config.write_text("torch:square")
+    paths = []
+    for name, priority in (("first_ops", 10), ("second_ops", 20)):
+        path = tmp_path / f"{name}.py"
+        path.write_text(
+            "from pathlib import Path\n"
+            "from torchturbo.engine.plugins import OpPlugin, register_plugin\n"
+            "from torchturbo.ops import OpBinding\n"
+            "from torchturbo.runtime import TurboDevice\n"
+            f"@register_plugin('{name}')\n"
+            "class ExternalOps(OpPlugin):\n"
+            "    def get_bindings(self):\n"
+            "        return (OpBinding(op_name='plugin_square', "
+            f"impl_name='{name}::square', target=Path(self.config).read_text(), "
+            f"devices=(TurboDevice.CPU,), priority={priority}),)\n"
+        )
+        paths.append(f"{path}:{config}")
+    manager = PluginManager(paths)
+    consumer = OpPluginConsumer()
+    manager.try_consume(consumer, strict=True)
+    assert [spec.name for spec in consumer.specs] == ["first_ops", "second_ops"]
+    ops = OpDispatcher(device_runtime=CpuRuntime(), registry=OpRegistry(),
+                       plugin_specs=consumer.specs)
+    x = torch.tensor([3.0], requires_grad=True)
+    ops.plugin_square(x).sum().backward()
+    torch.testing.assert_close(x.grad, 2 * x.detach())
+    selected = [candidate.spec.impl_name for candidate in ops._candidate_impl_cache.values()]
+    assert selected == ["second_ops::square"]

@@ -67,6 +67,7 @@ from .optimizers import (
     OptimizerRecipe,
 )
 from .plugins import (
+    OpPlugin,
     DatasetPlugin,
     Plugin,
     PluginConsumer,
@@ -77,6 +78,7 @@ from .plugins import (
 
 
 __all__ = [
+    "OpPlugin",
     # EngineConfig construction.
     "build_from_args",
     # CLI args
