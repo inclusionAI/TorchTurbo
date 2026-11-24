@@ -10,6 +10,7 @@ import torch.nn.functional as F
 from transformers import Cache
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
+from torchturbo.engine.peft.weights import get_effective_weight
 from torchturbo.models.modules.attention.ulysses import (
     all_gather_sp_with_grad_reduce,
 )
@@ -201,7 +202,7 @@ class DeepseekV4DSparkAttention(DeepseekV4Attention):
         )
         o = torch.cat([o_nope, o_rope], dim=-1)
         o = o.view(batch_size, draft_length, self.n_groups, -1)
-        wo_a_weight = self.wo_a.weight.view(self.n_groups, self.o_lora_rank, -1)
+        wo_a_weight = get_effective_weight(self.wo_a).view(self.n_groups, self.o_lora_rank, -1)
         o = torch.einsum("bsgd,grd->bsgr", o, wo_a_weight)
         return self.wo_b(o.reshape(batch_size, draft_length, -1))
 

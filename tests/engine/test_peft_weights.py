@@ -6,7 +6,11 @@ import torch
 from peft import LoraConfig, get_peft_model
 from torch import nn
 
-from torchturbo.engine.peft.weights import compute_dora_magnitude, merge_lora_linear
+from torchturbo.engine.peft.weights import (
+    compute_dora_magnitude,
+    get_effective_weight,
+    merge_lora_linear,
+)
 
 
 class LinearModel(nn.Module):
@@ -64,3 +68,32 @@ def test_compute_dora_magnitude_matches_peft_initialization() -> None:
         actual,
         layer.lora_magnitude_vector["default"].weight,
     )
+
+
+def test_get_effective_weight_plain_linear_passthrough() -> None:
+    linear = nn.Linear(3, 2, bias=False)
+    assert get_effective_weight(linear) is linear.weight
+
+
+def test_get_effective_weight_keeps_adapter_in_graph() -> None:
+    model = get_peft_model(
+        LinearModel(),
+        LoraConfig(r=2, lora_alpha=3, target_modules=["linear"]),
+    )
+    layer = model.base_model.model.linear
+    # Non-zero B so the adapter actually changes the effective weight.
+    with torch.no_grad():
+        layer.lora_A["default"].weight.normal_()
+        layer.lora_B["default"].weight.normal_()
+
+    # Numerics are covered by test_merge_lora_linear_matches_peft_dora_merge;
+    # this only guards the autograd contract: the returned tensor must carry
+    # gradients to the adapters (the pre-fix .weight read left them at None).
+    get_effective_weight(layer).sum().backward()
+    assert layer.lora_A["default"].weight.grad is not None
+    assert layer.lora_B["default"].weight.grad is not None
+
+    # After merge the delta folds into the base weight, so the effective
+    # weight is exactly the merged base weight.
+    model.merge_adapter()
+    assert get_effective_weight(layer) is layer.base_layer.weight
