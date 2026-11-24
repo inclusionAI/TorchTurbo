@@ -338,13 +338,30 @@ class TorchTurboEngine:
 
                 # Prepare model via backend (module replacement → LoRA → sharding).
                 logger.info_rank0("Sharding model via %s backend", self.config.backend.value)
+                parallel_context_holder: dict[str, Any] = {}
+
+                def _run_on_parallelized(prepared: nn.Module) -> None:
+                    # Backends call this after SP setup and before activation
+                    # checkpointing. Patch Transformers first so SP attention
+                    # registration sees the final attention dispatch.
+                    self._patch_transformers()
+                    context = self._get_parallel_context()
+                    parallel_context_holder["context"] = context
+                    prepared.on_parallelized(context)
+
                 model = self.backend.prepare_model(
-                    model, parallel_plan=parallel_plan, peft_config=peft_config
+                    model,
+                    parallel_plan=parallel_plan,
+                    peft_config=peft_config,
+                    on_parallelized=_run_on_parallelized,
                 )
 
-                self._patch_transformers()
-                parallel_context = self._get_parallel_context()
-                model.on_parallelized(parallel_context)
+                parallel_context = parallel_context_holder.get("context")
+                if parallel_context is None:
+                    # Backend did not run the hook; keep the legacy order.
+                    self._patch_transformers()
+                    parallel_context = self._get_parallel_context()
+                    model.on_parallelized(parallel_context)
 
         if self._checkpoint is None:
             export_plugin_consumer = CheckpointExportPluginConsumer()

@@ -2,7 +2,7 @@
 
 import functools
 import re
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from types import MappingProxyType, MethodType
 from typing import Any, Optional
@@ -605,6 +605,7 @@ class FSDP2Backend(BaseBackend):
         model: nn.Module,
         parallel_plan: Any = None,
         peft_config: Any = None,
+        on_parallelized: Callable[[nn.Module], None] | None = None,
     ) -> nn.Module:
         if parallel_plan is None:
             plan = FSDPParallelPlan()
@@ -640,6 +641,12 @@ class FSDP2Backend(BaseBackend):
                 sp_info["sp_size"],
                 sp_info["sp_rank"],
             )
+
+        # Sequence-parallel forward patches are class-level replacements. Run
+        # the model hook before activation checkpointing so a checkpointed
+        # module captures the patched forward instead of the pre-SP one.
+        if on_parallelized is not None:
+            on_parallelized(model)
 
         # Freeze model-authored patterns into exact targets before later
         # transformations can add wrappers or replace parameter objects.

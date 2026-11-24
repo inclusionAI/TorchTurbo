@@ -165,8 +165,12 @@ class DummyBackend(BaseBackend):
         super().__init__(config, device_runtime)
         self._checkpoint = RecordingCheckpointManager()
 
-    def prepare_model(self, model, parallel_plan=None, peft_config=None):
+    def prepare_model(
+        self, model, parallel_plan=None, peft_config=None, on_parallelized=None
+    ):
         model._dummy_sharded = True
+        if on_parallelized is not None:
+            on_parallelized(model)
         return model
 
     def materialize(self, model):
@@ -373,13 +377,15 @@ class TestEngineSetup:
                 assert torch.empty(0).device.type == "cpu"
                 return converter
 
-        def backend_prepare(model, parallel_plan, peft_config):
+        def backend_prepare(model, parallel_plan, peft_config, on_parallelized=None):
             order.append("backend_prepare")
             assert isinstance(model, LifecycleModel)
             assert model.projection.weight.is_meta
             assert flash_integration._flash_attention_forward is original_binding
             assert parallel_plan is engine.parallel_plan
             assert peft_config is None
+            if on_parallelized is not None:
+                on_parallelized(model)
             return model
 
         def backend_context():

@@ -211,6 +211,30 @@ def test_compress_fqn_runs_groups_specs_across_dfs_order():
     ]
 
 
+def test_prepare_model_runs_on_parallelized_before_activation_checkpointing():
+    order = []
+    backend = make_preparing_backend(
+        order, {"sp_size": 1, "sp_group": None, "sp_rank": 0}
+    )
+    model = TaggedModule("root")
+    model.config = types.SimpleNamespace()
+
+    backend.prepare_model(
+        model,
+        FSDPParallelPlan(),
+        on_parallelized=lambda prepared: order.append("on_parallelized"),
+    )
+
+    assert order == [
+        "init_mesh",
+        "replace",
+        "on_parallelized",
+        "activation_checkpointing",
+        "shard",
+        "prefetch",
+    ]
+
+
 def test_cpu_offload_grad_norm_counts_replicated_grad_once(monkeypatch):
     backend = FSDP2Backend.__new__(FSDP2Backend)
     backend._device_runtime = types.SimpleNamespace(
