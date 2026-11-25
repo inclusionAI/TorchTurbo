@@ -20,9 +20,18 @@ engine_config:
     sp_size: 1
     ep_size: 1
     # Example FQN patches. Adjust these patterns to match the target model.
+    # Model defaults resolve first; these patterns then override matched FQNs
+    # field-by-field. User patterns use YAML order and first-match wins.
     plan:
       "model.language_model.layers.*":
         activation_checkpoint: true
+      # Submodule-granularity example: disable whole-layer recompute, then
+      # checkpoint only each layer's attention. Nested enabled targets are
+      # rejected at startup.
+      # "model.layers.*":
+      #   activation_checkpoint: false
+      # "model.layers.*.attention":
+      #   activation_checkpoint: true
       "model.visual.blocks.*":
         activation_checkpoint: true
       "model.visual":

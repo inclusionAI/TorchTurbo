@@ -20,7 +20,7 @@ from torchturbo.models.qwen3_5.configuration_qwen3_5 import Qwen3_5VisionConfig
 from torchturbo.models.qwen3_5.model import TurboQwen3_5ForConditionalGeneration
 from torchturbo.models.qwen3_5.modeling_qwen3_5 import Qwen3_5VisionModel
 from torchturbo.models.qwen3_5.vision_balance import Qwen3_5VisionBalanceIO
-from torchturbo.parallel import VisionBalanceMode, VisionBalanceSpec
+from torchturbo.parallel import VisionBalanceMode, VisionBalanceSpec, resolve_plan_spec
 
 
 def _tower():
@@ -58,7 +58,7 @@ def test_yaml_merges_dense_vision_balance_without_losing_sharding(tmp_path, mode
     engine = TorchTurboEngine.__new__(TorchTurboEngine)
     engine.config = build_from_args(args)
     plan = engine._resolve_parallel_plan(_DensePlanModel())
-    visual = plan.plan["model.visual"]
+    visual = resolve_plan_spec(plan, "model.visual")
     assert plan.sp_size == plan.ep_size == 8
     assert visual.standalone_world_shard is True
     assert plan.plan["model.visual.blocks.*"].activation_checkpoint is True
@@ -66,6 +66,7 @@ def test_yaml_merges_dense_vision_balance_without_losing_sharding(tmp_path, mode
     assert visual.vision_balance.mode == (VisionBalanceMode(mode) if mode else None)
     default = _DensePlanModel.get_default_parallel_plan()
     assert default.plan["model.visual"].vision_balance.mode is None
+    assert isinstance(default.plan["model.visual"].vision_balance.io, Qwen3_5VisionBalanceIO)
     assert default.ep_size == 1
 
 

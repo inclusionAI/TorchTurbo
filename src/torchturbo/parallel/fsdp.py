@@ -5,12 +5,21 @@ from __future__ import annotations
 import copy
 from collections.abc import Mapping
 from dataclasses import dataclass, field, fields
+from dataclasses import replace as dataclass_replace
 from enum import Enum
 from typing import TYPE_CHECKING, Any
 
 from ..engine.utils import match_fqn
 from .parallel import ParallelPlan
 
+USER_PLAN_PATTERNS_ATTR = "_tt_user_plan_patterns"
+"""Attribute carrying user-supplied plan patterns separately from model defaults.
+
+The engine attaches the YAML/CLI ``parallel_plan.plan`` mapping here instead of
+merging it into the model-authored plan dict. Resolution then applies model
+defaults first (declared order, first match) and user patterns second (declared
+order, first match, field-level override).
+"""
 if TYPE_CHECKING:
     from ..models.modules.vision.io import BaseVisionBalanceIO
 
@@ -185,3 +194,56 @@ class FSDPParallelPlan(ParallelPlan):
             if match_fqn(pattern, fqn):
                 return spec
         return None
+
+    def user_match(self, fqn: str) -> Any | None:
+        """Find the first user-pattern specification matching *fqn*."""
+        user_patterns = getattr(self, USER_PLAN_PATTERNS_ATTR, None) or {}
+        for pattern, spec in user_patterns.items():
+            if match_fqn(pattern, fqn):
+                return spec
+        return None
+
+
+def merge_plan_spec_override(
+    base: FSDPPlanSpec | None, override: FSDPPlanSpec
+) -> FSDPPlanSpec:
+    """Apply non-``None`` fields of *override* on top of *base*.
+
+    Fields the user did not set (``None``) keep the model-default value. This is
+    the per-FQN equivalent of the former same-key dict merge, and also merges
+    partial :class:`VisionBalanceSpec` overrides.
+    """
+    if base is None:
+        return override
+    if not isinstance(base, FSDPPlanSpec):
+        raise TypeError(f"Cannot override non-FSDPPlanSpec base: {base!r}")
+
+    values: dict[str, Any] = {}
+    for spec_field in fields(override):
+        value = getattr(override, spec_field.name)
+        if value is None:
+            continue
+        if spec_field.name == "vision_balance":
+            base_vision = base.vision_balance
+            if base_vision is not None:
+                value = VisionBalanceSpec(
+                    mode=value.mode if value.mode is not None else base_vision.mode,
+                    io=value.io if value.io is not None else base_vision.io,
+                )
+        values[spec_field.name] = value
+    return dataclass_replace(base, **values)
+
+
+def resolve_plan_spec(plan: FSDPParallelPlan, fqn: str) -> FSDPPlanSpec | None:
+    """Resolve one FQN against model defaults, then user overrides.
+
+    Each side uses its own declared-order first-match rule. A user match
+    overrides only explicitly set fields; model defaults survive elsewhere.
+    """
+    base = plan.match(fqn)
+    override = plan.user_match(fqn)
+    if override is None:
+        return base if isinstance(base, FSDPPlanSpec) else None
+    return merge_plan_spec_override(
+        base if isinstance(base, FSDPPlanSpec) else None, override
+    )
