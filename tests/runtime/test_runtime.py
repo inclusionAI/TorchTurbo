@@ -14,7 +14,9 @@ from torchturbo.runtime import (
     is_device_available,
     is_npu_available,
 )
+from torchturbo.runtime.base import Shmem, TorchShmem
 from torchturbo.runtime.cpu import CpuRuntime
+from torchturbo.runtime.cuda import CudaRuntime
 from torchturbo.runtime.npu import _NPU_DETERMINISTIC_ENV, NpuRuntime
 import torchturbo.runtime.runtime as runtime_impl
 
@@ -112,6 +114,9 @@ def test_cpu_runtime_contract():
     assert runtime.supports_async_streams is False
     assert runtime.new_stream() is None
     assert runtime.current_stream() is None
+    buffer, handle = runtime.allocate_communication_buffer(3, dtype=torch.float32, device=runtime.device, group=None)
+    assert buffer.device == runtime.device and buffer.shape == (3,)
+    assert handle is None
     free, total = runtime.memory_info()
     assert 0 <= free <= total
     assert total > 0
@@ -128,6 +133,62 @@ def test_cpu_runtime_contract():
             profiling_enabled=True,
             memory_snapshot_steps=None,
         )
+
+
+def test_selected_npu_runtime_owns_the_shmem_service(monkeypatch):
+    monkeypatch.setattr(runtime_impl, "_auto_detect_runtime", NpuRuntime)
+    runtime = get_device_runtime()
+
+    assert isinstance(runtime.shmem, Shmem)
+    assert get_device_runtime().shmem is runtime.shmem
+
+
+@pytest.mark.parametrize("runtime_cls", [CpuRuntime, CudaRuntime])
+def test_runtime_without_shmem_support_skips_heap_management(runtime_cls):
+    shmem = runtime_cls().shmem
+    assert not shmem.available()
+    assert shmem.prepare_heap([None, None, None]) == 0
+    shmem.release_unused()
+
+
+@pytest.mark.parametrize("use_world", [False, True], ids=["subgroup", "world"])
+def test_communication_buffer_delegates_peer_allocations_to_pytorch(monkeypatch, use_world):
+    import torch.distributed._symmetric_memory as symm_mem
+
+    class AvailableShmem(TorchShmem):
+        def available(self) -> bool:
+            return True
+
+    runtime = CpuRuntime()
+    runtime.shmem = AvailableShmem()
+    device = torch.device("cpu")
+    world = object()
+    group = None if use_world else object()
+    monkeypatch.setattr(torch.distributed, "group", SimpleNamespace(WORLD=world))
+    calls = []
+    arena = torch.empty(3)
+    handle = object()
+
+    def empty(numel, *, dtype, device):
+        calls.append((numel, dtype, device))
+        return arena
+
+    def rendezvous(tensor, group):
+        assert tensor is arena
+        calls.append(group)
+        return handle
+
+    monkeypatch.setattr(symm_mem, "empty", empty)
+    monkeypatch.setattr(symm_mem, "rendezvous", rendezvous)
+    args = {"dtype": torch.float32, "device": device, "group": group}
+
+    assert runtime.shmem.prepare_heap([arena.nbytes, None]) == 0
+    tensor, peers = runtime.allocate_communication_buffer(3, **args, peer_access=True)
+    assert tensor is arena and peers is handle
+    local, peers = runtime.allocate_communication_buffer(3, **args, peer_access=False)
+    assert (local.shape, local.dtype, local.device, peers) == ((3,), torch.float32, device, None)
+    runtime.shmem.release_unused()
+    assert calls == [(3, torch.float32, device), world if use_world else group]
 
 
 def test_use_deterministic_algorithms_sets_process_state(monkeypatch):
@@ -214,9 +275,10 @@ def test_get_device_name_falls_back_to_probe_order(monkeypatch):
     assert npu_runtime.available_calls == 1
 
 
-def test_device_runtime_base_is_abstract():
-    with pytest.raises(TypeError):
-        DeviceRuntime()
+@pytest.mark.parametrize("base", [DeviceRuntime, Shmem])
+def test_runtime_base_is_abstract(base):
+    with pytest.raises(TypeError, match="abstract"):
+        base()
 
 
 def test_device_runtime_auto_detects_first_available_runtime(monkeypatch):

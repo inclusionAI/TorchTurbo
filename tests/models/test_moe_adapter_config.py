@@ -1,4 +1,4 @@
-"""Model replacements honor engine MoE losses across sequence-parallel ranks."""
+"""Model replacements honor engine MoE settings across sequence-parallel ranks."""
 
 import os
 import sys
@@ -16,6 +16,7 @@ from transformers import Qwen3MoeConfig
 from torchturbo.engine.backends.fsdp2.backend import FSDP2Backend
 from torchturbo.engine.config import EngineConfig
 from torchturbo.models.bailing_hybrid.parallel_plan import _replace_moe_only as replace_bailing
+from torchturbo.models.bailing_moe_v3_vl.parallel_plan import _replace_vl_moe
 from torchturbo.models.deepseek_v4.parallel_plan import _replace_moe_only as replace_deepseek
 from torchturbo.models.glm_moe_dsa.parallel_plan import _replace_moe_only as replace_glm
 from torchturbo.models.kimi_k25.parallel_plan import _replace_kimi_moe_only
@@ -26,6 +27,7 @@ from torchturbo.models.modules.moe.experts import GroupedMLP
 from torchturbo.models.modules.moe.module import ModuleSpec
 from torchturbo.models.modules.moe.moe_layer import MoESubmodules
 from torchturbo.models.qwen3_5_moe.parallel_plan import _replace_qwen3_5_moe_only
+from torchturbo.models.qwen3_5_moe_text.parallel_plan import get_parallel_plan as get_text_moe_plan
 from torchturbo.models.qwen3_moe.parallel_plan import QWen3MoeLayerWrapper
 from torchturbo.ops import OpPolicy, get_or_create_ops
 from torchturbo.parallel import FSDPParallelPlan, FSDPPlanSpec
@@ -58,7 +60,9 @@ def _adapter_cases():
         ("deepseek_v4", deepseek, replace_deepseek, "sqrtsoftplus"),
         ("llada2", llada, _replace_llada2_moe_only, "sigmoid"),
         ("qwen3_5", common, _replace_qwen3_5_moe_only, "softmax"),
+        ("qwen3_5_text", common, get_text_moe_plan().plan["model.layers.*.mlp"].replace_module, "softmax"),
         ("bailing", common, replace_bailing, "sigmoid"),
+        ("bailing_vl", SimpleNamespace(text_config=common), _replace_vl_moe, "sigmoid"),
     ]
 
 
@@ -78,7 +82,7 @@ def _reference_loss(weight, inputs, score_function, aux_coeff, z_coeff):
     return aux_coeff * aux_loss + z_coeff * z_loss
 
 
-def _check_adapter_losses(rank: int, init_file: str) -> None:
+def _check_adapter_losses(rank: int, init_file: str, dispatcher: str) -> None:
     torch.set_num_threads(1)
     os.environ.setdefault("GLOO_SOCKET_IFNAME", "lo0" if sys.platform == "darwin" else "lo")
     dist.init_process_group(
@@ -89,7 +93,12 @@ def _check_adapter_losses(rank: int, init_file: str) -> None:
         runtime = CpuRuntime()
         runtime_module._SELECTED_RUNTIME = runtime
         get_or_create_ops(device_runtime=runtime, default_policy=OpPolicy.NATIVE)
-        engine_config = EngineConfig()
+        engine_config = EngineConfig.from_dict({
+            "moe": {
+                "token_dispatcher": dispatcher,
+                "virtual_expert_load_balance": dispatcher == "flex",
+            },
+        })
         backend = FSDP2Backend(engine_config, runtime)
         submodules = MoESubmodules(experts=ModuleSpec(module=GroupedMLP))
         inputs = torch.tensor([
@@ -128,6 +137,10 @@ def _check_adapter_losses(rank: int, init_file: str) -> None:
                         backend._replace_modules(model, plan)
                     continue
                 backend._replace_modules(model, plan)
+                assert model.mlp.config.moe_token_dispatcher_type == dispatcher, name
+                assert model.mlp.config.moe_virtual_expert_load_balance == (
+                    dispatcher == "flex"
+                ), name
                 router = model.mlp.router
                 with torch.no_grad():
                     router.weight.copy_(weight)
@@ -159,8 +172,9 @@ def _check_adapter_losses(rank: int, init_file: str) -> None:
     not (dist.is_available() and dist.is_gloo_available()),
     reason="requires torch.distributed with Gloo support",
 )
-def test_model_adapters_apply_configured_losses_across_sp(tmp_path) -> None:
+@pytest.mark.parametrize("dispatcher", ["alltoall", "flex"])
+def test_model_adapters_apply_configured_losses_across_sp(tmp_path, dispatcher) -> None:
     mp.spawn(
-        _check_adapter_losses, args=(str(tmp_path / "adapter-sp"),),
+        _check_adapter_losses, args=(str(tmp_path / "adapter-sp"), dispatcher),
         nprocs=2, join=True,
     )

@@ -31,6 +31,19 @@ RUN pip install triton-ascend==3.2.2.post2 \
         --index-url=https://repo.huaweicloud.com/ascend/repos/pypi \
         --extra-index-url=https://repo.huaweicloud.com/repository/pypi/simple
 RUN pip install torch_npu==2.10.0.post7
+# Build Ascend SHMEM v1.8.0 with A2/A3 RDMA support.
+ARG MAX_JOBS=8
+ENV SHMEM_HOME_PATH=/usr/local/Ascend/shmem
+ENV LD_LIBRARY_PATH=${SHMEM_HOME_PATH}/shmem/lib:${LD_LIBRARY_PATH}
+RUN bash -c "source /usr/local/Ascend/ascend-toolkit/set_env.sh \
+    && git clone --branch v1.8.0 --depth 1 https://gitcode.com/cann/shmem.git /tmp/shmem \
+    && git -C /tmp/shmem checkout ed07fa687d1ca30e636b5a86e1e6ceba82d88535 \
+    && CMAKE_BUILD_PARALLEL_LEVEL=${MAX_JOBS} bash /tmp/shmem/scripts/build.sh -enable_rdma \
+    && install -d ${SHMEM_HOME_PATH} \
+    && cp -a /tmp/shmem/install/shmem /tmp/shmem/install/set_env.sh /tmp/shmem/install/version.info \
+        /tmp/shmem/LICENSE /tmp/shmem/Third_Party_Open_Source_Software* ${SHMEM_HOME_PATH}/ \
+    && test -s ${SHMEM_HOME_PATH}/shmem/lib/libshmem.so \
+    && rm -rf /tmp/shmem"
 # flash-linear-attention: built in-image from the fla-org/flash-linear-attention
 # main branch at commit 954438d1
 RUN git clone https://github.com/fla-org/flash-linear-attention.git /tmp/flash-linear-attention \
@@ -40,7 +53,6 @@ RUN git clone https://github.com/fla-org/flash-linear-attention.git /tmp/flash-l
     && rm -rf /tmp/flash-linear-attention
 # Disable mimalloc to avoid MADV_FREE reclaiming DMA-written pages.
 # Patch PyTorch's AArch64 default so USE_MIMALLOC=OFF takes effect.
-ARG MAX_JOBS=8
 RUN git clone --branch v2.10.0 --depth 1 --recurse-submodules --shallow-submodules \
         https://github.com/pytorch/pytorch.git /tmp/pytorch \
     && cd /tmp/pytorch \

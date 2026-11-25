@@ -287,8 +287,8 @@ class TopKRouter(Router):
             logits (torch.Tensor): Logits tensor after gating.
 
         Returns:
-            Dense routing weights, boolean assignment mask, and the selected
-            expert IDs in their native top-k order.
+            Routing weights, assignment map and selected expert IDs. Flex
+            consumes top-k weights and uses the selected IDs as its map.
         """
         seq_length, bsz = logits.shape[:2]
         logits = logits.view(-1, self.config.num_moe_experts)
@@ -312,6 +312,7 @@ class TopKRouter(Router):
                 use_hash_routing=self.use_hash_routing,
                 hash_table=getattr(self, "tid2eid", None),
                 input_ids=input_ids,
+                compact_output=self.config.moe_token_dispatcher_type == "flex",
             )
         else:
             raise ValueError(f"Unsupported MoE routing type: {self.routing_type}")
@@ -341,10 +342,10 @@ class TopKRouter(Router):
             and torch.is_grad_enabled()
         ):
             with torch.no_grad():
-                bias_routing_map = mask_padding_tokens(
-                    routing_map, padding_mask
-                )
-                tokens_per_expert = bias_routing_map.sum(dim=0).to(torch.float32)
+                valid_routes = mask_padding_tokens(torch.ones_like(expert_indices), padding_mask)
+                tokens_per_expert = expert_indices.new_zeros(self.num_experts).scatter_add_(
+                    0, expert_indices.flatten(), valid_routes.flatten(),
+                ).float()
                 if not hasattr(self, "local_tokens_per_expert"):
                     self.register_buffer(
                         "local_tokens_per_expert",
@@ -366,8 +367,8 @@ class TopKRouter(Router):
         Forward pass of the router.
 
         Returns:
-            Dense routing weights, boolean assignment mask, selected expert
-            IDs, and the router logits.
+            Routing weights, assignment map, selected expert IDs and router
+            logits. Flex weights and maps both use the compact top-k layout.
         """
         self._maintain_float32_expert_bias()
 

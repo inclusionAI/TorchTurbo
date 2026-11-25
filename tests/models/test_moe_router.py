@@ -1,5 +1,7 @@
 """Tests for shared MoE router behavior."""
 
+from dataclasses import replace
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -61,6 +63,36 @@ def test_gating_saves_inputs_without_router_dtype_copies():
     assert [(tuple(tensor.shape), tensor.dtype) for tensor in saved] == [
         ((2, 3, 4), torch.bfloat16), ((3, 4), torch.bfloat16),
     ]
+
+
+@pytest.mark.parametrize("hash_routing", [False, True])
+def test_flex_router_returns_compact_probabilities_and_preserves_training_losses(hash_routing):
+    config = MoEConfig(
+        hidden_size=3, num_moe_experts=5, moe_router_topk=2,
+        moe_router_score_function="sigmoid", moe_router_enable_expert_bias=True,
+        moe_aux_loss_coeff=0.2, moe_z_loss_coeff=0.1,
+        num_hash_layers=int(hash_routing), vocab_size=8,
+    )
+    reference = TopKRouter(config, layer_number=0)
+    router = TopKRouter(replace(config, moe_token_dispatcher_type="flex"), layer_number=0)
+    router.load_state_dict(reference.state_dict())
+    inputs = torch.randn(2, 3, 3, requires_grad=True)
+    ref_inputs = inputs.detach().clone().requires_grad_()
+    ids = torch.arange(6).reshape(2, 3)
+    padding = torch.tensor([[True, False, False], [False, True, False]])
+    probs, routes, indices, _ = router(inputs, ids, padding)
+    dense, _, ref_indices, _ = reference(ref_inputs, ids, padding)
+    expected = dense.gather(1, ref_indices)
+    torch.testing.assert_close(routes, ref_indices)
+    torch.testing.assert_close(indices, ref_indices)
+    torch.testing.assert_close(probs, expected)
+    if not hash_routing:
+        torch.testing.assert_close(router.local_tokens_per_expert, reference.local_tokens_per_expert)
+    torch.testing.assert_close(router.pop_metrics(), reference.pop_metrics())
+    probs.square().sum().backward()
+    expected.square().sum().backward()
+    torch.testing.assert_close(inputs.grad, ref_inputs.grad)
+    torch.testing.assert_close(router.weight.grad, reference.weight.grad)
 
 
 def test_softmax_expert_bias_requires_pre_softmax():

@@ -6,18 +6,22 @@
   #
   # Modified by the TorchTurbo contributors.
 
+from contextlib import nullcontext
+from functools import partial
 from typing import TYPE_CHECKING
 
 import torch
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
+from .grouped_linear import grouped_linear
 from .moe_config import MoEConfig
 from torchturbo.ops import ops
 from torchturbo.logging import get_logger
 
 if TYPE_CHECKING:
     from torchturbo.engine.optimizers import MuonParameterSpec
+    from .virtual_expert_load_balancer import VirtualExpertLoadBalancer
 
 logger = get_logger(__name__)
 
@@ -46,7 +50,13 @@ class GroupedMLP(torch.nn.Module):
         layer_number: int = None,
     ):
         super().__init__()
+        if config.moe_virtual_expert_load_balance and use_te:
+            raise ValueError(
+                "Virtual-expert load balancing does not support TE experts; "
+                "use fused-weight GroupedMLP."
+            )
         self.config = config
+        self._load_balancer: VirtualExpertLoadBalancer | None = None
         self.num_local_experts = num_local_experts
         self.layer_number = layer_number
         limit_list = getattr(config, "moe_swiglu_limit", None)
@@ -185,6 +195,17 @@ class GroupedMLP(torch.nn.Module):
         hidden_states = self.activation_func(hidden_states)
         return (hidden_states * probs).to(hidden_states.dtype)
 
+    def bind_virtual_experts(self, load_balancer: "VirtualExpertLoadBalancer") -> None:
+        """Use this load balancer to bind weights for each expert call."""
+        self._load_balancer = load_balancer
+
+    def native_weights(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """View the current unsharded FC parameters as expert matrices."""
+        return (
+            self.weight1.view(self.num_local_experts, self.config.hidden_size, -1),
+            self.weight2.view(self.num_local_experts, -1, self.config.hidden_size),
+        )
+
     def forward(
         self,
         permuted_local_hidden_states: torch.Tensor,
@@ -192,75 +213,26 @@ class GroupedMLP(torch.nn.Module):
         permuted_probs: torch.Tensor,
     ) -> tuple[torch.Tensor, None]:
         """Apply routing probabilities inside each expert before its second linear."""
-        if self.config.moe_apply_probs_on_input:
-            assert (
-                self.config.moe_router_topk == 1
-            ), "`moe_apply_probs_on_input` only works with `moe_router_topk`=1."
-            original_dtype = permuted_local_hidden_states.dtype
-            permuted_local_hidden_states = (
-                permuted_probs.unsqueeze(-1) * permuted_local_hidden_states
-            )
-            permuted_local_hidden_states = permuted_local_hidden_states.to(
-                original_dtype
-            )
-            # Probs already applied, so reset to 1.
-            permuted_probs = torch.ones_like(permuted_probs)
-
-        activation_probs = permuted_probs.unsqueeze(-1)
-
-        # `tokens_per_expert` is the per-expert token count used as the grouped-GEMM
-        # `batch_sizes`. The grouped_gemm C++ kernel hard-requires it on CPU
-        # (`assert batch_sizes.is_cpu()`). During normal forward the AlltoAll token
-        # dispatcher moves it to CPU via an async side-stream + sync point; but under
-        # activation-checkpoint recompute (driven by autograd in backward) that side
-        # stream/sync timing is not reliably hit, so the GPU tensor can leak through
-        # and trip the is_cpu() assert. Pin it to CPU here at the call site instead of
-        # relying on the dispatcher's async DtoH, so forward and recompute behave the
-        # same. (The TE branch already does the equivalent via .tolist() below.)
-        if isinstance(tokens_per_expert, torch.Tensor) and tokens_per_expert.is_cuda:
-            tokens_per_expert = tokens_per_expert.cpu()
-
-        if transformer_engine_is_available() and self.use_te:
-            # TE also handles empty inputs and keeps its expert weights in the graph.
-            m_splits = tokens_per_expert.tolist()
-            # First grouped linear: hidden_size -> fc1_output_size
-            fc1_output = self.fc1_linear(permuted_local_hidden_states, m_splits)
-
-            # Apply activation function
-            intermediate_parallel = self.activation_func_with_probs(
-                fc1_output, activation_probs
-            )
-
-            # Second grouped linear: fc2_input_size -> hidden_size
-            fc2_output = self.fc2_linear(intermediate_parallel, m_splits)
-        elif permuted_local_hidden_states.nelement() != 0:
-            # Fall back to the grouped_matmul op registry.
-            # Reshape the weights for the grouped GEMMs.
-            w1 = self.weight1.view(
-                self.num_local_experts, self.config.hidden_size, -1
-            )
-            w2 = self.weight2.view(
-                self.num_local_experts, -1, self.config.hidden_size
-            )
-
-            fc1_output = ops.grouped_matmul(
-                permuted_local_hidden_states, w1, tokens_per_expert, trans_b=False
-            )
-            intermediate_parallel = self.activation_func_with_probs(
-                fc1_output, activation_probs
-            )
-            fc2_output = ops.grouped_matmul(
-                intermediate_parallel, w2, tokens_per_expert, trans_b=False
-            )
-        else:
-            # No token is allocated for local experts.
-            assert torch.count_nonzero(tokens_per_expert) == 0
-
-            # Make sure params of experts still have gradients even given zero tokens.
-            w1 = self.weight1.view(self.config.hidden_size, -1)
-            w2 = self.weight2.view(-1, self.config.hidden_size)
-            h = torch.matmul(permuted_local_hidden_states, w1)
-            h = self.activation_func_with_probs(h, activation_probs)
-            fc2_output = torch.matmul(h, w2)
-
-        return fc2_output, None
+        hidden, counts, probs = permuted_local_hidden_states, tokens_per_expert, permuted_probs
+        # CUDA grouped_gemm reads host splits, including during checkpoint replay.
+        if isinstance(counts, torch.Tensor) and counts.is_cuda:
+            counts = counts.cpu()
+        manager = self._load_balancer
+        if manager is None:
+            if transformer_engine_is_available() and self.use_te:
+                fc1, fc2 = self.fc1_linear, self.fc2_linear
+                counts = counts.tolist()
+            else:
+                fc1, fc2 = (partial(grouped_linear, weight=w) for w in self.native_weights())
+        # FSDP can reshard between passes. Bind the current unsharded views each time.
+        with (
+            nullcontext((hidden, counts, probs, fc1, fc2)) if manager is None else
+            manager.bind_expert_weights(hidden, counts, probs, self.native_weights())
+        ) as (hidden, counts, probs, fc1, fc2):
+            probs = probs.unsqueeze(-1)
+            if self.config.moe_apply_probs_on_input:
+                assert self.config.moe_router_topk == 1, "`moe_apply_probs_on_input` requires top-k 1."
+                hidden = (hidden * probs).to(hidden.dtype)
+                probs = torch.ones_like(probs)
+            intermediate = self.activation_func_with_probs(fc1(hidden, counts), probs)
+            return fc2(intermediate, counts), None

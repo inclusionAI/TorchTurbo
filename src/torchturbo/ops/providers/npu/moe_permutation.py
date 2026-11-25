@@ -13,10 +13,12 @@ from ...registry import register_op
 
 class _TokenPermutation(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, tokens, expert_indices):
+    def forward(ctx, tokens, expert_indices, num_out_tokens):
         from torch_npu import npu_moe_token_permute
 
-        output, inverse = npu_moe_token_permute(tokens, expert_indices)
+        output, inverse = npu_moe_token_permute(
+            tokens.contiguous(), expert_indices.contiguous(), num_out_tokens=num_out_tokens,
+        )
         ctx.save_for_backward(inverse)
         ctx.assignment_shape = expert_indices.shape
         return output, inverse
@@ -30,7 +32,7 @@ class _TokenPermutation(torch.autograd.Function):
         if ctx.assignment_shape[1] > 1:
             weights = grad_output.new_ones(ctx.assignment_shape)
         grad_tokens = npu_moe_token_unpermute(grad_output, inverse, probs=weights)
-        return grad_tokens, None
+        return grad_tokens, None, None
 
 
 class _UnweightedUnpermutation(torch.autograd.Function):
@@ -40,6 +42,7 @@ class _UnweightedUnpermutation(torch.autograd.Function):
 
         # This linear merge needs only assignment metadata for its backward.
         ctx.save_for_backward(expert_indices)
+        ctx.num_packed_rows = tokens.shape[0]
         weights = None
         if expert_indices.shape[1] > 1:
             weights = tokens.new_ones(expert_indices.shape)
@@ -48,7 +51,9 @@ class _UnweightedUnpermutation(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         (expert_indices,) = ctx.saved_tensors
-        grad_tokens, _ = _TokenPermutation.apply(grad_output, expert_indices)
+        if ctx.num_packed_rows == 0:
+            return grad_output[:0], None, None
+        grad_tokens, _ = _TokenPermutation.apply(grad_output, expert_indices, ctx.num_packed_rows)
         return grad_tokens, None, None
 
 
@@ -70,24 +75,32 @@ class NpuMoEMaskPermutation(OpImpl):
     def __call__(
         self,
         tokens: torch.Tensor,
-        routing_map: torch.Tensor,
+        routing_map: torch.Tensor | None = None,
         probs: torch.Tensor | None = None,
         num_out_tokens: int | None = None,
         expert_indices: torch.Tensor | None = None,
     ) -> MoEPermutation:
-        """Group fixed-top-k tokens and retain expert indices for probability gather."""
+        """Group compact assignments and pack their corresponding probabilities."""
+        if expert_indices is None:
+            expert_indices = routing_map
+        elif routing_map is not None and probs is not None:
+            probs = probs.gather(1, expert_indices)
         if num_out_tokens == 0:
-            inverse = torch.empty_like(expert_indices, dtype=torch.int32)
+            inverse = torch.arange(
+                expert_indices.numel(), dtype=torch.int32, device=tokens.device,
+            ).view_as(expert_indices)
             permuted_probs = None if probs is None else probs.reshape(-1)[:0]
             return MoEPermutation(tokens[:0], permuted_probs, inverse, expert_indices)
-        output, inverse = _TokenPermutation.apply(tokens, expert_indices)
+        output, inverse = _TokenPermutation.apply(tokens, expert_indices, num_out_tokens)
         permuted_probs = None
         if probs is not None:
-            selected_probs = probs.gather(1, expert_indices).flatten()
+            selected_probs = probs.flatten()
             # Each token/top-k slot maps to its row in the packed tensor.
             permuted_probs = torch.empty_like(selected_probs).index_put(
                 (inverse.long(),), selected_probs,
             )
+            if output.shape[0] < selected_probs.numel():
+                permuted_probs = permuted_probs[:output.shape[0]]
         return MoEPermutation(
             output,
             permuted_probs,
@@ -127,7 +140,7 @@ class NpuMoEMaskUnpermutation(OpImpl):
             # Keep the inverse-map dependency so checkpoint recomputes before EP backward.
             restored = permuted_tokens.index_select(0, inverse.long())
             output = restored.view(
-                *permutation.row_indices.shape, permuted_tokens.shape[-1]
+                *expert_indices.shape, permuted_tokens.shape[-1]
             ).sum(dim=1)
             if probs is not None:
                 output = output + probs.sum() * 0
@@ -172,6 +185,8 @@ class NpuMoESortChunks(OpImpl):
         """Reorder chunks with device metadata and the NPU permutation kernel."""
         if input.shape[0] == 0:
             return input, probs
+        split_sizes = split_sizes.to(input.device, non_blocking=True)
+        sorted_idxs = sorted_idxs.to(input.device, non_blocking=True)
         # Assign each source chunk its destination position without copying counts to CPU.
         chunk_positions = torch.arange(
             sorted_idxs.numel(),
@@ -188,7 +203,7 @@ class NpuMoESortChunks(OpImpl):
             split_sizes,
             output_size=input.shape[0],
         ).unsqueeze(1)
-        output, inverse = _TokenPermutation.apply(input, indices)
+        output, inverse = _TokenPermutation.apply(input, indices, input.shape[0])
         permuted_probs = None
         if probs is not None:
             permuted_probs = torch.empty_like(probs).index_put((inverse.long(),), probs)
