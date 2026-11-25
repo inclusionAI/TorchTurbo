@@ -238,3 +238,14 @@ def test_parse_torchturbo_args_mtp_log_loss():
 
     assert args.mtp_log_loss is True
     assert remaining == ["--other"]
+
+
+def test_parse_torchturbo_args_profiling():
+    from torchturbo.engine.args import parse_torchturbo_args
+
+    args, remaining = parse_torchturbo_args(["--tt_profiling", "--other"])
+    assert args.profiling is True
+    # Runtime-only switch never enters EngineConfig overrides.
+    assert "tt_profiling" not in args.config_overrides
+    # Non-tt args stay in remaining for the training framework parser.
+    assert remaining == ["--other"]

@@ -5,7 +5,7 @@ from contextlib import nullcontext
 
 import torch
 
-from .base import BaseProfiler, DeviceRuntime, TurboDevice
+from .base import BaseProfiler, DeviceRuntime, ProfilingConfig, TurboDevice
 
 
 class _CudaProfiler(BaseProfiler):
@@ -14,26 +14,37 @@ class _CudaProfiler(BaseProfiler):
         output_dir: str,
         worker_name: str,
         profiling_enabled: bool,
+        profiling_config: ProfilingConfig,
         memory_snapshot_steps: int | None,
     ) -> None:
         self._profiler = None
         if profiling_enabled:
+            # experimental_config is not wired up for the CUDA profiler yet;
+            # its experimental profiling options are uncommon in training runs.
+            # Training step N (1-based) runs inside the ProfilerStep#(N-1)
+            # record_function window, so profiling_step=N maps to
+            # skip_first=N-1. Without profiling_step, profile the first step.
+            if profiling_config.profiling_step is not None:
+                skip_first = profiling_config.profiling_step - 1
+            else:
+                skip_first = 0
+            schedule = torch.profiler.schedule(
+                wait=0, warmup=0, active=1, repeat=1, skip_first=skip_first
+            )
             self._profiler = torch.profiler.profile(
                 activities=[
                     torch.profiler.ProfilerActivity.CPU,
                     torch.profiler.ProfilerActivity.CUDA,
                 ],
-                schedule=torch.profiler.schedule(
-                    wait=0, warmup=10, active=1, repeat=1, skip_first=1
-                ),
+                schedule=schedule,
                 on_trace_ready=torch.profiler.tensorboard_trace_handler(
                     output_dir, worker_name=worker_name
                 ),
-                record_shapes=False,
-                profile_memory=False,
-                with_stack=False,
-                with_modules=False,
-                with_flops=False,
+                record_shapes=profiling_config.record_shapes,
+                profile_memory=profiling_config.profile_memory,
+                with_stack=profiling_config.with_stack,
+                with_modules=profiling_config.with_modules,
+                with_flops=profiling_config.with_flops,
             )
         self._snapshot_path = os.path.join(
             os.path.dirname(output_dir),
@@ -137,11 +148,13 @@ class CudaRuntime(DeviceRuntime):
         output_dir: str,
         worker_name: str,
         profiling_enabled: bool,
+        profiling_config: ProfilingConfig,
         memory_snapshot_steps: int | None,
     ) -> BaseProfiler:
         return _CudaProfiler(
             output_dir,
             worker_name,
             profiling_enabled,
+            profiling_config,
             memory_snapshot_steps,
         )
