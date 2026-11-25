@@ -16,10 +16,7 @@ from torchturbo.runtime import get_device_runtime
 
 from ..base import TurboVLMModel
 from ..modules.attention.gdn import build_gdn_sp_forward
-from ..modules.attention.ulysses import (
-    SequencePadding,
-    SequenceParallelInputSlicingSpec,
-)
+from ..modules.attention.ulysses import SequenceParallelInputSlicingSpec
 from ..registry import register_model
 from ..weight_converter import FusedExpertWeightConverter
 from .configuration_qwen4_exp import Qwen4ExpConfig
@@ -219,12 +216,9 @@ class TurboQwen4ExpForConditionalGeneration(
         return SequenceParallelInputSlicingSpec(
             self.model.language_model,
             Qwen4ExpTextModel.forward,
-            sliced_inputs=(("inputs_embeds", 1), ("position_ids", -1)),
-            padded_inputs=(
-                ("input_ids", SequencePadding.ZERO),
-                ("mm_token_type_ids", SequencePadding.ZERO),
-                ("labels", SequencePadding.IGNORE_INDEX),
-                ("position_ids", SequencePadding.POSITION),
+            padded_inputs=tuple(
+                (name, padding) for name, padding in SequenceParallelInputSlicingSpec.padded_inputs
+                if name != "text_position_ids"
             ),
         )
 

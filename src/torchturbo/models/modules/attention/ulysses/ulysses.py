@@ -533,6 +533,7 @@ class SequenceParallelInputSlicingSpec:
         ("input_ids", SequencePadding.ZERO),
         ("mm_token_type_ids", SequencePadding.ZERO),
         ("labels", SequencePadding.IGNORE_INDEX),
+        ("loss_scale", SequencePadding.ZERO),
         ("position_ids", SequencePadding.POSITION),
         ("text_position_ids", SequencePadding.POSITION),
     )

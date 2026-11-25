@@ -12,6 +12,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers.utils import ModelOutput
 
+from torchturbo.adapters.msswift.inputs_bridging import bridge_swift_inputs
 from torchturbo.engine.backends.fsdp2.backend import FSDP2Backend
 from torchturbo.engine.config import LossChunkConfig
 from torchturbo.models.base import TurboModel
@@ -247,6 +248,32 @@ def test_eval_uses_regular_logits_path():
     assert model.lm_head.calls == 1
 
 
+@pytest.mark.parametrize("chunked", [False, True])
+def test_swift_token_weights_reach_backend_gradients(chunked):
+    model = _ContractModel()
+    batch = _batch()
+    batch["attention_mask"] = torch.ones_like(batch["labels"])
+    batch["loss_scale"] = torch.tensor([[1.0, 0.0, 0.25, 2.0]])
+    inputs = bridge_swift_inputs(batch)
+    loss = _backend(enabled=chunked).compute_loss(model, inputs)
+
+    logits = model.lm_head(model.hidden)[0, :-1]
+    token_ce = F.cross_entropy(logits, torch.tensor([2, 3, 4]), reduction="none")
+    expected = (token_ce[1] * 0.25 + token_ce[2] * 2.0) / 3
+    torch.testing.assert_close(loss, expected)
+    parameters = (model.hidden, model.lm_head.weight)
+    loss.backward()
+    for parameter, grad in zip(parameters, torch.autograd.grad(expected, parameters)):
+        torch.testing.assert_close(parameter.grad, grad)
+
+
+def test_backend_rejects_transposed_token_weights():
+    batch = _batch()
+    batch["loss_scale"] = torch.ones_like(batch["labels"].T)
+    with pytest.raises(ValueError, match="loss_scale must have the same shape as labels"):
+        _backend().compute_loss(_ContractModel(), batch)
+
+
 def test_main_and_mtp_losses_are_aggregated_on_chunked_path():
     model = _ContractModel(mtp=True)
     backend = _backend(mtp=True, scaling=0.2)
@@ -402,8 +429,9 @@ def test_packed_mtp_targets_respect_short_sequences_and_sp_shards(monkeypatch, s
     cu = torch.tensor([0, 3, 4, 9], dtype=torch.int32)
     predictions = [torch.empty(1, 12 // sp_size, 1) for _ in range(6)]
 
+    loss_scale = torch.arange(1, 1 + labels.shape[-1], dtype=torch.float32).unsqueeze(0)
     for rank in range(sp_size):
-        shifted_labels, normalizers = FSDP2Backend._prepare_loss_labels(
+        shifted_labels, normalizers, shifted_loss_scale = FSDP2Backend._prepare_loss_labels(
             predictions,
             labels,
             sp_size=sp_size,
@@ -411,19 +439,27 @@ def test_packed_mtp_targets_respect_short_sequences_and_sp_shards(monkeypatch, s
             sp_rank=rank,
             num_items_in_batch=None,
             cu_seq_lens=cu,
+            loss_scale=loss_scale,
         )
-        for shift, (actual, normalizer) in enumerate(zip(shifted_labels, normalizers), 1):
+        for shift, (actual, normalizer, weights) in enumerate(
+                zip(shifted_labels, normalizers, shifted_loss_scale), 1):
             expected = torch.full_like(labels, -100)
+            expected_weights = torch.zeros_like(loss_scale)
             offset = 0
             for row in rows:
                 if shift < row.numel():
                     expected[0, offset : offset + row.numel() - shift] = row[shift:]
+                    expected_weights[0, offset : offset + row.numel() - shift] = (
+                        loss_scale[0, offset + shift : offset + row.numel()])
                 offset += row.numel()
             expected_normalizer = (expected != -100).sum().clamp(min=1) * sp_size
             expected_shard = expected.chunk(sp_size, dim=1)[rank]
+            expected_weights[expected == -100] = 0.0
+            expected_weight_shard = expected_weights.chunk(sp_size, dim=1)[rank]
 
             torch.testing.assert_close(actual, expected_shard)
             torch.testing.assert_close(normalizer, expected_normalizer)
+            torch.testing.assert_close(weights, expected_weight_shard)
 
     torch.testing.assert_close(labels, original_labels)
 

@@ -1,29 +1,4 @@
-"""Trainer that lets the turbo engine/backend own the training mechanics.
-
-:class:`TurboTrainerMixin` reroutes the pieces the FSDP2 backend must own, and
-is mixed ahead of swift's trainer base for any stage:
-
-* ``_wrap_model``  -- the model is already FSDP2-sharded; don't let accelerate
-  re-wrap it.
-* ``create_optimizer`` -- build via the engine (FSDP2-aware); ``create_scheduler``
-  uses the engine for engine-managed optimizers and HF's default otherwise.
-* ``compute_loss``  -- ``engine.compute_loss`` (with SP loss re-scale).
-* ``_get_data_collator`` - the taken-over plugin's collator, else
-  ``SwiftInputCollator`` over swift's template collator.
-* ``save_model`` -- engine writes DCP checkpoint state and HF exports; swift
-  still records metadata.
-* ``get_train_dataloader`` -- engine SP-aware sampler for all ``sp_size``.
-
-:func:`make_turbo_seq2seq_trainer` combines it with swift's
-:class:`Seq2SeqTrainer` for the SFT stage. :func:`make_turbo_dpo_trainer`
-combines :class:`TurboDPOTrainerMixin` with swift's ``DPOTrainer`` and
-overrides only the DPO forward (``concatenated_forward``) on flattened
-batches. Everything else (logging, callbacks, the loop, grad accumulation)
-stays swift/HF.
-
-The mixin is module-level and imports swift only lazily inside method bodies,
-so this module stays swift-free until a concrete trainer is actually built.
-"""
+"""Swift trainers backed by TorchTurbo."""
 
 from __future__ import annotations
 
@@ -338,7 +313,7 @@ class TurboTrainerMixin:
         if engine is None:
             return super().compute_loss(model, inputs, return_outputs, num_items_in_batch)
 
-        for key in ("compute_loss_func", "loss_scale", "logits_to_keep"):
+        for key in ("compute_loss_func", "logits_to_keep"):
             inputs.pop(key, None)
 
         sp_size = engine.get_sp_info()["sp_size"]
