@@ -2,10 +2,21 @@ from __future__ import annotations
 
 import os
 from contextlib import nullcontext
+from typing import TYPE_CHECKING
 
 import torch
 
+from torchturbo.logging import get_logger
+
 from .base import BaseProfiler, DeviceRuntime, TurboDevice
+
+if TYPE_CHECKING:
+    from torch.distributed.device_mesh import DeviceMesh
+
+logger = get_logger(__name__)
+
+# HcclCommConfig::hcclOpExpansionMode values: 0 default, 1 host, 2 AI_CPU, 3 AIV.
+_HCCL_OP_EXPANSION_MODE_AIV = 3
 
 
 # Ascend environment variable reference:
@@ -140,6 +151,77 @@ class NpuRuntime(DeviceRuntime):
         super().use_deterministic_algorithms()
         for name, value in _NPU_DETERMINISTIC_ENV.items():
             os.environ[name] = value
+
+    def init_device_mesh(
+        self,
+        mesh_shape: tuple[int, ...],
+        *,
+        mesh_dim_names: tuple[str, ...] | None = None,
+        expert_parallel_dim: str | None = None,
+    ) -> DeviceMesh:
+        """Build a DeviceMesh whose expert-parallel dimension uses AIV.
+
+        HCCL_OP_EXPANSION_MODE is process wide, so an expert-parallel-only
+        choice has to be passed as per-dimension backend options. AIV is only
+        applied when the process itself stays on AI_CPU: HCCL does not support
+        several communicators expanded to AIV at once, and a globally selected
+        AIV already covers every dimension.
+        """
+        backend_override = self._expert_parallel_backend_override(
+            mesh_dim_names, expert_parallel_dim
+        )
+        if backend_override is None:
+            return super().init_device_mesh(
+                mesh_shape,
+                mesh_dim_names=mesh_dim_names,
+                expert_parallel_dim=expert_parallel_dim,
+            )
+
+        from torch.distributed.device_mesh import init_device_mesh
+
+        return init_device_mesh(
+            self.device.type,
+            mesh_shape,
+            mesh_dim_names=mesh_dim_names,
+            backend_override=backend_override,
+        )
+
+    def _expert_parallel_backend_override(
+        self,
+        mesh_dim_names: tuple[str, ...] | None,
+        expert_parallel_dim: str | None,
+    ) -> dict[str, object] | None:
+        """Return per-dimension backend options for the expert-parallel dimension."""
+        if expert_parallel_dim is None:
+            return None
+        if mesh_dim_names is None or expert_parallel_dim not in mesh_dim_names:
+            raise ValueError(
+                f"expert_parallel_dim={expert_parallel_dim!r} is not one of the "
+                f"mesh dimensions {mesh_dim_names}."
+            )
+
+        expansion_mode = os.environ.get("HCCL_OP_EXPANSION_MODE", "AI_CPU")
+        if expansion_mode.upper() != "AI_CPU":
+            logger.info(
+                "Mesh dimension %s keeps HCCL_OP_EXPANSION_MODE=%s; AIV override "
+                "only applies when it is AI_CPU.",
+                expert_parallel_dim,
+                expansion_mode,
+            )
+            return None
+
+        from torch_npu._C._distributed_c10d import ProcessGroupHCCL
+
+        options = ProcessGroupHCCL.Options()
+        options.hccl_config = {
+            "hccl_op_expansion_mode": _HCCL_OP_EXPANSION_MODE_AIV,
+        }
+        logger.info(
+            "Mesh dimension %s uses AIV op expansion; other dimensions keep "
+            "AI_CPU.",
+            expert_parallel_dim,
+        )
+        return {expert_parallel_dim: options}
 
     @property
     def _npu(self):

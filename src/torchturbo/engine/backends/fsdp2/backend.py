@@ -196,19 +196,30 @@ class FSDP2Backend(BaseBackend):
             )
 
         # Create all SP groups (all ranks must call this)
+        sp_start = (rank // sp_size) * sp_size
+        sp_ranks = list(range(sp_start, sp_start + sp_size))
         sp_group = None
-        for start in range(0, world_size, sp_size):
-            ranks = list(range(start, start + sp_size))
-            group = dist.new_group(ranks)
-            if rank in ranks:
-                sp_group = group
+        # The expert mesh rows are contiguous blocks of ep_size ranks, i.e. the
+        # same rank sets as the SP groups whenever sp_size == ep_size. Reuse the
+        # existing communicator instead of creating a duplicate one.
+        if self._mesh is not None and self._mesh["ep"].mesh.tolist() == sp_ranks:
+            sp_group = self._mesh["ep"].get_group()
+            reuse_note = "reused the expert-parallel communicator"
+        else:
+            for start in range(0, world_size, sp_size):
+                ranks = list(range(start, start + sp_size))
+                group = dist.new_group(ranks)
+                if rank in ranks:
+                    sp_group = group
+            reuse_note = "created a dedicated communicator"
         sp_rank = dist.get_rank(sp_group)
 
         logger.info_rank0(
-            "Created SP process group: sp_size=%d, rank=%d, " "group_ranks=%s",
+            "Created SP process group: sp_size=%d, rank=%d, group_ranks=%s (%s)",
             sp_size,
             rank,
-            list(range((rank // sp_size) * sp_size, (rank // sp_size + 1) * sp_size)),
+            sp_ranks,
+            reuse_note,
         )
 
         self._sp_size = sp_size
@@ -276,11 +287,6 @@ class FSDP2Backend(BaseBackend):
         if not dist.is_initialized():
             return None
 
-        try:
-            from torch.distributed.device_mesh import init_device_mesh
-        except ImportError:
-            raise ValueError("torch.distributed.device_mesh not available.")
-
         world_size = dist.get_world_size()
 
         ep_size = getattr(plan, "ep_size", 1)
@@ -292,14 +298,15 @@ class FSDP2Backend(BaseBackend):
             )
 
         world_size = world_size
-        device_name = self.device.type
-        self._world_mesh = init_device_mesh(
-            device_name,
+        runtime = self.device_runtime
+        self._world_mesh = runtime.init_device_mesh(
             (world_size,),
             mesh_dim_names=("dp",),
         )
-        self._mesh = init_device_mesh(
-            device_name, (world_size // ep_size, ep_size), mesh_dim_names=("edp", "ep")
+        self._mesh = runtime.init_device_mesh(
+            (world_size // ep_size, ep_size),
+            mesh_dim_names=("edp", "ep"),
+            expert_parallel_dim="ep",
         )
 
         logger.info_rank0("Created DeviceMesh")

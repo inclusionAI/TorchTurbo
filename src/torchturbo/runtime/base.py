@@ -2,8 +2,12 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from enum import StrEnum
+from typing import TYPE_CHECKING
 
 import torch
+
+if TYPE_CHECKING:
+    from torch.distributed.device_mesh import DeviceMesh
 
 
 class BaseProfiler(ABC):
@@ -52,6 +56,33 @@ class DeviceRuntime(ABC):
     def supports_async_streams(self) -> bool:
         """Whether this runtime provides asynchronous stream/event primitives."""
         return False
+
+    def init_device_mesh(
+        self,
+        mesh_shape: tuple[int, ...],
+        *,
+        mesh_dim_names: tuple[str, ...] | None = None,
+        expert_parallel_dim: str | None = None,
+    ) -> DeviceMesh:
+        """Build a DeviceMesh on this runtime's device.
+
+        Runtimes may specialize the process groups that back individual mesh
+        dimensions; callers should build meshes through this method rather than
+        calling :func:`torch.distributed.device_mesh.init_device_mesh` directly.
+
+        Args:
+            mesh_shape: Size of each mesh dimension.
+            mesh_dim_names: Name of each mesh dimension.
+            expert_parallel_dim: Name of the expert-parallel mesh dimension,
+                which carries the MoE dispatch/combine communication. Runtimes
+                may give its communicator a dedicated configuration; runtimes
+                without such a notion ignore it.
+        """
+        from torch.distributed.device_mesh import init_device_mesh
+
+        return init_device_mesh(
+            self.device.type, mesh_shape, mesh_dim_names=mesh_dim_names
+        )
 
     @abstractmethod
     def available(self) -> bool:

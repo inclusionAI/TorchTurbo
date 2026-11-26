@@ -1,5 +1,7 @@
 from contextlib import nullcontext
 import os
+import sys
+import types
 from types import SimpleNamespace
 
 import pytest
@@ -268,3 +270,137 @@ def test_device_runtime_get_returns_selected_runtime(monkeypatch):
 
     assert current is selected
     assert current.turbo_device is TurboDevice.CPU
+
+
+def _patch_init_device_mesh(monkeypatch):
+    calls = []
+
+    def fake_init_device_mesh(
+        device_type, mesh_shape, *, mesh_dim_names=None, backend_override=None
+    ):
+        calls.append(
+            {
+                "device_type": device_type,
+                "mesh_shape": mesh_shape,
+                "mesh_dim_names": mesh_dim_names,
+                "backend_override": backend_override,
+            }
+        )
+        return "mesh"
+
+    import torch.distributed.device_mesh as device_mesh
+
+    monkeypatch.setattr(device_mesh, "init_device_mesh", fake_init_device_mesh)
+    return calls
+
+
+def _patch_torch_npu_hccl_options(monkeypatch):
+    created = []
+
+    class FakeOptions:
+        def __init__(self) -> None:
+            self.hccl_config = None
+            created.append(self)
+
+    distributed_c10d = types.ModuleType("torch_npu._C._distributed_c10d")
+    distributed_c10d.ProcessGroupHCCL = types.SimpleNamespace(Options=FakeOptions)
+    torch_npu_c = types.ModuleType("torch_npu._C")
+    torch_npu_c._distributed_c10d = distributed_c10d
+    torch_npu = types.ModuleType("torch_npu")
+    torch_npu._C = torch_npu_c
+
+    monkeypatch.setitem(sys.modules, "torch_npu", torch_npu)
+    monkeypatch.setitem(sys.modules, "torch_npu._C", torch_npu_c)
+    monkeypatch.setitem(sys.modules, "torch_npu._C._distributed_c10d", distributed_c10d)
+    return created
+
+
+def test_init_device_mesh_forwards_without_override(monkeypatch):
+    calls = _patch_init_device_mesh(monkeypatch)
+
+    mesh = CpuRuntime().init_device_mesh(
+        (4, 2), mesh_dim_names=("edp", "ep")
+    )
+
+    assert mesh == "mesh"
+    assert calls == [
+        {
+            "device_type": "cpu",
+            "mesh_shape": (4, 2),
+            "mesh_dim_names": ("edp", "ep"),
+            "backend_override": None,
+        }
+    ]
+
+
+def test_init_device_mesh_uses_aiv_for_expert_parallel_dimension_on_npu(monkeypatch):
+    calls = _patch_init_device_mesh(monkeypatch)
+    created = _patch_torch_npu_hccl_options(monkeypatch)
+    monkeypatch.setenv("HCCL_OP_EXPANSION_MODE", "AI_CPU")
+
+    NpuRuntime().init_device_mesh(
+        (2, 4),
+        mesh_dim_names=("edp", "ep"),
+        expert_parallel_dim="ep",
+    )
+
+    override = calls[0]["backend_override"]
+    assert set(override) == {"ep"}
+    assert override["ep"] is created[0]
+    assert created[0].hccl_config == {"hccl_op_expansion_mode": 3}
+
+
+def test_init_device_mesh_treats_unset_expansion_mode_as_ai_cpu(monkeypatch):
+    calls = _patch_init_device_mesh(monkeypatch)
+    _patch_torch_npu_hccl_options(monkeypatch)
+    monkeypatch.delenv("HCCL_OP_EXPANSION_MODE", raising=False)
+
+    NpuRuntime().init_device_mesh(
+        (2, 4),
+        mesh_dim_names=("edp", "ep"),
+        expert_parallel_dim="ep",
+    )
+
+    assert set(calls[0]["backend_override"]) == {"ep"}
+
+
+def test_init_device_mesh_skips_override_without_expert_parallel_dim(monkeypatch):
+    calls = _patch_init_device_mesh(monkeypatch)
+    created = _patch_torch_npu_hccl_options(monkeypatch)
+    monkeypatch.setenv("HCCL_OP_EXPANSION_MODE", "AI_CPU")
+
+    NpuRuntime().init_device_mesh((4,), mesh_dim_names=("dp",))
+
+    assert calls[0]["backend_override"] is None
+    assert created == []
+
+
+def test_init_device_mesh_rejects_unknown_expert_parallel_dim(monkeypatch):
+    calls = _patch_init_device_mesh(monkeypatch)
+    _patch_torch_npu_hccl_options(monkeypatch)
+    monkeypatch.setenv("HCCL_OP_EXPANSION_MODE", "AI_CPU")
+
+    with pytest.raises(ValueError, match="expert_parallel_dim"):
+        NpuRuntime().init_device_mesh(
+            (2, 4),
+            mesh_dim_names=("edp", "ep"),
+            expert_parallel_dim="tp",
+        )
+
+    assert calls == []
+
+
+@pytest.mark.parametrize("expansion_mode", ["AIV", "aiv", "HOST"])
+def test_init_device_mesh_keeps_global_expansion_mode(monkeypatch, expansion_mode):
+    calls = _patch_init_device_mesh(monkeypatch)
+    created = _patch_torch_npu_hccl_options(monkeypatch)
+    monkeypatch.setenv("HCCL_OP_EXPANSION_MODE", expansion_mode)
+
+    NpuRuntime().init_device_mesh(
+        (2, 4),
+        mesh_dim_names=("edp", "ep"),
+        expert_parallel_dim="ep",
+    )
+
+    assert calls[0]["backend_override"] is None
+    assert created == []
