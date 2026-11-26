@@ -76,6 +76,17 @@ def flash_calls(monkeypatch):
     return calls
 
 
+def test_rank_segments_cache_tracks_tensor_version_and_rank() -> None:
+    qsa._cached_rank_segments.cache_clear()
+    lengths = torch.tensor([0, 3, 8], dtype=torch.int32)
+    first = qsa.rank_segments_for_call(lengths, 8, 1, 0)
+    assert first == [(0, 0, 3), (3, 3, 8)]
+    assert qsa.rank_segments_for_call(lengths, 8, 1, 0) is first
+    assert qsa.rank_segments_for_call(lengths, 4, 2, 1) == [(3, 4, 8)]
+    lengths[1] = 4
+    assert qsa.rank_segments_for_call(lengths, 8, 1, 0) == [(0, 0, 4), (4, 4, 8)]
+
+
 @pytest.mark.parametrize("input_kind", ["fp32_leaf", "fp32_nonleaf", "bf16_leaf"])
 def test_qsa_autocast_preserves_input_and_parameter_gradients(
     monkeypatch, flash_calls, input_kind

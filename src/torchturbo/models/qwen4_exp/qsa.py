@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import itertools
 import math
+import os
 from typing import Any
 
 import torch
 from torch.distributed import ProcessGroup
 from torch.utils.checkpoint import checkpoint
 from transformers.integrations.flash_attention import get_target_dtype
+
+from torchturbo.utils.functools import cache
 
 from ..modules.attention.interface import attention_forward
 from ..modules.attention.ulysses import all_gather_sp_with_grad_reduce
@@ -20,11 +23,52 @@ from .modeling_qwen4_exp import (
     apply_rotary_pos_emb,
 )
 
+from .gbsa import qsa_gbsa_attention
+
 _QSA_INDEXER_QUERY_CHUNK_SIZE = 256
 # Expanded KV rows are transient: each chunk is checkpointed, so this bounds
 # peak memory rather than saved activations. Real head sizes need about 4 MiB
 # per query, and small chunks make the varlen kernels launch-bound.
 _QSA_ATTENTION_MAX_KV_BYTES = 1 << 30
+
+# Set TORCHTURBO_ENABLE_NPU_LI=0 to force the torch small-op indexer path.
+_ENABLE_NPU_LI = os.environ.get("TORCHTURBO_ENABLE_NPU_LI", "1") == "1"
+
+
+@cache
+def _cached_rank_segments(
+    cu_seq_lens: torch.Tensor,
+    local_length: int,
+    sp_size: int,
+    sp_rank: int,
+    _version: int | None,
+) -> list[tuple[int, int, int]]:
+    """Cache host segment metadata shared by all QSA layers in a forward."""
+    rank_start = sp_rank * local_length
+    rank_stop = rank_start + local_length
+    segments = []
+    for segment_start, segment_stop in itertools.pairwise(cu_seq_lens.tolist()):
+        query_start = max(segment_start, rank_start)
+        query_stop = min(segment_stop, rank_stop)
+        if query_start < query_stop:
+            segments.append((segment_start, query_start, query_stop))
+    return segments
+
+
+def rank_segments_for_call(
+    cu_seq_lens: torch.Tensor,
+    local_length: int,
+    sp_size: int,
+    sp_rank: int,
+) -> list[tuple[int, int, int]]:
+    """Return local query segments without repeatedly synchronizing each layer."""
+    if torch.is_inference_mode_enabled() or cu_seq_lens.is_inference():
+        return _cached_rank_segments.__wrapped__(
+            cu_seq_lens, local_length, sp_size, sp_rank, None
+        )
+    return _cached_rank_segments(
+        cu_seq_lens, local_length, sp_size, sp_rank, cu_seq_lens._version
+    )
 
 
 def qsa_indexer_forward(
@@ -48,6 +92,15 @@ def qsa_indexer_forward(
         Heads share one selection per query. Unused slots and padding queries
         contain -1.
     """
+    if _ENABLE_NPU_LI:
+        from .npu import has_cann_liv2, qsa_indexer_forward_cann
+
+        if hidden_states.device.type == "npu" and has_cann_liv2():
+            return qsa_indexer_forward_cann(
+                indexer, hidden_states, position_embeddings, cu_seq_lens,
+                sp_group=sp_group, sp_size=sp_size, sp_rank=sp_rank,
+            )
+
     batch_size, local_length, _ = hidden_states.shape
     if batch_size != 1:
         raise ValueError("Packed QSA expects a single flattened batch row.")
@@ -59,7 +112,7 @@ def qsa_indexer_forward(
         (indexer.index_n_heads * head_dim, head_dim), dim=-1
     )
     query = indexer.q_layernorm(query.unflatten(-1, (indexer.index_n_heads, head_dim)))
-    query = apply_rotary_pos_emb(query, cos=cos, sin=sin, unsqueeze_dim=2)
+    query = apply_rotary_pos_emb(query, cos=cos, sin=sin, unsqueeze_dim=2).to(raw_keys.dtype)
 
     if sp_size > 1:
         raw_key_dtype = raw_keys.dtype
@@ -86,12 +139,9 @@ def qsa_indexer_forward(
     block_offsets = torch.arange(ratio, device=hidden_states.device)
     tail_offsets = block_offsets[:-1]
 
-    for segment_start, segment_stop in itertools.pairwise(cu_seq_lens.tolist()):
-        query_start = max(segment_start, query_offset)
-        query_stop = min(segment_stop, query_offset + local_length)
-        if query_start >= query_stop:
-            continue
-
+    for segment_start, query_start, query_stop in rank_segments_for_call(
+        cu_seq_lens, local_length, sp_size, sp_rank
+    ):
         # Later blocks cannot be visible to any query owned by this rank.
         num_blocks = (query_stop - segment_start) // ratio
         if num_blocks:
@@ -108,7 +158,7 @@ def qsa_indexer_forward(
                 cos=cos.index_select(1, block_starts),
                 sin=sin.index_select(1, block_starts),
                 unsqueeze_dim=2,
-            )[0, :, 0]
+            )[0, :, 0].to(raw_keys.dtype)
 
         for chunk_start in range(
             query_start, query_stop, _QSA_INDEXER_QUERY_CHUNK_SIZE
@@ -298,6 +348,7 @@ def qsa_forward(
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Keep Q local and gather K/V for packed sequence-parallel QSA."""
     cu_seq_lens = kwargs.get("cu_seq_lens_q")
+    backend = os.environ.get("TORCHTURBO_QSA_BACKEND", "flash")
     if past_key_values is not None or cu_seq_lens is None:
         return Qwen4ExpTextAttention.forward(
             self,
@@ -335,15 +386,25 @@ def qsa_forward(
     )
     key, value = key_value.chunk(2, dim=-1)
 
-    output = qsa_attention_forward(
-        query,
-        key,
-        value,
-        token_ids,
-        dropout=self.attention_dropout if self.training else 0.0,
-        softmax_scale=self.scaling,
-        target_dtype=get_target_dtype(query, self),
-    )
+    if backend == "gbsa":
+        output = qsa_gbsa_attention(
+            query, key, value, token_ids, cu_seq_lens,
+            block_size=self.indexer.compress_ratio,
+            query_offset=sp_rank * hidden_states.shape[1],
+            dropout=self.attention_dropout if self.training else 0.0,
+            softmax_scale=self.scaling,
+            target_dtype=get_target_dtype(query, self),
+        )
+    else:
+        output = qsa_attention_forward(
+            query,
+            key,
+            value,
+            token_ids,
+            dropout=self.attention_dropout if self.training else 0.0,
+            softmax_scale=self.scaling,
+            target_dtype=get_target_dtype(query, self),
+        )
     output = output.reshape(*input_shape, -1)
     output = output * torch.sigmoid(gate.reshape(*input_shape, -1))
     return self.o_proj(output), None
