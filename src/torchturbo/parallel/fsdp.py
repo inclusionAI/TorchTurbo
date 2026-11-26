@@ -12,14 +12,9 @@ from typing import TYPE_CHECKING, Any
 from ..engine.utils import match_fqn
 from .parallel import ParallelPlan
 
+"""Attribute carrying user-supplied plan patterns separately from model defaults."""
 USER_PLAN_PATTERNS_ATTR = "_tt_user_plan_patterns"
-"""Attribute carrying user-supplied plan patterns separately from model defaults.
 
-The engine attaches the YAML/CLI ``parallel_plan.plan`` mapping here instead of
-merging it into the model-authored plan dict. Resolution then applies model
-defaults first (declared order, first match) and user patterns second (declared
-order, first match, field-level override).
-"""
 if TYPE_CHECKING:
     from ..models.modules.vision.io import BaseVisionBalanceIO
 
@@ -207,12 +202,7 @@ class FSDPParallelPlan(ParallelPlan):
 def merge_plan_spec_override(
     base: FSDPPlanSpec | None, override: FSDPPlanSpec
 ) -> FSDPPlanSpec:
-    """Apply non-``None`` fields of *override* on top of *base*.
-
-    Fields the user did not set (``None``) keep the model-default value. This is
-    the per-FQN equivalent of the former same-key dict merge, and also merges
-    partial :class:`VisionBalanceSpec` overrides.
-    """
+    """Apply non-``None`` fields of *override* on top of *base*."""
     if base is None:
         return override
     if not isinstance(base, FSDPPlanSpec):

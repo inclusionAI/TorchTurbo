@@ -175,12 +175,8 @@ def _compressed_fqn_sort_key(fqn: str) -> tuple[tuple[int, Any], ...]:
 def _compress_fqn_runs(entries: list[tuple[str, dict[str, Any]]]) -> list[str]:
     """Group effective specs, then merge numeric FQN runs inside each group.
 
-    Model FQNs arrive in pre-order DFS (``layers.0``, ``layers.0.mlp``,
-    ``layers.1``...), so adjacent-only compression would never merge repeated
-    layer specs. Grouping by identical summaries first and compressing each
-    group as a segment trie collapses runs at any depth, including
-    ``model.layers.[0~23].mlp.experts``. Cost is linear in trie size after
-    grouping, negligible next to plan wrapping.
+    Group FQNs by identical summaries first. Then compress each group as
+    a Trie at any depth, including ``model.layers.[0~23].mlp.experts``.
     """
     groups: dict[tuple[tuple[str, Any], ...], list[str]] = {}
     for fqn, summary in entries:
@@ -542,10 +538,6 @@ class FSDP2Backend(BaseBackend):
         for model_fqn, prepared_fqn in model_fqn_map.parameters.items():
             spec = resolve(model_fqn)
             if isinstance(spec, FSDPPlanSpec):
-                # A vision pattern naturally matches both a module and its
-                # parameters (e.g. "model.visual"). Pattern-level validation
-                # above only requires a winning module; the vision spec is
-                # simply inert on parameter entries, matching upstream behavior.
                 parameters[prepared_fqn] = spec
 
         unmatched_user_patterns = [
