@@ -203,10 +203,15 @@ class TorchTurboEngine:
         self.backend: BaseBackend = backend_cls(self.config, self.device_runtime)
         self._checkpoint: CheckpointCoordinator | None = None
         self._profiler: BaseProfiler | None = None
+        from ..ops.plugins import OpPluginConsumer
+
+        op_consumer = OpPluginConsumer()
+        self.plugin_manager.try_consume(op_consumer, strict=True)
         self.ops = get_or_create_ops(
             device_runtime=self.device_runtime,
             default_policy=self.config.ops.policy,
             overrides=self.config.ops.overrides,
+            plugin_specs=op_consumer.specs,
         )
 
         # These are set by setup()

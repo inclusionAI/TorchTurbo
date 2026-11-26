@@ -23,6 +23,7 @@ from torchturbo.engine import (
     MuonPlan,
     OptimizerClassPlan,
     OptimizerConfig,
+    OpsConfig,
     TorchTurboEngine,
     build_model_fqn_map,
     register_backend,
@@ -247,6 +248,28 @@ def dummy_engine():
     # EngineConfig selects a supported backend; the registry supplies its class.
     register_backend("fsdp2", DummyBackend)
     return TorchTurboEngine()
+
+
+def test_engine_enables_configured_operator_plugin(tmp_path):
+    path = tmp_path / "engine_ops_plugin.py"
+    path.write_text(
+        "from torchturbo.engine.plugins import OpPlugin, register_plugin\n"
+        "from torchturbo.ops import OpBinding\n"
+        "from torchturbo.runtime import TurboDevice\n"
+        "@register_plugin('engine_test')\n"
+        "class EngineOps(OpPlugin):\n"
+        "    def get_bindings(self):\n"
+        "        return (OpBinding(op_name='plugin_square', impl_name='engine_test::square',\n"
+        "            target='torch:square', devices=(TurboDevice.CPU,)),)\n"
+    )
+    register_backend("fsdp2", DummyBackend)
+    engine = TorchTurboEngine(config=EngineConfig(
+        plugin_paths=[str(path)],
+        ops=OpsConfig(overrides={"plugin_square": "engine_test::square"}),
+    ))
+    x = torch.tensor([2.0], requires_grad=True)
+    engine.ops.plugin_square(x).sum().backward()
+    torch.testing.assert_close(x.grad, 2 * x)
 
 
 # ---------------------------------------------------------------------------

@@ -12,6 +12,13 @@ class OpRegistry:
         self._specs: list[OpSpec] = []
         self._specs_by_impl: dict[str, OpSpec] = {}
 
+    def copy(self) -> OpRegistry:
+        """Return an independent snapshot of the registered metadata."""
+        snapshot = OpRegistry()
+        for spec in self._specs:
+            snapshot.register(spec)
+        return snapshot
+
     def register(self, spec: OpSpec) -> OpSpec:
         existing = self._specs_by_impl.get(spec.impl_name)
         if existing is not None and existing.op_name != spec.op_name:
@@ -42,6 +49,7 @@ class OpRegistry:
         # Rank by priority first; at equal priority prefer device-specific
         # implementations (non-empty ``devices``) over device-agnostic fallback,
         # then prefer custom over native so auto selection stays deterministic.
+        specs.sort(key=lambda item: item.impl_name)
         specs.sort(
             key=lambda item: (
                 item.priority,

@@ -72,6 +72,12 @@ def _build_from_argv(argv: list[str]) -> EngineConfig:
     return build_from_args(tt)
 
 
+def test_removed_ops_plugins_config_is_rejected(tmp_path):
+    path = _write(tmp_path, "plugins.yaml", _engine_config("ops:\n  plugins: []\n"))
+    with pytest.raises(ValueError, match="ops.plugins"):
+        _build_from_argv(["--tt_config", path])
+
+
 class _FakeQwen35Moe(TurboModel):
     """Model whose default plan mirrors ``qwen3_5_moe.parallel_plan``."""
 
