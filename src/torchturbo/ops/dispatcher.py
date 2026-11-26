@@ -659,6 +659,38 @@ class OpDispatcher:
             impl=impl,
         )
 
+    def bailing_vl_get_rope_index(
+        self,
+        input_ids: torch.Tensor,
+        image_grid_thw: torch.Tensor | None = None,
+        video_grid_thw: torch.Tensor | None = None,
+        segment_ids: torch.Tensor | None = None,
+        *,
+        image_token_id: int,
+        video_token_id: int,
+        spatial_merge_size: int,
+        use_interleaved_frame_timestamp: bool = False,
+        impl: str | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Build Bailing VL T/H/W mRoPE positions and rope deltas.
+
+        Returns position_ids of shape [3, batch_size, seq_length] and
+        rope_deltas of shape [batch_size, 1], both with the dtype and device
+        of input_ids.
+        """
+        return self._dispatch(
+            "bailing_vl_get_rope_index",
+            input_ids,
+            image_grid_thw,
+            video_grid_thw,
+            segment_ids,
+            image_token_id=image_token_id,
+            video_token_id=video_token_id,
+            spatial_merge_size=spatial_merge_size,
+            use_interleaved_frame_timestamp=use_interleaved_frame_timestamp,
+            impl=impl,
+        )
+
     def __getattr__(self, name: str):
         if name.startswith("_"):
             raise AttributeError(name)
