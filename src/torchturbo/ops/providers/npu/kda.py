@@ -187,7 +187,9 @@ class ChunkKDAFunction(torch.autograd.Function):
             use_beta_sigmoid_in_kernel=ctx.use_beta_sigmoid_in_kernel,
         )
         dbias = None if dt_bias is None else dbias.reshape_as(dt_bias)
-        # Finalize already returns token-major gate/beta gradients.
+        # Finalize returns head-major gradients; gate and beta inputs are token-major.
+        dg = dg.transpose(token_axis, token_axis + 1)
+        dbeta = dbeta.transpose(token_axis, token_axis + 1)
         if packed:
             dg, dbeta = dg.unsqueeze(0), dbeta.unsqueeze(0)
         return (
@@ -272,8 +274,6 @@ def ascendc_chunk_kda(
         if cu_seqlens is not None:
             tensor = tensor.squeeze(0)
         inputs.append(tensor.contiguous())
-    # FP32 gate inputs avoid Prepare's BF16 path. Keep the cast in autograd.
-    g = g.float()
     output, final_state = ChunkKDAFunction.apply(
         *inputs,
         g,

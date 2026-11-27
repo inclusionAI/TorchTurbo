@@ -576,7 +576,7 @@ def test_packed_supervision_matches_trainer_count_and_backend_loss(
         sp_group=None,
         sp_rank=0,
         num_items_in_batch=num_items,
-        mtp_loss_scale=0.2,
+        mtp_loss_scaling_factor=0.2,
         cu_seq_lens=batch["cu_seq_lens_q"],
     )
     torch.testing.assert_close(loss, reference_total)

@@ -371,14 +371,15 @@ def test_fanout_uses_each_output_streams_own_lengths():
 @pytest.mark.parametrize("mode", list(VisionBalanceMode))
 @pytest.mark.parametrize("rank", range(4))
 @pytest.mark.parametrize("num_media", [0, 1, 3, 4, 5])
-def test_plan_skips_only_when_global_pool_is_smaller_than_world(
+def test_plan_is_built_even_when_the_global_pool_is_smaller_than_world(
     monkeypatch, mode, rank, num_media
 ):
     world = 4
     tower = nn.Identity()
     state = _VisionBalanceState(tower, mode, BailingVisionBalanceIO(), 2, rank % 2)
     batch = VisionBatch(torch.zeros(4, 2), torch.tensor([[1, 2, 2]]), {"features": [1]})
-    # The decision must use the shared pool, not this rank's local media count.
+    # The plan comes from the shared pool, not this rank's local media count, and
+    # every rank builds one, even when the pool holds fewer media than ranks.
     metadata = [[[1, 2, 2, 1]] * num_media, [], [], []]
     monkeypatch.setattr(torch.distributed, "get_rank", lambda: rank)
     monkeypatch.setattr(torch.distributed, "get_world_size", lambda: world)
@@ -391,35 +392,27 @@ def test_plan_skips_only_when_global_pool_is_smaller_than_world(
 
     monkeypatch.setattr(state, "_exchange_pixels", exchange)
     plan = state._build_plan(tower, batch)
-    if num_media < world:
-        assert plan is None
-        assert exchanges == []
-    else:
-        assert isinstance(plan, _StepPlan)
-        assert len(exchanges) == 1
+    assert isinstance(plan, _StepPlan)
+    assert len(exchanges) == 1
 
 
-def test_skipped_hooks_preserve_inputs_outputs_and_clear_previous_plan(monkeypatch):
+def test_no_grad_hooks_leave_the_local_call_unchanged(monkeypatch):
     tower = nn.Identity()
-    tower.spatial_merge_size = 2
     io = BailingVisionBalanceIO()
     state = _VisionBalanceState(tower, VisionBalanceMode.PATCH, io, 2, 0)
     pixels = torch.zeros(4, 2)
     grid = torch.tensor([[1, 2, 2]])
-    batch = VisionBatch(pixels, grid, {"features": [1]})
-    state._plan = _StepPlan(batch, batch, {})
-    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
-    monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 4)
-    monkeypatch.setattr(state, "_gather_metadata", lambda batch: [[[1, 2, 2, 1]], [], [], []])
 
     def unexpected(*args, **kwargs):
-        pytest.fail("a skipped step must leave the local tower call unchanged")
+        pytest.fail("a no_grad step must leave the local tower call unchanged")
 
+    monkeypatch.setattr(io, "read_inputs", unexpected)
     monkeypatch.setattr(state, "_exchange_pixels", unexpected)
     monkeypatch.setattr(io, "write_inputs", unexpected)
     monkeypatch.setattr(io, "read_outputs", unexpected)
     args, kwargs = (pixels,), {"grid_thw": grid, "marker": object()}
-    assert state._pre_forward(tower, args, kwargs) is None
+    with torch.no_grad():
+        assert state._pre_forward(tower, args, kwargs) is None
+        assert state._post_forward(tower, args, object()) is None
     assert state._plan is None
     assert args[0] is pixels and kwargs["grid_thw"] is grid
-    assert state._post_forward(tower, args, object()) is None

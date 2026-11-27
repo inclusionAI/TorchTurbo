@@ -13,7 +13,6 @@ import torch  # noqa: E402
 
 from torchturbo.adapters.msswift.inputs_bridging import (  # noqa: E402
     SwiftInputCollator,
-    bake_loss_scale_into_labels,
     bridge_packed_inputs,
     bridge_swift_inputs,
 )
@@ -96,8 +95,8 @@ def test_packed_left_padding_moves_to_tail_with_all_token_fields():
     pixels = inputs["pixel_values"]
     out = bridge_swift_inputs(inputs, sequence_lengths=[2, 3], padding_side="left")
     assert out["input_ids"].tolist() == [[10, 11, 12, 13, 14, 0, 0]]
-    # Sample starts are unsupervised; loss_scale then drops token 11.
-    assert out["labels"].tolist() == [[-100, -100, -100, 13, 14, -100, -100]]
+    assert out["labels"].tolist() == [[-100, 11, -100, 13, 14, -100, -100]]
+    assert out["loss_scale"].tolist() == [[1.0, 0.0, 1.0, 1.0, 1.0, 0.0, 0.0]]
     assert out["text_position_ids"].tolist() == [[0, 1, 0, 1, 2, 0, 0]]
     assert out["position_ids"][0].tolist() == out["text_position_ids"].tolist()
     assert out["mm_token_type_ids"].tolist() == [[0, 1, 0, 0, 0, 0, 0]]
@@ -191,9 +190,9 @@ def test_collator_captures_lengths_before_native_batch_mutation(nested):
 
     out = SwiftInputCollator(native_collator, template)(batch)
     assert out["cu_seq_lens_q"].tolist() == [0, 2, 5]
-    assert out["labels"].tolist() == [[-100, -100, -100, 13, 14]]
+    assert out["labels"].tolist() == [[-100, 11, -100, 13, 14]]
     assert "attention_mask" not in out
-    assert "loss_scale" not in out
+    assert out["loss_scale"].tolist() == [[1.0, 0.0, 1.0, 1.0, 1.0]]
     assert out["cu_seq_lens_q"].device.type == "cpu"
 
 
@@ -396,40 +395,67 @@ def test_nonpacked_collator_flattens_binary_mask_batches():
     assert "attention_mask" not in out
 
 
-def test_loss_scale_zeros_masked_into_labels():
-    labels = _t([[10, 11, 12, 13, 14]])
-    loss_scale = _t([[1.0, 0.0, 1.0, 0.0, 1.0]])  # ignore tokens at idx 1,3
-    inputs = {"labels": labels.clone(), "loss_scale": loss_scale}
-    out = bake_loss_scale_into_labels(inputs)
-    assert out["labels"].tolist() == [[10, -100, 12, -100, 14]]
-    assert "loss_scale" not in out  # removed after folding
+def test_bridge_keeps_swift_loss_scale_verbatim():
+    inputs = {
+        "input_ids": _t([[0, 0, 10, 11, 12]]),
+        "position_ids": _t([[0, 0, 0, 1, 2]]),
+        "labels": _t([[-100, -100, 10, 11, -100]]),
+        "attention_mask": _t([[0, 0, 1, 1, 1]]),
+        "loss_scale": _t([[1.0, 1.0, 0.5, 2.0, 0.0]]),
+    }
+    template = SimpleNamespace(padding_free=False, padding_side="left", is_training=True)
+    out = SwiftInputCollator(lambda batch: inputs, template)([{"input_ids": [10, 11, 12]}])
+    assert out["labels"].tolist() == [[-100, 11, -100]]
+    assert torch.allclose(out["loss_scale"], _t([[0.5, 2.0, 0.0]]))
 
 
-def test_loss_scale_all_positive_passthrough_and_drops_loss_scale():
-    labels = _t([[10, 11, 12]])
-    inputs = {"labels": labels.clone(), "loss_scale": _t([[1.0, 1.0, 1.0]])}
-    out = bake_loss_scale_into_labels(inputs)
-    assert out["labels"].tolist() == [[10, 11, 12]]
+def test_bridge_keeps_zero_weight_labels_unmasked():
+    labels = _t([[10, 11, 12, 13]])
+    loss_scale = _t([[1.0, 0.0, 1.0, 0.3]])
+    inputs = {
+        "input_ids": _t([[10, 11, 12, 13]]),
+        "position_ids": _t([[0, 1, 2, 3]]),
+        "labels": labels.clone(),
+        "attention_mask": _t([[1, 1, 1, 1]]),
+        "loss_scale": loss_scale,
+    }
+    template = SimpleNamespace(padding_free=False, padding_side="left", is_training=True)
+    out = SwiftInputCollator(lambda batch: inputs, template)([{"input_ids": [10, 11, 12, 13]}])
+    assert out["labels"].tolist() == [[-100, 11, 12, 13]]
+    assert torch.allclose(out["loss_scale"], loss_scale)
+
+
+def test_bridge_without_loss_scale_adds_none():
+    inputs = {
+        "input_ids": _t([[10, 11]]),
+        "position_ids": _t([[0, 1]]),
+        "labels": _t([[10, 11]]),
+        "attention_mask": _t([[1, 1]]),
+    }
+    template = SimpleNamespace(padding_free=False, padding_side="left", is_training=True)
+    out = SwiftInputCollator(lambda batch: inputs, template)([{"input_ids": [10, 11]}])
     assert "loss_scale" not in out
 
 
-def test_loss_scale_absent_noop():
-    inputs = {"labels": _t([[1, 2, 3]])}
-    out = bake_loss_scale_into_labels(inputs)
-    assert out is inputs
-    assert out["labels"].tolist() == [[1, 2, 3]]
+def test_packed_bridge_keeps_loss_scale_unfolded():
+    inputs = _packed_inputs([2, 3])
+    inputs["labels"] = torch.arange(10, 15).unsqueeze(0)
+    loss_scale = _t([[1.0, 0.0, 0.5, 2.0, 1.0]])
+    inputs["loss_scale"] = loss_scale
+    out = bridge_packed_inputs(inputs, sequence_lengths=[2, 3])
+    assert out["labels"].tolist() == [[-100, 11, -100, 13, 14]]
+    assert torch.allclose(out["loss_scale"], loss_scale)
 
 
-def test_loss_scale_no_labels_noop():
-    inputs = {"loss_scale": _t([[1.0, 0.0]])}
-    out = bake_loss_scale_into_labels(inputs)
-    assert out is inputs  # nothing to fold into
-
-
-def test_loss_scale_non_binary_warns_but_still_masks_zeros(caplog):
-    labels = _t([[10, 11, 12, 13]])
-    loss_scale = _t([[1.0, 0.5, 0.0, 0.3]])  # values in (0,1) -> non-binary
-    inputs = {"labels": labels.clone(), "loss_scale": loss_scale}
-    out = bake_loss_scale_into_labels(inputs)
-    # zeros still masked; non-binary fractional weights dropped (warned).
-    assert out["labels"].tolist() == [[10, 11, -100, 13]]
+def test_nonpacked_collator_keeps_fractional_loss_scale():
+    inputs = {
+        "input_ids": _t([[0, 0, 10, 11]]),
+        "position_ids": _t([[0, 0, 0, 1]]),
+        "labels": _t([[-100, -100, 10, 11]]),
+        "attention_mask": _t([[0, 0, 1, 1]]),
+        "loss_scale": _t([[1.0, 1.0, 0.5, 2.0]]),
+    }
+    template = SimpleNamespace(padding_free=False, padding_side="left", is_training=True)
+    out = SwiftInputCollator(lambda batch: inputs, template)([{"input_ids": [10, 11]}])
+    assert out["labels"].tolist() == [[-100, 11]]
+    assert torch.allclose(out["loss_scale"], _t([[0.5, 2.0]]))

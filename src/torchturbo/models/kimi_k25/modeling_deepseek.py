@@ -1781,6 +1781,7 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel, GenerationMixin):
         cu_seq_lens_k: Optional[torch.Tensor] = None,
         max_length_q: Optional[int] = None,
         max_length_k: Optional[int] = None,
+        logits_to_keep: Union[int, torch.Tensor] = 0,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         r"""
         Args:
@@ -1839,7 +1840,9 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel, GenerationMixin):
         )
 
         hidden_states = outputs[0]
-        logits = self.lm_head(hidden_states)
+        # Only compute necessary logits
+        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+        logits = self.lm_head(hidden_states[:, slice_indices, :])
         logits = logits.float()
 
         loss = None
@@ -1936,6 +1939,8 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel, GenerationMixin):
                 "attention_mask": attention_mask,
             }
         )
+        if "logits_to_keep" in kwargs:
+            model_inputs["logits_to_keep"] = kwargs["logits_to_keep"]
         return model_inputs
 
     @staticmethod

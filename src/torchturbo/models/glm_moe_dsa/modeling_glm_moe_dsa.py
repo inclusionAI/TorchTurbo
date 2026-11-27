@@ -2,7 +2,7 @@
 # Copyright 2026 the HuggingFace Team.
 # Apache 2.0
 
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -875,6 +875,8 @@ class GlmMoeDsaForCausalLM(GlmMoeDsaPreTrainedModel, GenerationMixin):
                 "attention_mask": attention_mask,
             }
         )
+        if "logits_to_keep" in kwargs:
+            model_inputs["logits_to_keep"] = kwargs["logits_to_keep"]
         return model_inputs
 
     def forward(
@@ -890,6 +892,7 @@ class GlmMoeDsaForCausalLM(GlmMoeDsaPreTrainedModel, GenerationMixin):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         cu_seq_lens_q: Optional[torch.Tensor] = None,
+        logits_to_keep: Union[int, torch.Tensor] = 0,
         **kwargs,
     ):
         return_dict = (
@@ -910,7 +913,9 @@ class GlmMoeDsaForCausalLM(GlmMoeDsaPreTrainedModel, GenerationMixin):
         )
 
         hidden_states = outputs[0] if not return_dict else outputs.last_hidden_state
-        logits = self.lm_head(hidden_states)
+        # Only compute necessary logits
+        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+        logits = self.lm_head(hidden_states[:, slice_indices, :])
 
         loss = None
         if labels is not None:

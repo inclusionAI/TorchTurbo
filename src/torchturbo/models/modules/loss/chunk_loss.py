@@ -1,9 +1,4 @@
-"""Memory-efficient linear projection plus language-model loss.
-
-The implementation chunks flattened tokens, so ``chunk_size`` has the same
-meaning for every batch size. Multiple prediction streams (for example a main
-LM objective plus MTP objectives) share one fp32 weight-gradient accumulator.
-"""
+"""Chunked linear cross entropy with shared FP32 weight-gradient accumulation."""
 
 from __future__ import annotations
 
@@ -14,6 +9,8 @@ import torch
 import torch.nn.functional as F
 
 from torchturbo.ops import ops
+
+from .logits_loss import prepare_loss_scale, token_ce_sum
 
 __all__ = ["chunk_loss"]
 
@@ -26,18 +23,18 @@ class _ChunkedLinearCrossEntropy(torch.autograd.Function):
         ctx,
         weight,
         normalizers,
-        loss_scales,
+        loss_scaling_factors,
         chunk_size,
         ignore_index,
-        num_inputs,
+        loss_scale,
         *hidden_and_labels,
     ):
-        num_inputs = int(num_inputs)
+        num_inputs = len(loss_scaling_factors)
         hidden_states = hidden_and_labels[:num_inputs]
         labels = hidden_and_labels[num_inputs:]
         needs = ctx.needs_input_grad
         # Zero-scaled streams retain raw-loss diagnostics without a backward edge.
-        backward_mask = tuple(loss_scale != 0.0 for loss_scale in loss_scales)
+        backward_mask = tuple(loss_scaling_factor != 0.0 for loss_scaling_factor in loss_scaling_factors)
         need_grad_weight = bool(needs[0]) and any(backward_mask)
         need_grad_hidden = [
             bool(needs[6 + i]) and backward_mask[i]
@@ -71,6 +68,12 @@ class _ChunkedLinearCrossEntropy(torch.autograd.Function):
 
             hidden_chunks = torch.split(hidden_flat, chunk_size, dim=0)
             label_chunks = torch.split(labels_flat, chunk_size, dim=0)
+            weights_flat = loss_scale[input_idx]
+            weight_chunks = (
+                torch.split(weights_flat, chunk_size, dim=0)
+                if weights_flat is not None
+                else (None,) * len(hidden_chunks)
+            )
             grad_chunks = (
                 torch.split(grad_input_flat, chunk_size, dim=0)
                 if grad_input_flat is not None
@@ -83,14 +86,14 @@ class _ChunkedLinearCrossEntropy(torch.autograd.Function):
                 )
 
             normalizer = normalizers[input_idx]
-            loss_scale = loss_scales[input_idx]
+            loss_scaling_factor = loss_scaling_factors[input_idx]
             compute_grads = backward_mask[input_idx] and (
                 need_grad_hidden[input_idx] or need_grad_weight
             )
             # TODO: Pass CPU-side chunk-validity metadata so fully ignored
             # chunks can skip projection without synchronizing the NPU.
-            for hidden_c, labels_c, grad_c in zip(
-                hidden_chunks, label_chunks, grad_chunks
+            for hidden_c, labels_c, grad_c, weights_c in zip(
+                hidden_chunks, label_chunks, grad_chunks, weight_chunks
             ):
                 # The custom function supplies linear's backward explicitly.
                 # Detaching here keeps autograd scoped to the cast and CE only.
@@ -99,16 +102,8 @@ class _ChunkedLinearCrossEntropy(torch.autograd.Function):
 
                 with torch.enable_grad():
                     logits = linear_output.float()
-                    loss_c = (
-                        ops.cross_entropy_loss(
-                            logits,
-                            labels_c,
-                            reduction="sum",
-                            ignore_index=ignore_index,
-                        )
-                        / normalizer
-                    )
-                    scaled_loss_c = loss_c * loss_scale
+                    loss_c = token_ce_sum(logits, labels_c, weights_c, ignore_index) / normalizer
+                    scaled_loss_c = loss_c * loss_scaling_factor
 
                 raw_loss.add_(loss_c.detach())
                 total_loss.add_(scaled_loss_c.detach())
@@ -165,8 +160,6 @@ class _ChunkedLinearCrossEntropy(torch.autograd.Function):
         if grad_weight is not None:
             grad_weight = grad_weight.to(ctx.weight_dtype)
 
-        # weight, normalizers, scales, chunk_size, ignore_index, num_inputs,
-        # then N hidden states and N labels.
         return (
             grad_weight,
             None,
@@ -185,11 +178,12 @@ def chunk_loss(
     *,
     lm_head: torch.nn.Module | torch.Tensor,
     normalizers: Sequence[float | torch.Tensor],
-    loss_scales: Sequence[float],
+    loss_scaling_factors: Sequence[float],
+    loss_scale: Sequence[torch.Tensor] | None = None,
     chunk_size: int = 1024,
     ignore_index: int = -100,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Compute linear-CE while keeping zero-scaled streams diagnostics-only."""
+    """Compute token-weighted cross entropy in chunks."""
     if isinstance(lm_head, torch.Tensor):
         weight = lm_head
     elif isinstance(lm_head, torch.nn.Linear):
@@ -212,10 +206,10 @@ def chunk_loss(
     if num_inputs == 0:
         raise ValueError("at least one LM loss input is required")
     if not (
-        len(labels) == len(normalizers) == len(loss_scales) == num_inputs
+        len(labels) == len(normalizers) == len(loss_scaling_factors) == num_inputs
     ):
         raise ValueError(
-            "hidden_states, labels, normalizers and loss_scales must have "
+            "hidden_states, labels, normalizers and loss_scaling_factors must have "
             "the same length"
         )
 
@@ -240,6 +234,7 @@ def chunk_loss(
                 f"labels {tuple(label.shape)} must match hidden states "
                 f"{tuple(hidden_state.shape[:2])}"
             )
+    loss_scale_per_stream = prepare_loss_scale(loss_scale, num_inputs)
 
     normalizer_scalars: list[torch.Tensor] = []
     for value in normalizers:
@@ -263,8 +258,8 @@ def chunk_loss(
         normalizer_scalars.append(scalar.reshape(()))
     normalizer_tensor = torch.stack(normalizer_scalars)
 
-    loss_scale_values: list[float] = []
-    for value in loss_scales:
+    scaling_factor_values: list[float] = []
+    for value in loss_scaling_factors:
         if torch.is_tensor(value):
             raise TypeError(
                 "loss scale values must be host scalars so zero-scaled "
@@ -275,15 +270,15 @@ def chunk_loss(
             raise ValueError(
                 f"loss scale values must be finite, got {scalar_value}"
             )
-        loss_scale_values.append(scalar_value)
-    loss_scale_tuple = tuple(loss_scale_values)
+        scaling_factor_values.append(scalar_value)
+    scaling_factors = tuple(scaling_factor_values)
 
     # Detach zero-scaled streams so ``apply`` never builds a backward edge for
     # them. Keeping the edge would still traverse it once before the Function
     # returns None, which under FSDP unshards that stream's module for nothing.
     hidden_states = tuple(
-        hidden_state if loss_scale != 0.0 else hidden_state.detach()
-        for hidden_state, loss_scale in zip(hidden_states, loss_scale_tuple)
+        hidden_state if loss_scaling_factor != 0.0 else hidden_state.detach()
+        for hidden_state, loss_scaling_factor in zip(hidden_states, scaling_factors)
     )
 
     chunk_size = int(chunk_size)
@@ -293,10 +288,10 @@ def chunk_loss(
     return _ChunkedLinearCrossEntropy.apply(
         weight,
         normalizer_tensor,
-        loss_scale_tuple,
+        scaling_factors,
         chunk_size,
         int(ignore_index),
-        num_inputs,
+        loss_scale_per_stream,
         *hidden_states,
         *labels,
     )

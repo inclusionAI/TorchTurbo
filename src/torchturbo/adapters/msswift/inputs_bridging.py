@@ -10,9 +10,6 @@ from typing import Any
 import torch
 
 from ...engine.utils import assert_packed_inputs, get_packed_boundaries
-from ...logging import get_logger
-
-logger = get_logger(__name__)
 
 _IGNORE_INDEX = -100
 
@@ -46,9 +43,6 @@ class SwiftInputCollator:
             padding_side = self.template.padding_side
         inputs = self.collator(batch)
         if is_dpo:
-            # Like Swift's, the DPO forward ignores loss_scale (Swift's template
-            # already masks zero-scale tokens in the labels), so it is not
-            # folded into the labels here.
             if sequence_lengths is None:
                 # Swift pads the chosen rows, then the rejected rows; the
                 # flattened segments keep that order.
@@ -195,52 +189,13 @@ def bridge_unpacked_inputs(inputs: dict[str, Any]) -> dict[str, Any]:
     return inputs
 
 
-def bake_loss_scale_into_labels(inputs: dict) -> dict:
-    """Fold swift's per-token ``loss_scale`` (binary) into ``labels`` as -100.
-
-    turbo's shifted CE does not read ``loss_scale``; binary weights (e.g.
-    ``--loss_scale ignore_empty_think``) zeroing think tokens are baked into
-    ``labels`` so turbo skips exactly those tokens. Non-binary weights in
-    (0,1) are dropped with a warning. No-op when ``loss_scale`` is absent or
-    all-positive.
-    """
-    loss_scale = inputs.get("loss_scale")
-    if loss_scale is None:
-        return inputs
-    labels = inputs.get("labels")
-    if labels is None:
-        return inputs
-
-    ls = loss_scale
-    if ls.dim() > labels.dim():  # defensive: align ranks
-        ls = ls.reshape(labels.shape)
-    mask = ls <= 0
-    if not bool(mask.any()):
-        inputs.pop("loss_scale", None)
-        return inputs
-
-    non_binary = bool(mask.any()) and bool(((ls > 0) & (ls < 1)).any())
-    if non_binary:
-        logger.warning_rank0(
-            "loss_scale has non-binary values in (0,1); turbo drops them "
-            "(only 0/positive binary weights are folded into labels). "
-            "Use --loss_scale ignore_empty_think."
-        )
-
-    labels = labels.clone()
-    labels[mask] = _IGNORE_INDEX
-    inputs["labels"] = labels
-    inputs.pop("loss_scale", None)
-    return inputs
-
-
 def bridge_swift_inputs(
     inputs: dict[str, Any],
     *,
     sequence_lengths: list[int] | None = None,
     padding_side: str = "right",
 ) -> dict[str, Any]:
-    """Normalize packing when enabled and fold Swift's per-token loss scales."""
+    """Normalize Swift batches while preserving per-token loss weights."""
     if sequence_lengths is not None:
         inputs = bridge_packed_inputs(
             inputs,
@@ -249,4 +204,4 @@ def bridge_swift_inputs(
         )
     else:
         inputs = bridge_unpacked_inputs(inputs)
-    return bake_loss_scale_into_labels(inputs)
+    return inputs

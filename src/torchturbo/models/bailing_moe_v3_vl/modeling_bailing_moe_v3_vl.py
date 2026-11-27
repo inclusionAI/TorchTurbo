@@ -48,6 +48,7 @@ from transformers.utils import (
     TransformersKwargs,
     add_start_docstrings,
     logging,
+    torch_compilable_check,
 )
 from transformers.utils.deprecation import deprecate_kwarg
 
@@ -2565,16 +2566,8 @@ class BailingMoeV3VLModel(BailingMoeV3Model):
             special_image_mask = input_ids == self._vl_config.image_token_id
             special_video_mask = input_ids == self._vl_config.video_token_id
 
-        special_image_mask = (
-            special_image_mask.unsqueeze(-1)
-            .expand_as(inputs_embeds)
-            .to(inputs_embeds.device)
-        )
-        special_video_mask = (
-            special_video_mask.unsqueeze(-1)
-            .expand_as(inputs_embeds)
-            .to(inputs_embeds.device)
-        )
+        special_image_mask = special_image_mask.to(inputs_embeds.device)
+        special_video_mask = special_video_mask.to(inputs_embeds.device)
         return special_image_mask, special_video_mask
 
     def forward(
@@ -2631,15 +2624,16 @@ class BailingMoeV3VLModel(BailingMoeV3Model):
             image_mask, _ = self.get_placeholder_mask(
                 source_input_ids, inputs_embeds, image_features=image_embeds_cat
             )
-            expected = int(image_embeds_cat.numel())
-            actual = int(image_mask.sum().item())
-            if actual != expected:
-                raise ValueError(
-                    f"Image placeholder token count mismatch before scatter: expected {expected} values "
-                    f"from image embeddings, but found {actual} masked input values "
-                    f"({expected // inputs_embeds.shape[-1]} vs {actual // inputs_embeds.shape[-1]} tokens)."
-                )
-            inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds_cat)
+            actual_tokens = image_mask.sum()
+            torch_compilable_check(
+                actual_tokens * inputs_embeds.shape[-1] == image_embeds_cat.numel(),
+                f"Image placeholder token count mismatch before scatter: expected "
+                f"{image_embeds_cat.shape[0]} tokens from image embeddings, but found "
+                f"{actual_tokens} image tokens.",
+            )
+            inputs_embeds = torch.index_put(
+                inputs_embeds, [image_mask], image_embeds_cat
+            )
 
         if pixel_values_videos is not None:
             video_embeds_cat = torch.cat(video_embeds, dim=0).to(
@@ -2648,15 +2642,16 @@ class BailingMoeV3VLModel(BailingMoeV3Model):
             _, video_mask = self.get_placeholder_mask(
                 source_input_ids, inputs_embeds, video_features=video_embeds_cat
             )
-            expected = int(video_embeds_cat.numel())
-            actual = int(video_mask.sum().item())
-            if actual != expected:
-                raise ValueError(
-                    f"Video placeholder token count mismatch before scatter: expected {expected} values "
-                    f"from video embeddings, but found {actual} masked input values "
-                    f"({expected // inputs_embeds.shape[-1]} vs {actual // inputs_embeds.shape[-1]} tokens)."
-                )
-            inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds_cat)
+            actual_tokens = video_mask.sum()
+            torch_compilable_check(
+                actual_tokens * inputs_embeds.shape[-1] == video_embeds_cat.numel(),
+                f"Video placeholder token count mismatch before scatter: expected "
+                f"{video_embeds_cat.shape[0]} tokens from video embeddings, but found "
+                f"{actual_tokens} video tokens.",
+            )
+            inputs_embeds = torch.index_put(
+                inputs_embeds, [video_mask], video_embeds_cat
+            )
 
         text_positions = kwargs.pop("text_position_ids", None)
         if position_ids is not None:

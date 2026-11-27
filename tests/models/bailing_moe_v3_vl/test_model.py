@@ -344,6 +344,26 @@ def test_image_forward_backward(hybrid):
         assert parameter.grad.norm() > 0
 
 
+def test_media_fusion_index_put_matches_masked_scatter():
+    """The index_put media fusion keeps the masked_scatter write order."""
+    batch, seq_len, hidden = 1, 5, 4
+    token_id = 60
+    inputs_embeds = torch.arange(
+        batch * seq_len * hidden, dtype=torch.float32
+    ).reshape(batch, seq_len, hidden)
+    input_ids = torch.tensor([[0, token_id, 0, token_id, 0]])
+    media_features = torch.tensor(
+        [[100.0, 101.0, 102.0, 103.0], [200.0, 201.0, 202.0, 203.0]]
+    )
+
+    mask_2d = input_ids.eq(token_id)
+    expanded_mask = mask_2d.unsqueeze(-1).expand_as(inputs_embeds)
+    expected = inputs_embeds.masked_scatter(expanded_mask, media_features)
+    actual = torch.index_put(inputs_embeds, [mask_2d], media_features)
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("hybrid", [False, True])
 def test_mixed_media_uses_one_visual_forward_and_preserves_logits(hybrid):
     model = make_model(hybrid=hybrid)

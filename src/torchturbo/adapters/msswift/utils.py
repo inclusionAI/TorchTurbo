@@ -10,8 +10,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from ...engine.config import EngineConfig, build_from_args
 from ...engine.args import TorchTurboArgs, get_torchturbo_args
+from ...engine.config import EngineConfig, build_from_args
 from ...engine.utils import raise_if_evaluation_enabled
 from ...logging import get_logger
 
@@ -107,8 +107,19 @@ def _raise_if_unsupported(args: Any) -> None:
     if tuner_type not in {"full", "lora"}:
         unsupported.append(f"tuner_type={tuner_type!r}")
     if rlhf_type == "dpo":
-        if tuner_type != "full":
-            unsupported.append("DPO with tuner_type!=full")
+        if tuner_type == "lora":
+            if vars(args).get("ref_adapters"):
+                unsupported.append("LoRA DPO with ref_adapters; use the frozen base reference")
+            if vars(args).get("resume_only_model"):
+                unsupported.append(
+                    "LoRA DPO with resume_only_model; resume a TorchTurbo checkpoint "
+                    "with --resume_from_checkpoint and --resume_only_model false"
+                )
+            elif vars(args).get("adapters"):
+                unsupported.append(
+                    "LoRA DPO with adapters; pass merged weights via --model or resume "
+                    "a TorchTurbo checkpoint with --resume_from_checkpoint"
+                )
         tt = get_torchturbo_args()
         if tt is not None and getattr(tt, "enable_mtp", False):
             unsupported.append("DPO with MTP")

@@ -1,10 +1,9 @@
 """Numerical alignment of the ``ascendc_kda`` provider against the fla
-triton baseline in bailing_hybrid's production config (packed varlen,
+triton baseline in bailing_hybrid's production config (dense and packed varlen,
 ``chunk_size=64``, in-kernel l2norm/gate/sigmoid), on NPU hosts with
 ``fla`` and ``fla_npu`` installed.
 
-Bound to fla 0.6.0 (main @ 954438d1) and the fla_npu wheel built from
-main @ d77c3738; re-run if either version moves.
+Bound to fla 0.6.0 (main @ 954438d1) and fla_npu v26.10.0-feature.
 """
 
 from __future__ import annotations
@@ -36,8 +35,9 @@ def _reset_ops_singleton():
         _ops_module._OPS = None
 
 
-def _make_inputs(device, dtype, batch=1, heads=2, head_dim=128, seq_len=128):
+def _make_inputs(device, dtype, num_sequences, batch=1, heads=2, head_dim=128):
     torch.manual_seed(0)
+    seq_len = 128 if num_sequences is None else 64 * num_sequences
     # Flat [B, T, H*D] Q/K/V; the provider splits heads from g's shape.
     q = torch.randn(batch, seq_len, heads * head_dim, device=device, dtype=dtype)
     k = torch.randn(batch, seq_len, heads * head_dim, device=device, dtype=dtype)
@@ -46,12 +46,14 @@ def _make_inputs(device, dtype, batch=1, heads=2, head_dim=128, seq_len=128):
     beta = torch.rand(batch, seq_len, heads, device=device, dtype=torch.float32)
     A_log = torch.randn(heads, device=device, dtype=torch.float32)
     dt_bias = torch.randn(heads * head_dim, device=device, dtype=torch.float32)
-    cu_seqlens = torch.tensor([0, 64, 128], dtype=torch.int32, device=device)
+    cu_seqlens = None
+    if num_sequences is not None:
+        cu_seqlens = torch.arange(0, seq_len + 1, 64, dtype=torch.int32, device=device)
     return q, k, v, g, beta, A_log, dt_bias, cu_seqlens
 
 
-def _run_and_backward(impl, device, dtype):
-    q, k, v, g, beta, A_log, dt_bias, cu_seqlens = _make_inputs(device, dtype)
+def _run_and_backward(impl, device, dtype, num_sequences):
+    q, k, v, g, beta, A_log, dt_bias, cu_seqlens = _make_inputs(device, dtype, num_sequences)
     for t in (q, k, v, g, beta, A_log, dt_bias):
         t.requires_grad_(True)
 
@@ -83,13 +85,14 @@ def _run_and_backward(impl, device, dtype):
 # with a CANN error); production also runs bailing in bf16, so the numeric
 # alignment is a bf16 comparison.
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
-def test_ascendc_chunk_kda_matches_fl_triton(dtype):
+@pytest.mark.parametrize("num_sequences", [None, 2, 1025], ids=["dense", "packed", "packed_over_1024"])
+def test_ascendc_chunk_kda_matches_fl_triton(dtype, num_sequences):
     device = "npu"
     if not torch.npu.is_available():  # pragma: no cover - guard for hosts
         pytest.skip("NPU device not available")
 
-    baseline = _run_and_backward("fla_kda", device, dtype)
-    ascendc = _run_and_backward("ascendc_kda", device, dtype)
+    baseline = _run_and_backward("fla_kda", device, dtype, num_sequences)
+    ascendc = _run_and_backward("ascendc_kda", device, dtype, num_sequences)
 
     tolerance = 1e-3 if dtype == torch.float32 else 2e-2
     names = ("o", "dq", "dk", "dv", "dg", "dbeta", "dA_log", "dt_bias")

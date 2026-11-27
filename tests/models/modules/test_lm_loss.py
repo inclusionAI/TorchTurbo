@@ -53,7 +53,7 @@ def _single_loss(hidden, lm_head, labels, *, normalizer, chunk_size):
         [labels],
         lm_head=lm_head,
         normalizers=[normalizer],
-        loss_scales=[1.0],
+        loss_scaling_factors=[1.0],
         chunk_size=chunk_size,
     )
     return loss
@@ -132,7 +132,7 @@ def test_default_chunk_size_is_1024(monkeypatch):
         [labels],
         lm_head=weight,
         normalizers=[1.0],
-        loss_scales=[1.0],
+        loss_scaling_factors=[1.0],
     )
 
     assert chunk_lengths == [1024, 1]
@@ -152,7 +152,7 @@ def test_multiple_inputs_match_one_combined_reference_gradient():
         [labels_a, labels_b],
         lm_head=weight,
         normalizers=normalizers,
-        loss_scales=scales,
+        loss_scaling_factors=scales,
         chunk_size=3,
     )
     total.backward()
@@ -198,7 +198,7 @@ def test_zero_scaled_chunk_stream_is_excluded_from_backward(monkeypatch):
         [labels_main, labels_mtp],
         lm_head=weight,
         normalizers=[5.0, 4.0],
-        loss_scales=[1.0, 0.0],
+        loss_scaling_factors=[1.0, 0.0],
         chunk_size=3,
     )
     total.backward()
@@ -236,7 +236,7 @@ def test_multiple_logits_inputs_match_combined_reference_gradient():
         [logits_a, logits_b],
         [labels_a, labels_b],
         normalizers=normalizers,
-        loss_scales=scales,
+        loss_scaling_factors=scales,
     )
     total.backward()
 
@@ -277,7 +277,7 @@ def test_zero_scaled_logits_stream_is_excluded_from_backward():
         [logits_main, logits_mtp],
         [labels_main, labels_mtp],
         normalizers=[5.0, 4.0],
-        loss_scales=[1.0, 0.0],
+        loss_scaling_factors=[1.0, 0.0],
     )
     total.backward()
 
@@ -453,7 +453,7 @@ def test_requires_matching_nonempty_inputs():
     hidden, weight, labels = _make_inputs()
     with pytest.raises(ValueError, match="at least one"):
         chunk_loss(
-            [], [], lm_head=weight, normalizers=[], loss_scales=[], chunk_size=2
+            [], [], lm_head=weight, normalizers=[], loss_scaling_factors=[], chunk_size=2
         )
     with pytest.raises(ValueError, match="same length"):
         chunk_loss(
@@ -461,6 +461,141 @@ def test_requires_matching_nonempty_inputs():
             [labels],
             lm_head=weight,
             normalizers=[1.0],
-            loss_scales=[],
+            loss_scaling_factors=[],
             chunk_size=2,
         )
+
+
+def _weighted_reference_logits(logits, labels, weights, normalizer):
+    logits = logits.detach().clone().requires_grad_(True)
+    per_token = F.cross_entropy(
+        logits.flatten(0, 1).float(),
+        labels.flatten(),
+        reduction="none",
+        ignore_index=IGNORE,
+    )
+    valid = labels.flatten() != IGNORE
+    loss = (
+        torch.where(valid, per_token, 0.0) * weights.flatten().float()
+    ).sum() / normalizer
+    return loss, logits
+
+
+def test_weighted_logits_match_swift_semantics():
+    torch.manual_seed(7)
+    logits = torch.randn(2, 6, 7, requires_grad=True)
+    labels = torch.randint(0, 7, (2, 6))
+    labels[0, 3] = IGNORE
+    weights = torch.tensor([[1.0, 0.5, 0.0, 0.3, 1.0, 2.0], [0.25, 1.0, 3.0, 1.0, 0.75, 1.0]])
+    weights[0, 3] = 5.0  # weight at an ignored position must not matter
+    normalizer = 9.0
+
+    total, components = logits_loss(
+        [logits],
+        [labels],
+        normalizers=[normalizer],
+        loss_scaling_factors=[1.0],
+        loss_scale=[weights],
+    )
+    total.backward()
+
+    ref_total, ref_logits = _weighted_reference_logits(logits, labels, weights, normalizer)
+    ref_total.backward()
+
+    assert torch.allclose(total, ref_total)
+    assert torch.allclose(components, torch.stack([ref_total.detach()]))
+    assert torch.allclose(logits.grad, ref_logits.grad, atol=1e-6)
+
+
+def test_all_ones_weights_match_unweighted_logits():
+    torch.manual_seed(8)
+    logits_w = torch.randn(1, 5, 7, requires_grad=True)
+    labels = torch.randint(0, 7, (1, 5))
+    labels[0, 1] = IGNORE
+    logits_u = logits_w.detach().clone().requires_grad_(True)
+
+    total_w, _ = logits_loss(
+        [logits_w], [labels], normalizers=[4.0], loss_scaling_factors=[1.0],
+        loss_scale=[torch.ones(1, 5)],
+    )
+    total_u, _ = logits_loss(
+        [logits_u], [labels], normalizers=[4.0], loss_scaling_factors=[1.0],
+    )
+    total_w.backward()
+    total_u.backward()
+
+    assert torch.allclose(total_w, total_u)
+    assert torch.allclose(logits_w.grad, logits_u.grad)
+
+
+def test_zero_weights_zero_the_loss_without_masking_labels():
+    torch.manual_seed(11)
+    logits = torch.randn(1, 4, 7, requires_grad=True)
+    labels = torch.randint(0, 7, (1, 4))  # every position supervised
+    weights = torch.tensor([[1.0, 0.0, 1.0, 0.0]])
+    normalizer = 4.0
+
+    total, _ = logits_loss(
+        [logits],
+        [labels],
+        normalizers=[normalizer],
+        loss_scaling_factors=[1.0],
+        loss_scale=[weights],
+    )
+    total.backward()
+
+    ref_total, ref_logits = _weighted_reference_logits(logits, labels, weights, normalizer)
+    ref_total.backward()
+
+    assert total.item() > 0.0  # weighted tokens keep contributing
+    assert torch.allclose(total, ref_total)
+    assert torch.allclose(logits.grad, ref_logits.grad, atol=1e-6)
+
+
+@pytest.mark.parametrize("chunk_size", [5, 3, 1])
+def test_weighted_chunk_loss_matches_reference(chunk_size):
+    torch.manual_seed(9)
+    hidden, weight, labels = _make_inputs(b=1, s=6, h=4, v=7)
+    labels[0, 2] = IGNORE
+    weights = torch.tensor([[1.0, 0.5, 4.0, 0.25, 1.0, 2.0]])
+    weights[0, 2] = 9.0  # weight at an ignored position must not matter
+
+    loss = chunk_loss(
+        [hidden],
+        [labels],
+        lm_head=weight,
+        normalizers=[5.0],
+        loss_scaling_factors=[1.0],
+        loss_scale=[weights],
+        chunk_size=chunk_size,
+    )[0]
+    loss.backward()
+
+    hidden_ref = hidden.detach().clone().requires_grad_(True)
+    weight_ref = weight.detach().clone().requires_grad_(True)
+    logits_ref = F.linear(hidden_ref.reshape(-1, 4), weight_ref).float()
+    per_token = F.cross_entropy(
+        logits_ref, labels.flatten(), reduction="none", ignore_index=IGNORE
+    )
+    valid = labels.flatten() != IGNORE
+    ref_loss = (
+        torch.where(valid, per_token, 0.0) * weights.flatten()
+    ).sum() / 5.0
+    ref_loss.backward()
+
+    assert torch.allclose(loss, ref_loss, atol=1e-5, rtol=1e-5)
+    assert torch.allclose(hidden.grad, hidden_ref.grad, atol=1e-5, rtol=1e-5)
+    assert torch.allclose(weight.grad, weight_ref.grad, atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.parametrize("chunk_size", [1, 4, 32])
+def test_weighted_chunk_matches_logits_gradients(chunk_size):
+    hidden, head, labels = _make_inputs()
+    labels[0, 1] = IGNORE
+    weights = torch.tensor([[0.0, 2.0, 0.25, 1.0, 2.0, 0.0]]).expand_as(labels)
+    options = dict(normalizers=[11], loss_scaling_factors=[1.0], loss_scale=[weights])
+    direct, _ = logits_loss([F.linear(hidden, head)], [labels], **options)
+    chunked, _ = chunk_loss([hidden], [labels], lm_head=head, chunk_size=chunk_size, **options)
+    torch.testing.assert_close(chunked, direct)
+    torch.testing.assert_close(torch.autograd.grad(chunked, (hidden, head)),
+                               torch.autograd.grad(direct, (hidden, head)))

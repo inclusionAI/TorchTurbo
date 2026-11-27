@@ -747,6 +747,39 @@ def test_hf_export_can_be_seeded_on_torchturbo_args():
     assert checkpoint.hf_export == "every"
 
 
+def test_lora_export_mode_comes_from_file_and_cli(tmp_path):
+    path = _write(
+        tmp_path,
+        "cfg.yaml",
+        _engine_config("checkpoint:\n  lora_export_mode: adapter\n"),
+    )
+
+    assert _build_from_argv(["--tt_config", path]).checkpoint.lora_export_mode == "adapter"
+    assert (
+        _build_from_argv(
+            ["--tt_config", path, "--tt_lora_export_mode", "merged"]
+        ).checkpoint.lora_export_mode
+        == "merged"
+    )
+
+
+def test_lora_export_mode_default_is_merged():
+    checkpoint = build_from_args(TorchTurboArgs()).checkpoint
+
+    assert checkpoint.lora_export_mode == "merged"
+
+
+def test_lora_export_mode_rejects_the_legacy_value(tmp_path):
+    path = _write(
+        tmp_path,
+        "cfg.yaml",
+        _engine_config("checkpoint:\n  lora_export_mode: merge\n"),
+    )
+
+    with pytest.raises(ValueError, match="lora_export_mode must be 'merged'"):
+        _build_from_argv(["--tt_config", path])
+
+
 def test_default_save_format_is_not_supported(tmp_path):
     path = _write(
         tmp_path,

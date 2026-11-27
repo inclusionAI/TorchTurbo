@@ -1628,6 +1628,7 @@ class BailingMoeV3ForCausalLM(BailingMoeV3PreTrainedModel, GenerationMixin):
         output_hidden_states: Optional[bool] = None,
         output_router_logits: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        logits_to_keep: Union[int, torch.Tensor] = 0,
         **kwargs,
     ) -> Union[Tuple, MoEV3CausalLMOutputWithPast]:
         r"""
@@ -1676,7 +1677,9 @@ class BailingMoeV3ForCausalLM(BailingMoeV3PreTrainedModel, GenerationMixin):
         all_mtp_loss = None
         aux_loss = None
         hidden_states = outputs[0]
-        logits = self.lm_head(hidden_states)
+        # Only compute necessary logits
+        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+        logits = self.lm_head(hidden_states[:, slice_indices, :])
         logits = logits.float()
 
         if labels is not None:
@@ -1688,7 +1691,7 @@ class BailingMoeV3ForCausalLM(BailingMoeV3PreTrainedModel, GenerationMixin):
             shift_labels_mtp = None
             for i in range(self.num_nextn_predict_layers):
                 mtp_hidden_states = mtp_hidden_states[i]
-                mtp_logits = self.lm_head(mtp_hidden_states).float()
+                mtp_logits = self.lm_head(mtp_hidden_states[:, slice_indices, :]).float()
                 if all_mtp_logits is None:
                     all_mtp_logits = []
                 all_mtp_logits.append(mtp_logits)
