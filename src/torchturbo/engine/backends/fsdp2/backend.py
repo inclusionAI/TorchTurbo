@@ -441,6 +441,9 @@ class FSDP2Backend(BaseBackend):
         parallel_plan: Any = None,
         peft_config: Any = None,
     ) -> nn.Module:
+        if self.config.moe.mega_moe.enable and peft_config is not None:
+            raise AssertionError("MegaMoE does not support PEFT/LoRA training.")
+
         if parallel_plan is None:
             plan = FSDPParallelPlan()
         elif not isinstance(parallel_plan, FSDPParallelPlan):
@@ -627,8 +630,9 @@ class FSDP2Backend(BaseBackend):
         units: list[_FSDPUnit],
         fsdp_kwargs: dict[str, Any],
     ) -> None:
-        from torch.distributed.fsdp import fully_shard
+        from torch.distributed.fsdp import fully_shard, register_fsdp_forward_method
 
+        from torchturbo.models.modules.moe.experts import GroupedMLP
         from torchturbo.models.modules.moe.moe_layer import BaseMoELayer
 
         expert_modules = {
@@ -667,6 +671,9 @@ class FSDP2Backend(BaseBackend):
                 )
 
             fully_shard(unit.modules, mesh=unit.mesh, **target_fsdp_kwargs)
+            for sharded_module in unit.modules:
+                if isinstance(sharded_module, GroupedMLP) and sharded_module.config.mega_moe.enable:
+                    register_fsdp_forward_method(sharded_module, "mega_moe_forward")
             applied.add(unit_idx)
 
         if len(applied) != len(units):

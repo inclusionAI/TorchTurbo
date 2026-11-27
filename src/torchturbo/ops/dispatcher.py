@@ -4,7 +4,7 @@ import importlib
 from collections.abc import Mapping
 from dataclasses import dataclass
 from types import ModuleType
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -16,6 +16,9 @@ from .moe import MoEPermutation, get_expert_indices
 from .packed_params import get_packed_params
 from .providers import iter_provider_modules
 from .registry import OpRegistry
+
+if TYPE_CHECKING:
+    from torchturbo.models.modules.moe.experts import GroupedMLP
 
 logger = get_logger(__name__)
 
@@ -525,6 +528,18 @@ class OpDispatcher:
     ):
         return self._dispatch(
             "lightning_indexer_metadata", *args, impl=impl, **kwargs
+        )
+
+    def mega_moe(
+        self, experts: GroupedMLP, hidden_states: torch.Tensor,
+        probs: torch.Tensor, routing_map: torch.Tensor, *,
+        ep_group: torch.distributed.ProcessGroup,
+        expert_indices: torch.Tensor | None = None, impl: str | None = None,
+    ) -> torch.Tensor:
+        """Compute routed expert outputs; the model adds shared experts."""
+        return self._dispatch(
+            "mega_moe", experts, hidden_states, probs, routing_map,
+            ep_group=ep_group, expert_indices=expert_indices, impl=impl,
         )
 
     def moe_permutation(

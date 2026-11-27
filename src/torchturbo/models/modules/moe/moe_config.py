@@ -7,11 +7,13 @@
   # Modified by the TorchTurbo contributors.
 
 import functools
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, List, Optional
 
 import torch
 import torch.nn.functional as F
+
+from torchturbo.engine.config import MegaMoEConfig
 
 
 def init_method_normal(sigma):
@@ -72,6 +74,7 @@ class MoEConfig:
     num_hash_layers: int = 0
     """Vocabulary size for token-id hash routing table."""
     vocab_size: int = 0
+    mega_moe: MegaMoEConfig = field(default_factory=MegaMoEConfig)
 
     def __post_init__(self):
         if self.init_method is None:

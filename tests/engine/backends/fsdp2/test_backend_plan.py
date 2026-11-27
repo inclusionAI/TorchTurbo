@@ -4,6 +4,7 @@ import os
 import sys
 import types
 from contextlib import nullcontext
+from unittest.mock import Mock
 
 os.environ.setdefault("TORCH_TURBO_DISABLE", "1")
 
@@ -61,6 +62,7 @@ def make_backend(*, mtp_enabled=False):
     backend = FSDP2Backend.__new__(FSDP2Backend)
     backend.config = types.SimpleNamespace(
         mtp=types.SimpleNamespace(enabled=mtp_enabled),
+        moe=types.SimpleNamespace(mega_moe=types.SimpleNamespace(enable=False)),
         loss_chunk=types.SimpleNamespace(enabled=False),
     )
     return backend
@@ -221,6 +223,51 @@ class CheckpointBlock(TaggedModule):
         if use_cache or past_key_values is not None:
             raise AssertionError("cache kwargs should be cleared")
         return x * self.weight
+
+
+def test_mega_moe_registers_each_sharded_expert_once_after_sharding(monkeypatch):
+    import torch.distributed.fsdp as fsdp
+
+    from torchturbo.engine.backends.fsdp2.backend import _FSDPUnit
+    from torchturbo.engine.config import MegaMoEConfig
+    from torchturbo.models.modules.moe.experts import GroupedMLP
+    from torchturbo.models.modules.moe.moe_config import MoEConfig
+
+    def experts(enabled):
+        config = MoEConfig(
+            hidden_size=4, moe_ffn_hidden_size=3, num_moe_experts=4,
+            gated_linear_unit=True, activation_func=torch.nn.functional.silu,
+            mega_moe=MegaMoEConfig(enable=enabled),
+        )
+        return GroupedMLP(2, False, config)
+
+    model = nn.Module()
+    model.first = experts(True)
+    model.native = experts(False)
+    model.second = experts(True)
+    model.unsharded = experts(True)
+    model.dense = nn.Linear(4, 4)
+    unit = _FSDPUnit(
+        [model.first, model.native, model.second, model.dense], mesh=object(),
+    )
+    events = []
+
+    def fully_shard(modules, *, mesh, **kwargs):
+        assert mesh is unit.mesh
+        events.append(("shard", tuple(modules)))
+
+    def register_forward(module, method_name):
+        events.append(("register", module, method_name))
+
+    monkeypatch.setattr(fsdp, "fully_shard", fully_shard)
+    monkeypatch.setattr(fsdp, "register_fsdp_forward_method", register_forward)
+    make_backend()._apply_fsdp(model, [unit], {})
+
+    assert events == [
+        ("shard", tuple(unit.modules)),
+        ("register", model.first, "mega_moe_forward"),
+        ("register", model.second, "mega_moe_forward"),
+    ]
 
 
 def test_standalone_world_shard_skips_default_descendant_wrapping(monkeypatch):
@@ -1336,3 +1383,42 @@ def test_activation_checkpointing_disabled_warns_and_skips_plan_targets(monkeypa
     assert len(warnings) == 1
     assert "skipping activation checkpointing" in warnings[0][0]
     assert not hasattr(model.layers[0], "_tt_original_forward")
+
+
+def test_megakernel_with_peft_fails_before_mesh_setup():
+    backend = make_backend()
+    backend.config.moe.mega_moe.enable = True
+    backend._init_mesh = lambda plan: pytest.fail("mesh setup should not run")
+    with pytest.raises(AssertionError, match="does not support PEFT/LoRA"):
+        backend.prepare_model(TaggedModule("root"), FSDPParallelPlan(), peft_config=object())
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_qwen_layers_propagate_mega_moe_config(monkeypatch, enabled):
+    from torchturbo.engine.config import EngineConfig
+    from torchturbo.models.modules.moe.moe_layer import MoELayer
+    from torchturbo.models.qwen3_5_moe.parallel_plan import get_parallel_plan
+
+    group = object()
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group=None: 2)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda group=None: 0)
+    backend = make_preparing_backend([], {"sp_group": None, "sp_size": 1, "sp_rank": 0})
+    del backend._replace_modules
+    backend.config = EngineConfig()
+    backend.get_ep_info = lambda: {"ep_group": group, "ep_size": 2}
+    model = nn.Module()
+    model.config = types.SimpleNamespace(hidden_size=8, moe_intermediate_size=4,
+                                         num_experts=4, num_experts_per_tok=2)
+    for name in ("mlp", "second_mlp"):
+        submodule = nn.Module()
+        submodule.gate = submodule.experts = nn.Identity()
+        setattr(model, name, submodule)
+    spec = get_parallel_plan().plan["model.language_model.layers.*.mlp"]
+    plan = FSDPParallelPlan(plan={"mlp": spec, "second_mlp": spec})
+    backend.config.moe.mega_moe.enable = enabled
+    backend.prepare_model(model, plan)
+    for layer in (model.mlp, model.second_mlp):
+        assert isinstance(layer, MoELayer)
+        assert layer.config.mega_moe.enable == enabled
+        assert (layer.token_dispatcher is None) == enabled
+    assert model.mlp.experts is not model.second_mlp.experts

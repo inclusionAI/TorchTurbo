@@ -44,6 +44,7 @@ def _replace_moe_only(
         moe_router_score_function=hf_config.scoring_func,
         moe_router_dtype=hf_config.router_dtype,
         moe_router_enable_expert_bias=True,
+        mega_moe=engine_config.moe.mega_moe,
         moe_token_dispatcher_type=engine_config.moe.token_dispatcher,
         moe_swiglu_limit=getattr(hf_config, "expert_swiglu_limit_list", None),
         # Match BailingMoeV3MLP, which computes min(silu(gate), limit).

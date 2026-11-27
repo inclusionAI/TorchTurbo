@@ -1,9 +1,14 @@
 """Contracts for the router's dense weights and compact expert IDs."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
 from torchturbo.models.modules.moe.moe_config import MoEConfig
+from torchturbo.models.modules.moe.experts import GroupedMLP
+from torchturbo.models.modules.moe.module import ModuleSpec
+from torchturbo.models.modules.moe.moe_layer import MoELayer, MoESubmodules
 from torchturbo.models.modules.moe.router import TopKRouter
 from torchturbo.models.modules.moe.utils import topk_softmax_with_capacity
 
@@ -70,3 +75,49 @@ def test_router_selected_weights_preserve_aux_and_z_loss_gradients(score_functio
     (selected * upstream).sum().backward()
     assert hidden.grad is not None
     assert router.weight.grad is not None
+
+
+class CustomRouter(TopKRouter):
+    def forward(self, hidden, input_ids, padding_mask, accumulate_tokens_per_expert):
+        return super().forward(hidden, input_ids, padding_mask, accumulate_tokens_per_expert)
+
+    def routing(self, logits, input_ids, padding_mask, accumulate_tokens_per_expert):
+        return super().routing(logits, input_ids, padding_mask, accumulate_tokens_per_expert)
+
+
+def test_megakernel_uses_model_router_once(monkeypatch):
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: 2)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda group: 0)
+    config = MoEConfig(hidden_size=4, moe_ffn_hidden_size=4, num_moe_experts=8, moe_router_topk=2,
+                       gated_linear_unit=True, activation_func=torch.nn.functional.silu, params_dtype=torch.float32)
+    config.mega_moe.enable = True
+    layer = MoELayer(config, object(), MoESubmodules(experts=ModuleSpec(module=GroupedMLP)))
+
+    def mega_moe(owner, hidden_states, weights, mask, *, ep_group, expert_indices=None):
+        assert owner is layer.experts
+        assert ep_group is layer.ep_group
+        assert weights.shape == mask.shape == (3, 8)
+        return weights.gather(1, expert_indices)
+
+    monkeypatch.setattr(
+        "torchturbo.models.modules.moe.experts.ops", SimpleNamespace(mega_moe=mega_moe),
+    )
+    layer.router = CustomRouter(config)
+    torch.nn.init.normal_(layer.router.weight)
+    hidden = torch.randn(3, 1, 4, requires_grad=True)
+    observed_shapes = []
+    layer.router.register_forward_hook(lambda module, args, result: observed_shapes.append(result[0].shape))
+
+    reference = TopKRouter(config)
+    reference.load_state_dict(layer.router.state_dict())
+    dense, _, ids, logits = reference(hidden)
+    weights, actual_logits = layer(hidden)
+    assert observed_shapes == [(3, 8)]
+    torch.testing.assert_close(actual_logits, logits.reshape(-1, config.num_moe_experts))
+    selected = dense.gather(1, ids)
+    torch.testing.assert_close(weights, selected)
+    upstream = torch.randn_like(weights)
+    expected = torch.autograd.grad(selected, (hidden, reference.weight), upstream)
+    actual = torch.autograd.grad(weights, (hidden, layer.router.weight), upstream)
+    for observed, wanted in zip(actual, expected):
+        torch.testing.assert_close(observed, wanted)

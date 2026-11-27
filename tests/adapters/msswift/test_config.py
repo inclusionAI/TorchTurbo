@@ -865,3 +865,15 @@ def test_lora_config_dora_rslora_flags():
     )
     assert lora.use_rslora is True
     assert lora.use_dora is True
+
+
+@pytest.mark.parametrize("packing,expected", [(True, 17), (False, 33)])
+def test_mega_moe_infers_source_bound(tmp_path, packing, expected):
+    path = tmp_path / "mega.yaml"
+    path.write_text("engine_config:\n  parallel_plan: {sp_size: 4}\n"
+                    "  moe: {mega_moe: {enable: true}}\n")
+    _set_tt(config_path=str(path))
+    args = _base_args(packing=packing, packing_length=33, max_length=65, per_device_train_batch_size=2)
+    config = build_config_from_swift_args(args)
+    assert config.moe.mega_moe.enable
+    assert config.moe.mega_moe.source_token_bound == expected

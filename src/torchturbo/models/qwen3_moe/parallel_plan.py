@@ -23,6 +23,7 @@ class QWen3MoeLayerWrapper(MoELayer):
             params_dtype=hf_config.torch_dtype,
             moe_aux_loss_coeff=engine_config.moe.aux_loss_coeff,
             moe_z_loss_coeff=engine_config.moe.z_loss_coeff,
+            mega_moe=engine_config.moe.mega_moe,
             moe_token_dispatcher_type=engine_config.moe.token_dispatcher,
             moe_router_pre_softmax=not hf_config.norm_topk_prob,
         )

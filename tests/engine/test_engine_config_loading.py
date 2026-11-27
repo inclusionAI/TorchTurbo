@@ -1462,3 +1462,23 @@ def test_gbs_negative_raises():
 def test_gbs_zero_raises():
     with pytest.raises(ValueError):
         build_from_args(TorchTurboArgs(gbs=0))
+
+
+@pytest.mark.parametrize(("setting", "balance"), [
+    ("{enable: true}", None),
+    ("{enable: true, expert_balance: null}", None),
+    ("{enable: true, expert_balance: hot_replica}", "hot_replica"),
+])
+def test_mega_moe_yaml_config(tmp_path, setting, balance):
+    path = _write(tmp_path, "mega.yaml", _engine_config(f"moe:\n  mega_moe: {setting}\n"))
+    config = _build_from_argv(["--tt_config", path]).moe.mega_moe
+    assert config.enable and config.expert_balance == balance
+    assert not _build_from_argv([]).moe.mega_moe.enable
+
+
+@pytest.mark.parametrize("value", ["None", "true"])
+def test_invalid_expert_balance(tmp_path, value):
+    path = _write(tmp_path, "mega.yaml", _engine_config(
+        f"moe:\n  mega_moe: {{enable: true, expert_balance: {value}}}\n"))
+    with pytest.raises(ValueError, match="expert_balance"):
+        _build_from_argv(["--tt_config", path])
