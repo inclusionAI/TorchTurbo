@@ -16,10 +16,9 @@ from torch import nn
 from torch.nn import functional as F
 
 from torchturbo.logging import get_logger
-from torchturbo.ops.providers.npu.mhc_pre_sinkhorn import (
-    NpuMhcPreSinkhorn,
-    mhc_pre_sinkhorn_unavailable_reason,
-    mhc_pre_sinkhorn_unsupported_reason,
+from torchturbo.ops import OpPolicy, get_ops, ops
+from torchturbo.ops.providers.npu.mhc_pre_sinkhorn_premix import (
+    has_mhc_pre_sinkhorn_premix,
 )
 
 from .modeling_glm5_3_flash import (
@@ -35,28 +34,62 @@ from .modeling_glm5_3_flash import (
 
 
 logger = get_logger(__name__)
-_mhc_pre = NpuMhcPreSinkhorn()
+
+
+def _mhc_pre_unsupported_reason(x, phi, alpha, bias, hc_mult, num_iters):
+    """Conservative arch22 training contract; contiguous copies are supported."""
+    if x.device.type != "npu":
+        return "input is not on NPU"
+    if x.dtype not in (torch.bfloat16, torch.float16):
+        return "input dtype must be BF16 or FP16"
+    if x.ndim != 4 or any(size == 0 for size in x.shape):
+        return "input must be nonempty BSND"
+    if hc_mult != 4 or x.shape[2] != 4:
+        return "training requires hc_mult=4 and N=4"
+    if x.shape[3] % 128:
+        return "training requires D divisible by 128"
+    if num_iters != 20:
+        return "training requires 20 Sinkhorn iterations"
+    expected = ((24, 4 * x.shape[3]), (3,), (24,))
+    for name, parameter, shape in zip(("phi", "alpha", "bias"), (phi, alpha, bias), expected):
+        if tuple(parameter.shape) != shape or parameter.device != x.device:
+            return f"{name} must have shape {shape} on the input device"
+        if not parameter.is_floating_point():
+            return f"{name} must be floating point"
+    if not torch.is_grad_enabled():
+        return "no_grad uses the reference pre"
+    if not any(t.requires_grad for t in (x, phi, alpha, bias)):
+        return "cache-free forward is not enabled"
+    return None
 
 
 def npu_mhc_pre(self, hidden, kind):
     phi = getattr(self, f"hc_{kind}_fn")
     alpha = getattr(self, f"hc_{kind}_scale")
     bias = getattr(self, f"hc_{kind}_base")
-    reason = mhc_pre_sinkhorn_unsupported_reason(
+    reason = _mhc_pre_unsupported_reason(
         hidden, phi, alpha, bias, self.hc_mult, self.hc_sinkhorn_iters
     )
     if reason is None:
-        reason = mhc_pre_sinkhorn_unavailable_reason()
+        dispatcher = get_ops()
+        if "mhc_pre_sinkhorn_premix" not in dispatcher.overrides:
+            if dispatcher.default_policy is OpPolicy.NATIVE:
+                return self._glm5_reference_pre(hidden, kind)
+            if (
+                dispatcher.default_policy is OpPolicy.AUTO
+                and not has_mhc_pre_sinkhorn_premix()
+            ):
+                reason = "fused mHC premix forward/backward operators are unavailable"
     if reason is not None:
         logger.warning_rank0_once("GLM-5.3-Flash mHC pre fallback: %s", reason)
         return self._glm5_reference_pre(hidden, kind)
     # Once selected, propagate execution errors instead of silently changing
     # computation paths during training or checkpoint recomputation.
-    collapsed, post, comb = _mhc_pre(
-        hidden, phi, alpha, bias, self.hc_mult, self.hc_sinkhorn_iters,
+    collapsed, post, comb, _ = ops.mhc_pre_sinkhorn_premix(
+        hidden, phi, alpha, bias, None, self.hc_mult, self.hc_sinkhorn_iters,
         hc_eps=self.hc_eps, norm_eps=self.hc_norm_eps,
     )
-    logger.info_rank0_once("GLM-5.3-Flash using fused NPU mhc_pre_sinkhorn")
+    logger.info_rank0_once("GLM-5.3-Flash using fused NPU mhc_pre_sinkhorn_premix")
     b, s, n, _ = hidden.shape
     return collapsed, post.to(hidden.dtype), comb.reshape(b, s, n, n).to(hidden.dtype)
 
