@@ -53,7 +53,7 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 RUN_LF="${REPO_ROOT}/scripts/runs/run_lf.py"
 DATASET_DIR="${DATASET_DIR:-${REPO_ROOT}/dataset}"
 LLAMAFACTORY_SRC_DIR="${LLAMAFACTORY_SRC_DIR:-/code/LLaMA-Factory/src}"
-export PYTHONPATH="/opt/MindSpeed:${REPO_ROOT}/src:${LLAMAFACTORY_SRC_DIR}:${PYTHONPATH:-}"
+export PYTHONPATH="${REPO_ROOT}/src:${LLAMAFACTORY_SRC_DIR}:${PYTHONPATH:-}"
 
 DISTRIBUTED_ARGS="
     --nproc_per_node $NPUS_PER_NODE \
